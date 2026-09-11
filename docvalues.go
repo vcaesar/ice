@@ -22,6 +22,7 @@ import (
 	"sort"
 
 	segment "github.com/vcaesar/bluge_segment_api"
+
 	"github.com/vcaesar/ice/compress"
 )
 
@@ -82,46 +83,45 @@ func (s *Segment) loadFieldDocValueReader(field string,
 		return nil, nil
 	}
 
-	// read the number of chunks, and chunk offsets position
-	var numChunks, chunkOffsetsPosition uint64
-
-	if fieldDvLocEnd-fieldDvLocStart > fieldDvStartEndWidth {
-		numChunksData, err := s.data.Read(int(fieldDvLocEnd-fieldDvEndWidth), int(fieldDvLocEnd))
-		if err != nil {
-			return nil, err
-		}
-		numChunks = binary.BigEndian.Uint64(numChunksData)
-		// read the length of chunk offsets
-		chunkOffsetsLenData, err := s.data.Read(int(fieldDvLocEnd-fieldDvStartEndWidth), int(fieldDvLocEnd-fieldDvEndWidth))
-		if err != nil {
-			return nil, err
-		}
-		chunkOffsetsLen := binary.BigEndian.Uint64(chunkOffsetsLenData)
-		// acquire position of chunk offsets
-		chunkOffsetsPosition = (fieldDvLocEnd - 16) - chunkOffsetsLen
-	} else {
-		return nil, fmt.Errorf("loadFieldDocValueReader: fieldDvLoc too small: %d-%d", fieldDvLocEnd, fieldDvLocStart)
+	dataLen := s.data.Len()
+	if dataLen < 0 || fieldDvLocStart > fieldDvLocEnd || fieldDvLocEnd > uint64(dataLen) ||
+		fieldDvLocEnd-fieldDvLocStart <= fieldDvStartEndWidth {
+		return nil, fmt.Errorf("invalid doc-value range: %d-%d", fieldDvLocStart, fieldDvLocEnd)
 	}
-
+	// #nosec G115 -- both offsets are bounded by data.Len(), an int.
+	start, end := int(fieldDvLocStart), int(fieldDvLocEnd)
+	tail, err := s.data.Read(end-fieldDvStartEndWidth, end)
+	if err != nil {
+		return nil, err
+	}
+	chunkOffsetsLen := binary.BigEndian.Uint64(tail[:fieldDvStartWidth])
+	numChunks := binary.BigEndian.Uint64(tail[fieldDvStartWidth:])
+	// #nosec G115 -- the validated field range is wider than fieldDvStartEndWidth.
+	if chunkOffsetsLen > uint64(end-start-fieldDvStartEndWidth) || numChunks > chunkOffsetsLen {
+		return nil, fmt.Errorf("invalid doc-value chunk offset length or count")
+	}
+	// #nosec G115 -- chunkOffsetsLen is bounded by the int-sized field range above.
+	chunkOffsetsPosition := end - fieldDvStartEndWidth - int(chunkOffsetsLen)
+	locData, err := s.data.Read(chunkOffsetsPosition, end-fieldDvStartEndWidth)
+	if err != nil {
+		return nil, err
+	}
 	fdvIter := &docValueReader{
-		curChunkNum:  math.MaxInt64,
-		field:        field,
+		curChunkNum: math.MaxInt64,
+		field:       field,
+		// #nosec G115 -- numChunks <= chunkOffsetsLen <= the int-sized field range.
 		chunkOffsets: make([]uint64, int(numChunks)),
 	}
-
-	// read the chunk offsets
-	var offset uint64
-	for i := 0; i < int(numChunks); i++ {
-		locData, err := s.data.Read(int(chunkOffsetsPosition+offset), int(chunkOffsetsPosition+offset+binary.MaxVarintLen64))
-		if err != nil {
-			return nil, err
-		}
+	var previous uint64
+	for i := range fdvIter.chunkOffsets {
 		loc, read := binary.Uvarint(locData)
-		if read <= 0 {
+		// #nosec G115 -- chunkOffsetsLen was checked to fit inside the field range.
+		if read <= 0 || loc < previous || loc > uint64(chunkOffsetsPosition-start) {
 			return nil, fmt.Errorf("corrupted chunk offset during segment load")
 		}
 		fdvIter.chunkOffsets[i] = loc
-		offset += uint64(read)
+		previous = loc
+		locData = locData[read:]
 	}
 
 	// set the data offset
@@ -131,10 +131,15 @@ func (s *Segment) loadFieldDocValueReader(field string,
 }
 
 func (di *docValueReader) loadDvChunk(chunkNumber uint64, s *Segment) error {
-	// advance to the chunk where the docValues
-	// reside for the given docNum
-	destChunkDataLoc, curChunkEnd := di.dvDataLoc, di.dvDataLoc
+	if chunkNumber >= uint64(len(di.chunkOffsets)) {
+		return fmt.Errorf("doc-value chunk number out of range: %d", chunkNumber)
+	}
+	// #nosec G115 -- chunkNumber is less than the int-sized offsets slice length.
 	start, end := readChunkBoundary(int(chunkNumber), di.chunkOffsets)
+	dataLen := s.data.Len()
+	if dataLen < 0 || start > end || di.dvDataLoc > uint64(dataLen) || end > uint64(dataLen)-di.dvDataLoc {
+		return fmt.Errorf("doc-value chunk offsets out of range")
+	}
 	if start >= end {
 		di.curChunkHeader = di.curChunkHeader[:0]
 		di.curChunkData = nil
@@ -143,57 +148,46 @@ func (di *docValueReader) loadDvChunk(chunkNumber uint64, s *Segment) error {
 		return nil
 	}
 
-	destChunkDataLoc += start
-	curChunkEnd += end
-
-	// read the number of docs reside in the chunk
-	numDocsData, err := s.data.Read(int(destChunkDataLoc), int(destChunkDataLoc+binary.MaxVarintLen64))
+	// #nosec G115 -- the sums are bounded by data.Len() above, without uint64 overflow.
+	data, err := s.data.Read(int(di.dvDataLoc+start), int(di.dvDataLoc+end))
 	if err != nil {
 		return err
 	}
-	numDocs, read := binary.Uvarint(numDocsData)
+	numDocs, read := binary.Uvarint(data)
 	if read <= 0 {
 		return fmt.Errorf("failed to read the chunk")
 	}
-	chunkMetaLoc := destChunkDataLoc + uint64(read)
-
-	offset := uint64(0)
-	if cap(di.curChunkHeader) < int(numDocs) {
-		di.curChunkHeader = make([]metaData, int(numDocs))
+	data = data[read:]
+	const minMetadataBytes = 2 // Document delta and offset delta each need at least one varint byte.
+	if numDocs > uint64(len(data)/minMetadataBytes) {
+		return fmt.Errorf("invalid doc-value document count")
+	}
+	// #nosec G115 -- numDocs <= len(data)/2, so it fits int.
+	count := int(numDocs)
+	if cap(di.curChunkHeader) < count {
+		di.curChunkHeader = make([]metaData, count)
 	} else {
-		di.curChunkHeader = di.curChunkHeader[:int(numDocs)]
+		di.curChunkHeader = di.curChunkHeader[:count]
 	}
 
-	diffDocNum := uint64(0)
-	diffDvOffset := uint64(0)
-	for i := 0; i < int(numDocs); i++ {
-		var docNumData []byte
-		docNumData, err = s.data.Read(int(chunkMetaLoc+offset), int(chunkMetaLoc+offset+binary.MaxVarintLen64))
-		if err != nil {
-			return err
+	var docNum, dvOffset uint64
+	for i := range di.curChunkHeader {
+		delta, n := binary.Uvarint(data)
+		if n <= 0 || delta > math.MaxUint64-docNum {
+			return fmt.Errorf("invalid doc-value document delta")
 		}
-		di.curChunkHeader[i].DocNum, read = binary.Uvarint(docNumData)
-		di.curChunkHeader[i].DocNum += diffDocNum
-		diffDocNum = di.curChunkHeader[i].DocNum
-		offset += uint64(read)
-		var docDvOffsetData []byte
-		docDvOffsetData, err = s.data.Read(int(chunkMetaLoc+offset), int(chunkMetaLoc+offset+binary.MaxVarintLen64))
-		if err != nil {
-			return err
+		docNum += delta
+		data = data[n:]
+		delta, n = binary.Uvarint(data)
+		if n <= 0 || delta > math.MaxUint64-dvOffset {
+			return fmt.Errorf("invalid doc-value offset delta")
 		}
-		di.curChunkHeader[i].DocDvOffset, read = binary.Uvarint(docDvOffsetData)
-		di.curChunkHeader[i].DocDvOffset += diffDvOffset
-		diffDvOffset = di.curChunkHeader[i].DocDvOffset
-		offset += uint64(read)
+		dvOffset += delta
+		data = data[n:]
+		di.curChunkHeader[i] = metaData{DocNum: docNum, DocDvOffset: dvOffset}
 	}
 
-	compressedDataLoc := chunkMetaLoc + offset
-	dataLength := curChunkEnd - compressedDataLoc
-	curChunkData, err := s.data.Read(int(compressedDataLoc), int(compressedDataLoc+dataLength))
-	if err != nil {
-		return err
-	}
-	di.curChunkData = curChunkData
+	di.curChunkData = data
 	di.curChunkNum = chunkNumber
 	di.uncompressed = di.uncompressed[:0]
 	return nil
@@ -218,6 +212,9 @@ func (di *docValueReader) iterateAllDocValues(s *Segment, visitor docNumTermsVis
 
 		start := uint64(0)
 		for _, entry := range di.curChunkHeader {
+			if entry.DocDvOffset < start || entry.DocDvOffset > uint64(len(uncompressed)) {
+				return fmt.Errorf("doc-value offset exceeds uncompressed data")
+			}
 			err = visitor(entry.DocNum, uncompressed[start:entry.DocDvOffset])
 			if err != nil {
 				return err
@@ -253,6 +250,9 @@ func (di *docValueReader) visitDocValues(docNum uint64,
 	}
 
 	// pick the terms for the given docNum
+	if start > end || end > uint64(len(uncompressed)) {
+		return fmt.Errorf("doc-value offsets exceed uncompressed data")
+	}
 	uncompressed = uncompressed[start:end]
 	for {
 		i := bytes.Index(uncompressed, termSeparatorSplitSlice)
@@ -329,7 +329,9 @@ func (s *Segment) visitDocumentFieldTerms(localDocNum uint64, fields []string,
 				}
 			}
 
-			_ = dvr.visitDocValues(localDocNum, visitor)
+			if err := dvr.visitDocValues(localDocNum, visitor); err != nil {
+				return dvs, err
+			}
 		}
 	}
 	return dvs, nil

@@ -38,6 +38,7 @@ type Match struct {
 
 const magic = "ICEV"
 const headerSize = 9 // magic, version byte, little-endian uint32 dimension
+const float32Size = 4
 
 // Encode serializes finite, nonempty float32 vectors without metric normalization.
 func Encode(vector []float32) ([]byte, error) {
@@ -50,7 +51,7 @@ func Encode(vector []float32) ([]byte, error) {
 	data := make([]byte, headerSize+4*len(vector))
 	copy(data, magic)
 	data[4] = 1
-	binary.LittleEndian.PutUint32(data[5:9], uint32(len(vector)))
+	binary.LittleEndian.PutUint32(data[5:9], uint32(len(vector))) // #nosec G115 -- len(vector) <= MaxUint32 above.
 	for i, v := range vector {
 		binary.LittleEndian.PutUint32(data[headerSize+4*i:], math.Float32bits(v))
 	}
@@ -64,10 +65,11 @@ func Decode(data []byte) ([]float32, error) {
 		return nil, fmt.Errorf("invalid vector header or version")
 	}
 	n := uint64(binary.LittleEndian.Uint32(data[5:9]))
+	// #nosec G115 -- the header check above guarantees len(data) >= headerSize.
 	if n == 0 || n*4 != uint64(len(data)-headerSize) {
 		return nil, fmt.Errorf("invalid vector payload length")
 	}
-	vector := make([]float32, int(n))
+	vector := make([]float32, (len(data)-headerSize)/float32Size)
 	for i := range vector {
 		vector[i] = math.Float32frombits(binary.LittleEndian.Uint32(data[headerSize+4*i:]))
 	}

@@ -16,6 +16,7 @@ package ice
 
 import (
 	"encoding/binary"
+	"fmt"
 	"io"
 	"math"
 
@@ -30,7 +31,13 @@ func encodeStoredFieldValues(fieldID int,
 	storedFieldValues [][]byte,
 	curr int, metaEncode varintEncoder, data []byte) (
 	newCurr int, newData []byte, err error) {
+	if fieldID < 0 || curr < 0 {
+		return 0, nil, fmt.Errorf("negative stored field ID or offset")
+	}
 	for i := 0; i < len(storedFieldValues); i++ {
+		if len(storedFieldValues[i]) > math.MaxInt-curr {
+			return 0, nil, fmt.Errorf("stored field offset overflow")
+		}
 		// encode field
 		_, err := metaEncode(uint64(fieldID))
 		if err != nil {
@@ -82,7 +89,7 @@ func writePostings(postings *roaring.Bitmap, tfEncoder, locEncoder *chunkedIntCo
 		return 0, err
 	}
 
-	postingsOffset := uint64(w.Count())
+	postingsOffset := uint64(w.Count()) // #nosec G115 -- countHashWriter checks overflow and counts nonnegative writes.
 
 	n := binary.PutUvarint(bufMaxVarintLen64, tfOffset)
 	_, err = w.Write(bufMaxVarintLen64[:n])
@@ -164,6 +171,7 @@ func persistFields(fieldsInv []string, fieldDocs, fieldFreqs map[uint16]uint64,
 
 	for fieldID, fieldName := range fieldsInv {
 		// record start of this field
+		// #nosec G115 -- countHashWriter checks overflow and counts nonnegative writes.
 		fieldsOffsets = append(fieldsOffsets, uint64(w.Count()))
 
 		// write out the dict location and field name length
@@ -187,7 +195,7 @@ func persistFields(fieldsInv []string, fieldDocs, fieldFreqs map[uint16]uint64,
 	}
 
 	// now write out the fields index
-	rv = uint64(w.Count())
+	rv = uint64(w.Count()) // #nosec G115 -- countHashWriter checks overflow and counts nonnegative writes.
 	for fieldID := range fieldsInv {
 		err := binary.Write(w, binary.BigEndian, fieldsOffsets[fieldID])
 		if err != nil {

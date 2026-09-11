@@ -78,52 +78,48 @@ func (s *Segment) loadFields() error {
 	// NOTE for now we assume the fields index immediately precedes
 	// the footer, and if this changes, need to adjust accordingly (or
 	// store explicit length), where s.mem was sliced from s.mm in Open().
-	fieldsIndexEnd := uint64(s.data.Len())
+	dataLen := s.data.Len()
+	if dataLen < 0 || s.footer.fieldsIndexOffset > uint64(dataLen) {
+		return fmt.Errorf("fields index offset out of range")
+	}
+	fieldsIndexEnd := uint64(dataLen)
+	if (fieldsIndexEnd-s.footer.fieldsIndexOffset)%fileAddrWidth != 0 {
+		return fmt.Errorf("truncated fields index address")
+	}
 
 	// iterate through fields index
 	var fieldID uint64
 	for s.footer.fieldsIndexOffset+(fileAddrWidth*fieldID) < fieldsIndexEnd {
+		// #nosec G115 -- the aligned index range and loop bound keep both addresses within dataLen.
 		addrData, err := s.data.Read(int(s.footer.fieldsIndexOffset+(fileAddrWidth*fieldID)),
 			int(s.footer.fieldsIndexOffset+(fileAddrWidth*fieldID)+fileAddrWidth))
 		if err != nil {
 			return err
 		}
 		addr := binary.BigEndian.Uint64(addrData)
-
-		dictLocData, err := s.data.Read(int(addr), int(fieldsIndexEnd))
+		dictLoc, err := readDataUvarint(s.data, &addr)
 		if err != nil {
 			return err
 		}
-		dictLoc, read := binary.Uvarint(dictLocData)
-		n := uint64(read)
 		s.dictLocs = append(s.dictLocs, dictLoc)
 
-		var nameLen uint64
-		nameLenData, err := s.data.Read(int(addr+n), int(fieldsIndexEnd))
+		nameLen, err := readDataUvarint(s.data, &addr)
 		if err != nil {
 			return err
 		}
-		nameLen, read = binary.Uvarint(nameLenData)
-		n += uint64(read)
-
-		nameData, err := s.data.Read(int(addr+n), int(addr+n+nameLen))
+		nameData, err := readDataAt(s.data, addr, nameLen)
 		if err != nil {
 			return err
 		}
-		n += nameLen
-
-		fieldDocData, err := s.data.Read(int(addr+n), int(fieldsIndexEnd))
+		addr += nameLen
+		fieldDocVal, err := readDataUvarint(s.data, &addr)
 		if err != nil {
 			return err
 		}
-		fieldDocVal, read := binary.Uvarint(fieldDocData)
-		n += uint64(read)
-
-		fieldFreqData, err := s.data.Read(int(addr+n), int(fieldsIndexEnd))
+		fieldFreqVal, err := readDataUvarint(s.data, &addr)
 		if err != nil {
 			return err
 		}
-		fieldFreqVal, _ := binary.Uvarint(fieldFreqData)
 
 		name := string(nameData)
 		s.fieldsInv = append(s.fieldsInv, name)
@@ -138,32 +134,38 @@ func (s *Segment) loadFields() error {
 
 // loadStoredFieldChunk load storedField chunk offsets
 func (s *Segment) loadStoredFieldChunk() error {
+	const trailerSize = 8 // Two uint32 fields: offset byte length and chunk count.
+	if s.footer.storedIndexOffset < trailerSize {
+		return fmt.Errorf("stored chunk trailer out of bounds")
+	}
+	chunkOffsetPos := s.footer.storedIndexOffset - trailerSize
+	chunkData, err := readDataAt(s.data, chunkOffsetPos, trailerSize)
+	if err != nil {
+		return err
+	}
 	// read chunk num
-	chunkOffsetPos := int(s.footer.storedIndexOffset - uint64(sizeOfUint32))
-	chunkData, err := s.data.Read(chunkOffsetPos, chunkOffsetPos+sizeOfUint32)
-	if err != nil {
-		return err
-	}
-	chunkNum := binary.BigEndian.Uint32(chunkData)
-	chunkOffsetPos -= sizeOfUint32
+	chunkNum := binary.BigEndian.Uint32(chunkData[sizeOfUint32:])
 	// read chunk offsets length
-	chunkData, err = s.data.Read(chunkOffsetPos, chunkOffsetPos+sizeOfUint32)
+	chunkOffsetsLen := uint64(binary.BigEndian.Uint32(chunkData))
+	if chunkOffsetsLen > chunkOffsetPos || uint64(chunkNum) > chunkOffsetsLen {
+		return fmt.Errorf("invalid stored chunk offset length or count")
+	}
+	// read chunk offsets
+	chunkOffsetPos -= chunkOffsetsLen
+	offsets, err := readDataAt(s.data, chunkOffsetPos, chunkOffsetsLen)
 	if err != nil {
 		return err
 	}
-	chunkOffsetsLen := binary.BigEndian.Uint32(chunkData)
-	// read chunk offsets
-	chunkOffsetPos -= int(chunkOffsetsLen)
-	var offset, read int
-	var offsetata []byte
 	s.storedFieldChunkOffsets = make([]uint64, chunkNum)
-	for i := 0; i < int(chunkNum); i++ {
-		offsetata, err = s.data.Read(chunkOffsetPos+offset, chunkOffsetPos+offset+binary.MaxVarintLen64)
-		if err != nil {
-			return err
+	var previous uint64
+	for i := range s.storedFieldChunkOffsets {
+		offset, n := binary.Uvarint(offsets)
+		if n <= 0 || offset < previous || offset > chunkOffsetPos {
+			return fmt.Errorf("invalid stored chunk offset")
 		}
-		s.storedFieldChunkOffsets[i], read = binary.Uvarint(offsetata)
-		offset += read
+		s.storedFieldChunkOffsets[i] = offset
+		previous = offset
+		offsets = offsets[n:]
 	}
 
 	return nil

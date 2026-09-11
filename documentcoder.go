@@ -3,7 +3,9 @@ package ice
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"io"
+	"math"
 
 	"github.com/vcaesar/ice/compress"
 )
@@ -32,7 +34,7 @@ func newChunkedDocumentCoder(chunkSize uint64, w io.Writer) *chunkedDocumentCode
 	return c
 }
 
-func (c *chunkedDocumentCoder) Add(docNum uint64, meta, data []byte) (int, error) {
+func (c *chunkedDocumentCoder) Add(_ uint64, meta, data []byte) (int, error) {
 	var wn, n int
 	var err error
 	n = binary.PutUvarint(c.metaBuf, uint64(len(meta)))
@@ -80,6 +82,7 @@ func (c *chunkedDocumentCoder) flush() error {
 		if err != nil {
 			return err
 		}
+		// #nosec G115 -- io.Writer returns a nonnegative number of bytes written.
 		c.bytes += uint64(n)
 		c.buf.Reset()
 	}
@@ -93,21 +96,30 @@ func (c *chunkedDocumentCoder) Write() error {
 		return err
 	}
 	var err error
-	var wn, n int
+	var wn uint64
+	if uint64(len(c.offsets)) > math.MaxUint32 {
+		return fmt.Errorf("too many stored-field chunk offsets")
+	}
 	// write chunk offsets
 	for _, offset := range c.offsets {
-		n = binary.PutUvarint(c.metaBuf, offset)
+		n := binary.PutUvarint(c.metaBuf, offset)
+		// #nosec G115 -- PutUvarint returns a positive encoded byte count (1..10).
+		wn += uint64(n)
+		if wn > math.MaxUint32 {
+			return fmt.Errorf("stored-field chunk offsets exceed uint32 length")
+		}
 		if _, err = c.w.Write(c.metaBuf[:n]); err != nil {
 			return err
 		}
-		wn += n
 	}
 	// write chunk offset length
+	// #nosec G115 -- wn is checked against MaxUint32 after each positive increment.
 	err = binary.Write(c.w, binary.BigEndian, uint32(wn))
 	if err != nil {
 		return err
 	}
 	// write chunk num
+	// #nosec G115 -- len(c.offsets) is checked against MaxUint32 above and unchanged in the loop.
 	err = binary.Write(c.w, binary.BigEndian, uint32(len(c.offsets)))
 	if err != nil {
 		return err
@@ -125,7 +137,7 @@ func (c *chunkedDocumentCoder) Reset() {
 
 // Size returns buffer size of current chunk
 func (c *chunkedDocumentCoder) Size() uint64 {
-	return uint64(c.buf.Len())
+	return uint64(c.buf.Len()) // #nosec G115 -- bytes.Buffer.Len() is nonnegative.
 }
 
 // Len returns chunks num

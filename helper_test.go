@@ -17,7 +17,6 @@ package ice
 import (
 	"bufio"
 	"fmt"
-	"io/ioutil"
 	"math"
 	"os"
 	"testing"
@@ -31,7 +30,7 @@ import (
 // ice no longer knows about files itself
 
 func setupTestDir(t *testing.T) (path string, cleanup func()) {
-	path, err := ioutil.TempDir("", "ice-test")
+	path, err := os.MkdirTemp(t.TempDir(), "ice-test")
 	if err != nil {
 		t.Fatalf("error creating tmp dir: %v", err)
 	}
@@ -50,6 +49,9 @@ var noCloseFunc = func() error {
 }
 
 func encodeNorm(_ string, numTerms int) float32 {
+	if numTerms < 0 || uint64(numTerms) > math.MaxUint32 {
+		panic("term count does not fit uint32")
+	}
 	return math.Float32frombits(uint32(numTerms))
 }
 

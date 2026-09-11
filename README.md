@@ -1,8 +1,8 @@
 # ice
 
 [![PkgGoDev](https://pkg.go.dev/badge/github.com/vcaesar/ice)](https://pkg.go.dev/github.com/vcaesar/ice)
-[![Tests](https://github.com/vcaesar/ice/workflows/Tests/badge.svg?branch=master&event=push)](https://github.com/vcaesar/ice/actions?query=workflow%3ATests+event%3Apush+branch%3Amaster)
-[![Lint](https://github.com/vcaesar/ice/workflows/Lint/badge.svg?branch=master&event=push)](https://github.com/vcaesar/ice/actions?query=workflow%3ALint+event%3Apush+branch%3Amaster)
+[![Tests](https://github.com/vcaesar/ice/actions/workflows/tests.yml/badge.svg?branch=main&event=push)](https://github.com/vcaesar/ice/actions/workflows/tests.yml)
+[![Lint](https://github.com/vcaesar/ice/actions/workflows/lint.yml/badge.svg?branch=main&event=push)](https://github.com/vcaesar/ice/actions/workflows/lint.yml)
 
 The file is written in the reverse order that we typically access data. This helps us write in one pass since later sections of the file require file offsets of things we've already written.
 

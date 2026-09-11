@@ -64,7 +64,8 @@ func TestRoaringSizes(t *testing.T) {
 			t.Errorf("size did not match,"+
 				" got: %d, test: %#v", len(b), test)
 		}
-		if int(bm.GetSerializedSizeInBytes()) != test.expectedSize {
+		// #nosec G115 -- expected sizes in this fixed fixture table are nonnegative.
+		if bm.GetSerializedSizeInBytes() != uint64(test.expectedSize) {
 			t.Errorf("GetSerializedSizeInBytes did not match,"+
 				" got: %d, test: %#v",
 				bm.GetSerializedSizeInBytes(), test)
@@ -80,7 +81,8 @@ func TestRoaringSizes(t *testing.T) {
 			t.Errorf("optimized size did not match,"+
 				" got: %d, test: %#v", len(b), test)
 		}
-		if int(bm.GetSerializedSizeInBytes()) != test.optimizedSize {
+		// #nosec G115 -- optimized sizes in this fixed fixture table are nonnegative.
+		if bm.GetSerializedSizeInBytes() != uint64(test.optimizedSize) {
 			t.Errorf("optimized GetSerializedSizeInBytes did not match,"+
 				" got: %d, test: %#v",
 				bm.GetSerializedSizeInBytes(), test)

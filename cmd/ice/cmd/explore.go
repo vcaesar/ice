@@ -34,7 +34,7 @@ var exploreCmd = &cobra.Command{
 	Use:   "explore [path] [field] <term> <docNum>",
 	Short: "explores the index by field, then term (optional), and then docNum (optional)",
 	Long:  `The explore command lets you explore the index in order of field, then optionally by term, then optionally again by doc number.`,
-	RunE: func(cmd *cobra.Command, args []string) error {
+	RunE: func(_ *cobra.Command, args []string) error {
 		if len(args) < exploreArgField {
 			return fmt.Errorf("must specify field")
 		}

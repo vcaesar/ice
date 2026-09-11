@@ -15,7 +15,6 @@
 package ice
 
 import (
-	"encoding/binary"
 	"fmt"
 	"math"
 
@@ -26,13 +25,13 @@ import (
 // FST or vellum value (uint64) encoding is determined by the top two
 // highest-order or most significant bits...
 //
-//  encoding  : MSB
-//  name      : 63  62  61...to...bit #0 (LSB)
-//  ----------+---+---+---------------------------------------------------
-//   general  : 0 | 0 | 62-bits of postingsOffset.
-//   ~        : 0 | 1 | reserved for future.
-//   1-hit    : 1 | 0 | 31-bits of positive float31 norm | 31-bits docNum.
-//   ~        : 1 | 1 | reserved for future.
+//	encoding  : MSB
+//	name      : 63  62  61...to...bit #0 (LSB)
+//	----------+---+---+---------------------------------------------------
+//	 general  : 0 | 0 | 62-bits of postingsOffset.
+//	 ~        : 0 | 1 | reserved for future.
+//	 1-hit    : 1 | 0 | 31-bits of positive float31 norm | 31-bits docNum.
+//	 ~        : 1 | 1 | reserved for future.
 //
 // Encoding "general" is able to handle all cases, where the
 // postingsOffset points to more information about the postings for
@@ -99,7 +98,13 @@ func (p *PostingsList) Size() int {
 	sizeInBytes := reflectStaticSizePostingsList + sizeOfPtr
 
 	if p.except != nil {
-		sizeInBytes += int(p.except.GetSizeInBytes())
+		bitmapSize := p.except.GetSizeInBytes()
+		// #nosec G115 -- sizeInBytes is only the small static PostingsList and pointer sizes here.
+		if bitmapSize > uint64(math.MaxInt-sizeInBytes) {
+			return math.MaxInt
+		}
+		// #nosec G115 -- bitmapSize fits the remaining int-sized result above.
+		sizeInBytes += int(bitmapSize)
 	}
 
 	return sizeInBytes
@@ -107,6 +112,7 @@ func (p *PostingsList) Size() int {
 
 func (p *PostingsList) OrInto(receiver *roaring.Bitmap) {
 	if p.normBits1Hit != 0 {
+		// #nosec G115 -- fSTValDecode1Hit masks the list document number to 31 bits.
 		receiver.Add(uint32(p.docNum1Hit))
 		return
 	}
@@ -175,6 +181,7 @@ func (p *PostingsList) iterator(includeFreq, includeNorm, includeLocs bool,
 		rv.docNum1Hit = p.docNum1Hit
 		rv.normBits1Hit = p.normBits1Hit
 
+		// #nosec G115 -- copied from the 31-bit list document number, before setting the sentinel.
 		if p.except != nil && p.except.Contains(uint32(rv.docNum1Hit)) {
 			rv.docNum1Hit = docNum1HitFinished
 		}
@@ -222,6 +229,7 @@ func (p *PostingsList) Count() uint64 {
 	var n, e uint64
 	if p.normBits1Hit != 0 {
 		n = 1
+		// #nosec G115 -- fSTValDecode1Hit masks the list document number to 31 bits.
 		if p.except != nil && p.except.Contains(uint32(p.docNum1Hit)) {
 			e = 1
 		}
@@ -243,35 +251,27 @@ func (p *PostingsList) read(postingsOffset uint64, d *Dictionary) error {
 	}
 
 	// read the location of the freq/norm details
-	var n uint64
-	var read int
-
-	freqOffsetData, err := d.sb.data.Read(int(postingsOffset+n), int(postingsOffset+binary.MaxVarintLen64))
+	pos := postingsOffset
+	var err error
+	p.freqOffset, err = readDataUvarint(d.sb.data, &pos)
 	if err != nil {
 		return err
 	}
-	p.freqOffset, read = binary.Uvarint(freqOffsetData)
-	n += uint64(read)
-
-	locOffsetData, err := d.sb.data.Read(int(postingsOffset+n), int(postingsOffset+n+binary.MaxVarintLen64))
+	p.locOffset, err = readDataUvarint(d.sb.data, &pos)
 	if err != nil {
 		return err
 	}
-	p.locOffset, read = binary.Uvarint(locOffsetData)
 	if p.locOffset > 0 && p.freqOffset > 0 {
+		if p.locOffset > math.MaxUint64-p.freqOffset {
+			return fmt.Errorf("postings location offset overflow")
+		}
 		p.locOffset += p.freqOffset
 	}
-	n += uint64(read)
-
-	postingsLenData, err := d.sb.data.Read(int(postingsOffset+n), int(postingsOffset+n+binary.MaxVarintLen64))
+	postingsLen, err := readDataUvarint(d.sb.data, &pos)
 	if err != nil {
 		return err
 	}
-	var postingsLen uint64
-	postingsLen, read = binary.Uvarint(postingsLenData)
-	n += uint64(read)
-
-	roaringData, err := d.sb.data.Read(int(postingsOffset+n), int(postingsOffset+n+postingsLen))
+	roaringData, err := readDataAt(d.sb.data, pos, postingsLen)
 	if err != nil {
 		return err
 	}
@@ -344,6 +344,9 @@ func (i *PostingsIterator) Empty() bool {
 }
 
 func (i *PostingsIterator) loadChunk(chunk int) error {
+	if chunk < 0 || uint64(chunk) > math.MaxUint32 {
+		return fmt.Errorf("posting chunk number out of range: %d", chunk)
+	}
 	if i.includeFreqNorm {
 		err := i.freqNormReader.loadChunk(chunk)
 		if err != nil {
@@ -436,6 +439,9 @@ func (i *PostingsIterator) readLocation(l *Location) error {
 	}
 
 	l.field = i.postings.sb.fieldsInv[fieldID]
+	if pos > math.MaxInt || start > math.MaxInt || end > math.MaxInt {
+		return fmt.Errorf("location exceeds int range")
+	}
 	l.pos = int(pos)
 	l.start = int(start)
 	l.end = int(end)
@@ -479,6 +485,9 @@ func (i *PostingsIterator) nextAtOrAfter(atOrAfter uint64) (segment.Posting, err
 		return nil, err
 	}
 
+	if normBits > math.MaxUint32 {
+		return nil, fmt.Errorf("norm bits exceed uint32")
+	}
 	rv.norm = math.Float32frombits(uint32(normBits))
 
 	if i.includeLocs && hasLocs {
@@ -503,7 +512,15 @@ func (i *PostingsIterator) nextAtOrAfter(atOrAfter uint64) (segment.Posting, err
 
 		j := 0
 		startBytesRemaining := i.locReader.Len() // # bytes remaining in the locReader
+		// #nosec G115 -- memUvarintReader.Len clamps its result to nonnegative values.
+		if numLocsBytes > uint64(startBytesRemaining) {
+			return nil, fmt.Errorf("location byte count exceeds chunk")
+		}
+		// #nosec G115 -- numLocsBytes is bounded by the int-sized remaining chunk length.
 		for startBytesRemaining-i.locReader.Len() < int(numLocsBytes) {
+			if j >= len(i.nextLocs) {
+				return nil, fmt.Errorf("location count exceeds frequency")
+			}
 			err := i.readLocation(&i.nextLocs[j])
 			if err != nil {
 				return nil, err
@@ -533,12 +550,16 @@ func (i *PostingsIterator) nextDocNumAtOrAfter(atOrAfter uint64) (docNum uint64,
 		return docNum, true, nil
 	}
 
+	if atOrAfter > math.MaxUint32 {
+		i.Actual = nil
+		return 0, false, nil
+	}
 	if i.Actual == nil || !i.Actual.HasNext() {
 		return 0, false, nil
 	}
 
 	if i.postings == nil || i.postings.postings == i.ActualBM {
-		return i.nextDocNumAtOrAfterClean(atOrAfter)
+		return i.nextDocNumAtOrAfterClean(uint32(atOrAfter))
 	}
 
 	i.Actual.AdvanceIfNeeded(uint32(atOrAfter))
@@ -551,17 +572,21 @@ func (i *PostingsIterator) nextDocNumAtOrAfter(atOrAfter uint64) (docNum uint64,
 	n := i.Actual.Next()
 	allN := i.all.Next()
 
-	nChunk := n / uint32(i.postings.chunkSize)
+	if i.postings.chunkSize == 0 {
+		return 0, false, fmt.Errorf("invalid zero postings chunk size")
+	}
+	// #nosec G115 -- dividing the uint32 document number by a positive size cannot increase it.
+	nChunk := uint32(uint64(n) / i.postings.chunkSize)
 
 	// when allN becomes >= to here, then allN is in the same chunk as nChunk.
-	allNReachesNChunk := nChunk * uint32(i.postings.chunkSize)
+	allNReachesNChunk := uint64(nChunk) * i.postings.chunkSize
 
 	// n is the next actual hit (excluding some postings), and
 	// allN is the next hit in the full postings, and
 	// if they don't match, move 'all' forwards until they do
 	for allN != n {
 		// we've reached same chunk, so move the freq/norm/loc decoders forward
-		if i.includeFreqNorm && allN >= allNReachesNChunk {
+		if i.includeFreqNorm && uint64(allN) >= allNReachesNChunk {
 			err := i.currChunkNext(nChunk)
 			if err != nil {
 				return 0, false, err
@@ -584,9 +609,9 @@ func (i *PostingsIterator) nextDocNumAtOrAfter(atOrAfter uint64) (docNum uint64,
 // optimization when the postings list is "clean" (e.g., no updates &
 // no deletions) where the all bitmap is the same as the actual bitmap
 func (i *PostingsIterator) nextDocNumAtOrAfterClean(
-	atOrAfter uint64) (docNum uint64, exists bool, err error) {
+	atOrAfter uint32) (docNum uint64, exists bool, err error) {
 	if !i.includeFreqNorm {
-		i.Actual.AdvanceIfNeeded(uint32(atOrAfter))
+		i.Actual.AdvanceIfNeeded(atOrAfter)
 
 		if !i.Actual.HasNext() {
 			return 0, false, nil // couldn't find anything
@@ -598,13 +623,18 @@ func (i *PostingsIterator) nextDocNumAtOrAfterClean(
 	// freq-norm's needed, so maintain freq-norm chunk reader
 	sameChunkNexts := 0 // # of times we called Next() in the same chunk
 	n := i.Actual.Next()
-	nChunk := n / uint32(i.postings.chunkSize)
+	if i.postings.chunkSize == 0 {
+		return 0, false, fmt.Errorf("invalid zero postings chunk size")
+	}
+	// #nosec G115 -- a uint32 document number divided by a positive size still fits uint32.
+	nChunk := uint32(uint64(n) / i.postings.chunkSize)
 
-	for uint64(n) < atOrAfter && i.Actual.HasNext() {
+	for n < atOrAfter && i.Actual.HasNext() {
 		n = i.Actual.Next()
 
 		nChunkPrev := nChunk
-		nChunk = n / uint32(i.postings.chunkSize)
+		// #nosec G115 -- a uint32 document number divided by a positive size still fits uint32.
+		nChunk = uint32(uint64(n) / i.postings.chunkSize)
 
 		if nChunk != nChunkPrev {
 			sameChunkNexts = 0
@@ -613,7 +643,7 @@ func (i *PostingsIterator) nextDocNumAtOrAfterClean(
 		}
 	}
 
-	if uint64(n) < atOrAfter {
+	if n < atOrAfter {
 		// couldn't find anything
 		return 0, false, nil
 	}
@@ -655,7 +685,12 @@ func (i *PostingsIterator) currChunkNext(nChunk uint32) error {
 			return fmt.Errorf("error reading location numLocsBytes: %v", err)
 		}
 
+		// #nosec G115 -- memUvarintReader.Len clamps its result to nonnegative values.
+		if numLocsBytes > uint64(i.locReader.Len()) {
+			return fmt.Errorf("location byte count exceeds chunk")
+		}
 		// skip over all the location bytes
+		// #nosec G115 -- numLocsBytes is bounded by the int-sized reader length above.
 		i.locReader.SkipBytes(int(numLocsBytes))
 	}
 

@@ -15,8 +15,10 @@
 package ice
 
 import (
+	"fmt"
 	"hash/crc32"
 	"io"
+	"math"
 )
 
 // countHashWriter is a wrapper around a Writer which counts the number of
@@ -34,6 +36,9 @@ func newCountHashWriter(w io.Writer) *countHashWriter {
 
 // Write writes the provided bytes to the wrapped writer and counts the bytes
 func (c *countHashWriter) Write(b []byte) (int, error) {
+	if len(b) > math.MaxInt-c.n {
+		return 0, fmt.Errorf("written byte count exceeds int range")
+	}
 	n, err := c.w.Write(b)
 	c.crc = crc32.Update(c.crc, crc32.IEEETable, b[:n])
 	c.n += n

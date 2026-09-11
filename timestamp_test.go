@@ -58,8 +58,8 @@ func TestTimestampBounds(t *testing.T) {
 				segments = append(segments, seg.(*Segment))
 			}
 			s := &interim{results: docs}
-			if min, max := s.calcTimestamp(); min != tc.min || max != tc.max {
-				t.Fatalf("bounds=(%d,%d), want=(%d,%d)", min, max, tc.min, tc.max)
+			if minimum, maximum := s.calcTimestamp(); minimum != tc.min || maximum != tc.max {
+				t.Fatalf("bounds=(%d,%d), want=(%d,%d)", minimum, maximum, tc.min, tc.max)
 			}
 			var buf bytes.Buffer
 			_, footer, err := mergeToWriter(segments, make([]*roaring.Bitmap, len(segments)),
@@ -67,9 +67,9 @@ func TestTimestampBounds(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if int64(footer.docTimeMin) != tc.min || int64(footer.docTimeMax) != tc.max {
-				t.Fatalf("merged bounds=(%d,%d), want=(%d,%d)",
-					int64(footer.docTimeMin), int64(footer.docTimeMax), tc.min, tc.max)
+			minimum, maximum := (&Segment{footer: footer}).Timestamp()
+			if minimum != tc.min || maximum != tc.max {
+				t.Fatalf("merged bounds=(%d,%d), want=(%d,%d)", minimum, maximum, tc.min, tc.max)
 			}
 		})
 	}

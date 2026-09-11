@@ -9,6 +9,7 @@ import (
 	"github.com/RoaringBitmap/roaring/v2"
 	"github.com/blevesearch/vellum"
 	segment "github.com/vcaesar/bluge_segment_api"
+
 	"github.com/vcaesar/ice/compress"
 )
 

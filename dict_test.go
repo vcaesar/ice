@@ -174,6 +174,7 @@ func TestDictionaryError(t *testing.T) {
 
 	for _, test := range tests {
 		lb := builders[test.editDistance]
+		// #nosec G115 -- the table above contains only edit distances 1, 2, and 3.
 		a, err := lb.BuildDfa(test.query, uint8(test.editDistance))
 		if err != nil {
 			t.Fatalf("error building dfa: %v", err)

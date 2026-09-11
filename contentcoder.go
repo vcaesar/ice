@@ -79,14 +79,14 @@ func (c *chunkedContentCoder) Reset() {
 }
 
 func (c *chunkedContentCoder) SetChunkSize(chunkSize, maxDocNum uint64) {
-	total := int(maxDocNum/chunkSize + 1)
+	total := maxDocNum/chunkSize + 1
 	c.chunkSize = chunkSize
-	if cap(c.chunkLens) < total {
+	if uint64(cap(c.chunkLens)) < total {
 		c.chunkLens = make([]uint64, total)
 	} else {
 		c.chunkLens = c.chunkLens[:total]
 	}
-	if cap(c.chunkMeta) < total {
+	if uint64(cap(c.chunkMeta)) < total {
 		c.chunkMeta = make([]metaData, 0, total)
 	}
 }
@@ -158,16 +158,14 @@ func (c *chunkedContentCoder) Add(docNum uint64, vals []byte) error {
 		c.currChunk = chunk
 	}
 
-	// get the starting offset for this doc
-	dvOffset := c.chunkBuf.Len()
-	dvSize, err := c.chunkBuf.Write(vals)
+	_, err := c.chunkBuf.Write(vals)
 	if err != nil {
 		return err
 	}
 
 	c.chunkMeta = append(c.chunkMeta, metaData{
 		DocNum:      docNum,
-		DocDvOffset: uint64(dvOffset + dvSize),
+		DocDvOffset: uint64(c.chunkBuf.Len()), // #nosec G115 -- bytes.Buffer.Len() is nonnegative.
 	})
 	return nil
 }
@@ -176,7 +174,6 @@ func (c *chunkedContentCoder) Add(docNum uint64, vals []byte) error {
 //
 // | ..... data ..... | chunk offsets (varints)
 // | position of chunk offsets (uint64) | number of offsets (uint64) |
-//
 func (c *chunkedContentCoder) Write() (int, error) {
 	var tw int
 

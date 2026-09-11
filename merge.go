@@ -26,6 +26,7 @@ import (
 	"github.com/RoaringBitmap/roaring/v2"
 	"github.com/blevesearch/vellum"
 	segment "github.com/vcaesar/bluge_segment_api"
+
 	"github.com/vcaesar/ice/compress"
 )
 
@@ -51,6 +52,9 @@ func (m *Merger) WriteTo(w io.Writer, closeCh chan struct{}) (n int64, err error
 		return
 	}
 
+	if sz > math.MaxInt64 {
+		return 0, fmt.Errorf("merged segment size exceeds int64")
+	}
 	n = int64(sz)
 	err = bw.Flush()
 	if err != nil {
@@ -106,7 +110,7 @@ func mergeSegmentBasesWriter(segmentBases []*Segment, drops []*roaring.Bitmap, w
 		return nil, 0, err
 	}
 
-	return newDocNums, uint64(cr.Count()), nil
+	return newDocNums, uint64(cr.Count()), nil // #nosec G115 -- countHashWriter checks overflow and counts nonnegative writes.
 }
 
 func mergeToWriter(segments []*Segment, drops []*roaring.Bitmap,
@@ -116,9 +120,15 @@ func mergeToWriter(segments []*Segment, drops []*roaring.Bitmap,
 	docValueOffset := uint64(fieldNotUninverted)
 
 	fieldsSame, fieldsInv := mergeFields(segments)
-	fieldsMap := mapFields(fieldsInv)
+	fieldsMap, err := mapFields(fieldsInv)
+	if err != nil {
+		return nil, nil, err
+	}
 
-	numDocs := computeNewDocCount(segments, drops)
+	numDocs, err := computeNewDocCount(segments, drops)
+	if err != nil {
+		return nil, nil, err
+	}
 
 	if isClosed(closeCh) {
 		return nil, nil, segment.ErrClosed
@@ -143,16 +153,16 @@ func mergeToWriter(segments []*Segment, drops []*roaring.Bitmap,
 		}
 
 		for i, seg := range segments {
-			min, max := seg.Timestamp()
-			if min == 0 && max == 0 {
+			minimum, maximum := seg.Timestamp()
+			if minimum == 0 && maximum == 0 {
 				docTimeMin, docTimeMax = 0, 0
 				break
 			}
-			if i == 0 || min < docTimeMin {
-				docTimeMin = min
+			if i == 0 || minimum < docTimeMin {
+				docTimeMin = minimum
 			}
-			if i == 0 || max > docTimeMax {
-				docTimeMax = max
+			if i == 0 || maximum > docTimeMax {
+				docTimeMax = maximum
 			}
 		}
 	} else {
@@ -170,32 +180,47 @@ func mergeToWriter(segments []*Segment, drops []*roaring.Bitmap,
 		storedIndexOffset: storedIndexOffset,
 		fieldsIndexOffset: fieldsIndexOffset,
 		docValueOffset:    docValueOffset,
-		docTimeMin:        uint64(docTimeMin),
-		docTimeMax:        uint64(docTimeMax),
+		docTimeMin:        uint64(docTimeMin), // #nosec G115 -- preserve signed timestamp bits in the uint64 wire format.
+		docTimeMax:        uint64(docTimeMax), // #nosec G115 -- preserve signed timestamp bits in the uint64 wire format.
 	}, nil
 }
 
 // mapFields takes the fieldsInv list and returns a map of fieldName
 // to fieldID+1
-func mapFields(fields []string) map[string]uint16 {
+func mapFields(fields []string) (map[string]uint16, error) {
+	if len(fields) > math.MaxUint16 {
+		return nil, fmt.Errorf("too many merged fields for uint16 field IDs")
+	}
 	rv := make(map[string]uint16, len(fields))
 	for i, fieldName := range fields {
+		// #nosec G115 -- len(fields) <= MaxUint16 above; i+1 reserves zero without wrapping.
 		rv[fieldName] = uint16(i) + 1
 	}
-	return rv
+	return rv, nil
 }
 
 // computeNewDocCount determines how many documents will be in the newly
 // merged segment when obsoleted docs are dropped
-func computeNewDocCount(segments []*Segment, drops []*roaring.Bitmap) uint64 {
+func computeNewDocCount(segments []*Segment, drops []*roaring.Bitmap) (uint64, error) {
 	var newDocCount uint64
 	for segI, seg := range segments {
-		newDocCount += seg.footer.numDocs
-		if drops[segI] != nil {
-			newDocCount -= drops[segI].GetCardinality()
+		count := seg.footer.numDocs
+		if count > uint64(math.MaxUint32)+1 {
+			return 0, fmt.Errorf("source document count exceeds uint32 document numbers")
 		}
+		if drops[segI] != nil {
+			dropped := drops[segI].GetCardinality()
+			if dropped > count {
+				return 0, fmt.Errorf("dropped document count exceeds source document count")
+			}
+			count -= dropped
+		}
+		if count > uint64(math.MaxUint32)+1-newDocCount {
+			return 0, fmt.Errorf("too many merged documents for uint32 document numbers")
+		}
+		newDocCount += count
 	}
-	return newDocCount
+	return newDocCount, nil
 }
 
 func persistMergedRest(segments []*Segment, dropsIn []*roaring.Bitmap,
@@ -243,6 +268,7 @@ func persistMergedRest(segments []*Segment, dropsIn []*roaring.Bitmap,
 			return nil, nil, nil, 0, err
 		}
 
+		// #nosec G115 -- fieldID indexes fieldsInv, bounded to MaxUint16 by mapFields.
 		fieldDocs[uint16(fieldID)] += fieldDocTracking.GetCardinality()
 	}
 
@@ -355,7 +381,7 @@ func persistMergedRestField(segments []*Segment, dropsIn []*roaring.Bitmap, fiel
 
 func writeMergedDict(w *countHashWriter, newVellum io.Closer, vellumBuf *bytes.Buffer,
 	bufMaxVarintLen64 []byte, fieldID int, dictLocs []uint64) error {
-	dictOffset := uint64(w.Count())
+	dictOffset := uint64(w.Count()) // #nosec G115 -- countHashWriter checks overflow and counts nonnegative writes.
 
 	err := newVellum.Close()
 	if err != nil {
@@ -383,7 +409,7 @@ func writeMergedDict(w *countHashWriter, newVellum io.Closer, vellumBuf *bytes.B
 func buildMergedDocVals(newSegDocCount uint64, w *countHashWriter, closeCh chan struct{}, fieldName string, fieldID int,
 	fieldDvLocsStart, fieldDvLocsEnd []uint64, segmentsInFocus []*Segment, newDocNums [][]uint64) error {
 	// get the field doc value offset (start)
-	fieldDvLocsStart[fieldID] = uint64(w.Count())
+	fieldDvLocsStart[fieldID] = uint64(w.Count()) // #nosec G115 -- countHashWriter checks overflow and counts nonnegative writes.
 
 	// update the field doc values
 	// NOTE: doc values continue to use legacy chunk mode
@@ -436,7 +462,7 @@ func buildMergedDocVals(newSegDocCount uint64, w *countHashWriter, closeCh chan 
 		}
 
 		// get the field doc value offset (end)
-		fieldDvLocsEnd[fieldID] = uint64(w.Count())
+		fieldDvLocsEnd[fieldID] = uint64(w.Count()) // #nosec G115 -- countHashWriter checks overflow and counts nonnegative writes.
 	} else {
 		fieldDvLocsStart[fieldID] = fieldNotUninverted
 		fieldDvLocsEnd[fieldID] = fieldNotUninverted
@@ -459,6 +485,7 @@ func prepareNewTerm(newSegDocCount uint64, chunkMode uint32, tfEncoder, locEncod
 			return err
 		}
 		newCard += pl.Count()
+		// #nosec G115 -- fieldID indexes fieldsInv, bounded to MaxUint16 by mapFields.
 		fieldFreqs[uint16(fieldID)] += newCard
 	}
 	// compute correct chunk size with this
@@ -521,7 +548,7 @@ func finishTerm(w *countHashWriter, newRoaring *roaring.Bitmap, tfEncoder, locEn
 }
 
 func writeDvLocs(w *countHashWriter, bufMaxVarintLen64 []byte, fieldDvLocsStart, fieldDvLocsEnd []uint64) (uint64, error) {
-	fieldDvLocsOffset := uint64(w.Count())
+	fieldDvLocsOffset := uint64(w.Count()) // #nosec G115 -- countHashWriter checks overflow and counts nonnegative writes.
 
 	buf := bufMaxVarintLen64
 	for i := 0; i < len(fieldDvLocsStart); i++ {
@@ -539,6 +566,7 @@ func writeDvLocs(w *countHashWriter, bufMaxVarintLen64 []byte, fieldDvLocsStart,
 	return fieldDvLocsOffset, nil
 }
 
+//nolint:gocritic // tooManyResults: keep the existing parallel slices aligned without changing the merge API.
 func setupActiveForField(segments []*Segment, dropsIn []*roaring.Bitmap, newDocNumsIn [][]uint64, closeCh chan struct{},
 	fieldName string) (newDocNums [][]uint64, drops []*roaring.Bitmap, dicts []*Dictionary, itrs []vellum.Iterator,
 	segmentsInFocus []*Segment, err error) {
@@ -588,10 +616,16 @@ func mergeTermFreqNormLocs(fieldsMap map[string]uint16, postItr *PostingsIterato
 			return 0, 0, 0, nil, fmt.Errorf("see hit with dropped docNum")
 		}
 
+		if hitNewDocNum > math.MaxUint32 {
+			return 0, 0, 0, nil, fmt.Errorf("merged document number exceeds uint32")
+		}
 		newRoaring.Add(uint32(hitNewDocNum))
 		docTracking.Add(uint32(hitNewDocNum))
 
 		nextFreq := next.Frequency()
+		if nextFreq < 0 {
+			return 0, 0, 0, nil, fmt.Errorf("negative posting frequency")
+		}
 		nextNorm := uint64(math.Float32bits(float32(next.Norm())))
 
 		locs := next.Locations()
@@ -605,6 +639,7 @@ func mergeTermFreqNormLocs(fieldsMap map[string]uint16, postItr *PostingsIterato
 		if len(locs) > 0 {
 			numBytesLocs := 0
 			for _, loc := range locs {
+				// #nosec G115 -- PostingsIterator.readLocation validates nonnegative int-sized locations.
 				numBytesLocs += totalUvarintBytes(uint64(fieldsMap[loc.Field()]-1),
 					uint64(loc.Pos()), uint64(loc.Start()), uint64(loc.End()))
 			}
@@ -620,9 +655,9 @@ func mergeTermFreqNormLocs(fieldsMap map[string]uint16, postItr *PostingsIterato
 				}
 				args := bufLoc[0:4]
 				args[0] = uint64(fieldsMap[loc.Field()] - 1)
-				args[1] = uint64(loc.Pos())
-				args[2] = uint64(loc.Start())
-				args[3] = uint64(loc.End())
+				args[1] = uint64(loc.Pos())   // #nosec G115 -- readLocation validates nonnegative int-sized locations.
+				args[2] = uint64(loc.Start()) // #nosec G115 -- readLocation validates nonnegative int-sized locations.
+				args[3] = uint64(loc.End())   // #nosec G115 -- readLocation validates nonnegative int-sized locations.
 				err = locEncoder.Add(hitNewDocNum, args...)
 				if err != nil {
 					return 0, 0, 0, nil, err
@@ -708,7 +743,7 @@ func mergeStoredAndRemap(segments []*Segment, drops []*roaring.Bitmap,
 	}
 
 	// return value is the start of the stored index
-	storedIndexOffset = uint64(w.Count())
+	storedIndexOffset = uint64(w.Count()) // #nosec G115 -- countHashWriter checks overflow and counts nonnegative writes.
 
 	// now write out the stored doc index
 	for _, docNumOffset := range docNumOffsets {
@@ -794,7 +829,7 @@ func (s *Segment) copyStoredDocs(newDocNum uint64, newDocNumOffsets []uint64, do
 		if chunkOffstart == chunkOffend {
 			continue
 		}
-		compressed, err := s.data.Read(int(chunkOffstart), int(chunkOffend))
+		compressed, err := readDataAt(s.data, chunkOffstart, chunkOffend-chunkOffstart)
 		if err != nil {
 			return err
 		}

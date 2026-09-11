@@ -23,6 +23,7 @@ import (
 	segment "github.com/vcaesar/bluge_segment_api"
 
 	"github.com/spf13/cobra"
+
 	"github.com/vcaesar/ice"
 )
 
@@ -35,7 +36,7 @@ var RootCmd = &cobra.Command{
 	Use:   "ice",
 	Short: "command-line tool to interact with an ice file",
 	Long:  `Ice is a command-line tool to interact with an ice file.`,
-	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+	PersistentPreRunE: func(_ *cobra.Command, args []string) error {
 
 		if len(args) < rootArgFilename {
 			return fmt.Errorf("must specify path to file")
@@ -49,7 +50,7 @@ var RootCmd = &cobra.Command{
 
 		return nil
 	},
-	PersistentPostRunE: func(cmd *cobra.Command, args []string) error {
+	PersistentPostRunE: func(_ *cobra.Command, _ []string) error {
 		return nil
 	},
 }

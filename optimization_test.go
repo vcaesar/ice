@@ -11,6 +11,7 @@ import (
 	"time"
 
 	segment "github.com/vcaesar/bluge_segment_api"
+
 	"github.com/vcaesar/ice/compress"
 )
 
@@ -25,8 +26,8 @@ func optimizationFileData(t *testing.T, contents []byte) *segment.Data {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		if err := f.Close(); err != nil {
-			t.Error(err)
+		if closeErr := f.Close(); closeErr != nil {
+			t.Error(closeErr)
 		}
 	})
 	data, err := segment.NewDataFile(f)
@@ -154,8 +155,8 @@ func TestOptimizationStoredCacheSize(t *testing.T) {
 				if s.Size() < before {
 					t.Error("size fell below base")
 				}
-				if _, _, err := s.getDocStoredMetaAndUnCompressed(0); err != nil {
-					t.Error(err)
+				if _, _, readErr := s.getDocStoredMetaAndUnCompressed(0); readErr != nil {
+					t.Error(readErr)
 					return
 				}
 			}
