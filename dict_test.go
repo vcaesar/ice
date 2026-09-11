@@ -19,7 +19,7 @@ import (
 	"reflect"
 	"testing"
 
-	segment "github.com/blugelabs/bluge_segment_api"
+	segment "github.com/vcaesar/bluge_segment_api"
 
 	"github.com/blevesearch/vellum/levenshtein"
 )

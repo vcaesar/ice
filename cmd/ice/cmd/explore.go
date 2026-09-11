@@ -18,8 +18,8 @@ import (
 	"fmt"
 	"strconv"
 
-	segment "github.com/blugelabs/bluge_segment_api"
 	"github.com/spf13/cobra"
+	segment "github.com/vcaesar/bluge_segment_api"
 )
 
 const (

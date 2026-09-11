@@ -21,8 +21,8 @@ import (
 	"math"
 	"sort"
 
-	segment "github.com/blugelabs/bluge_segment_api"
 	"github.com/blugelabs/ice/compress"
+	segment "github.com/vcaesar/bluge_segment_api"
 )
 
 type docNumTermsVisitor func(docNum uint64, terms []byte) error
@@ -283,7 +283,7 @@ func (s *Segment) visitDocumentFieldTerms(localDocNum uint64, fields []string,
 	visitor segment.DocumentValueVisitor, dvs *docVisitState) (
 	*docVisitState, error) {
 	if dvs == nil {
-		dvs = &docVisitState{}
+		dvs = &docVisitState{segment: s}
 	} else if dvs.segment != s {
 		dvs.segment = s
 		dvs.dvrs = nil

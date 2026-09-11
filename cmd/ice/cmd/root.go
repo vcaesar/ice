@@ -20,7 +20,7 @@ import (
 	"unicode"
 
 	"github.com/blevesearch/mmap-go"
-	segment "github.com/blugelabs/bluge_segment_api"
+	segment "github.com/vcaesar/bluge_segment_api"
 
 	"github.com/blugelabs/ice"
 	"github.com/spf13/cobra"

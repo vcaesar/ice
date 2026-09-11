@@ -19,7 +19,7 @@ import (
 	"io"
 	"math"
 
-	"github.com/RoaringBitmap/roaring"
+	"github.com/RoaringBitmap/roaring/v2"
 )
 
 const fieldNotUninverted = math.MaxUint64

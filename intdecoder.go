@@ -18,8 +18,8 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	segment "github.com/blugelabs/bluge_segment_api"
 	"github.com/blugelabs/ice/compress"
+	segment "github.com/vcaesar/bluge_segment_api"
 )
 
 type chunkedIntDecoder struct {

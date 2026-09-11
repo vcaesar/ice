@@ -10,3 +10,7 @@
 /cmd/ice/ice
 *.test
 tags
+
+.v0
+.codg
+test

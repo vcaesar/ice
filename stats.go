@@ -15,7 +15,7 @@
 package ice
 
 import (
-	segment "github.com/blugelabs/bluge_segment_api"
+	segment "github.com/vcaesar/bluge_segment_api"
 )
 
 type CollectionStats struct {

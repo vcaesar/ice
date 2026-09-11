@@ -19,7 +19,7 @@ import (
 	"fmt"
 
 	"github.com/blevesearch/vellum"
-	segment "github.com/blugelabs/bluge_segment_api"
+	segment "github.com/vcaesar/bluge_segment_api"
 )
 
 // Open returns an impl of a segment
