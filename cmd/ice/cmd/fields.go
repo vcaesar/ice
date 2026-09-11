@@ -24,7 +24,7 @@ var fieldsCmd = &cobra.Command{
 	Use:   "fields [path]",
 	Short: "fields prints the fields in the specified file",
 	Long:  `The fields command lets you print the fields in the specified file.`,
-	RunE: func(cmd *cobra.Command, args []string) error {
+	RunE: func(_ *cobra.Command, _ []string) error {
 		fields := seg.Fields()
 		for i, field := range fields {
 			cs, err := seg.CollectionStats(field)

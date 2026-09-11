@@ -115,7 +115,7 @@ func TestMergeWithEmptySegmentsFirst(t *testing.T) {
 
 func testMergeWithEmptySegments(t *testing.T, before bool, numEmptySegments int) {
 	path, cleanup := setupTestDir(t)
-	defer cleanup()
+	t.Cleanup(cleanup)
 
 	segPath := filepath.Join(path, "segment.ice")
 	seg, closeF, err := createDiskSegment(buildTestSegmentMulti, segPath)
@@ -146,12 +146,11 @@ func testMergeWithEmptySegments(t *testing.T, before bool, numEmptySegments int)
 		if err != nil {
 			t.Fatalf("error opening segment: %v", err)
 		}
-		defer func(emptyClose closeFunc) {
-			cerr := emptyClose()
-			if cerr != nil {
-				t.Fatalf("error closing segment: %v", err)
+		t.Cleanup(func() {
+			if closeErr := emptyClose(); closeErr != nil {
+				t.Errorf("error closing segment: %v", closeErr)
 			}
-		}(emptyClose)
+		})
 
 		segsToMerge = append(segsToMerge, emptyFileSegment)
 	}
@@ -203,7 +202,7 @@ func createAndPersistEmptySegment(t *testing.T, path string) {
 
 func testMergeWithSelf(t *testing.T, segCur *Segment, expectedCount uint64) {
 	path, cleanup := setupTestDir(t)
-	defer cleanup()
+	t.Cleanup(cleanup)
 
 	// trying merging the segment with itself for a few rounds
 	var diffs []string
@@ -225,12 +224,11 @@ func testMergeWithSelf(t *testing.T, segCur *Segment, expectedCount uint64) {
 		if err != nil {
 			t.Fatalf("error opening merged segment: %v", err)
 		}
-		defer func(close closeFunc) {
-			cerr := close()
-			if cerr != nil {
-				t.Fatalf("error closing segment: %v", err)
+		t.Cleanup(func() {
+			if closeErr := closeNew(); closeErr != nil {
+				t.Errorf("error closing segment: %v", closeErr)
 			}
-		}(closeNew)
+		})
 
 		if segNew.Count() != expectedCount {
 			t.Fatalf("wrong count")
@@ -544,7 +542,7 @@ func testMergeAndDrop(t *testing.T, docsToDrop []*roaring.Bitmap) {
 }
 
 func TestMergeWithUpdates(t *testing.T) {
-	segmentDocIds := [][]string{
+	segmentDocIDs := [][]string{
 		{"a", "b"},
 		{"b", "c"}, // doc "b" updated
 	}
@@ -554,23 +552,23 @@ func TestMergeWithUpdates(t *testing.T) {
 	docsToDrop[0].AddInt(1) // doc "b" updated
 	docsToDrop[1] = roaring.NewBitmap()
 
-	testMergeWithUpdates(t, segmentDocIds, docsToDrop, 3)
+	testMergeWithUpdates(t, segmentDocIDs, docsToDrop, 3)
 }
 
 func TestMergeWithUpdatesOnManySegments(t *testing.T) {
-	segmentDocIds := [][]string{
+	segmentDocIDs := [][]string{
 		{"a", "b"},
 		{"b", "c"}, // doc "b" updated
 		{"c", "d"}, // doc "c" updated
 		{"d", "e"}, // doc "d" updated
 	}
 
-	docsToDrop := makeDeletedBitmaps(len(segmentDocIds))
+	docsToDrop := makeDeletedBitmaps(len(segmentDocIDs))
 	docsToDrop[0].AddInt(1) // doc "b" updated
 	docsToDrop[1].AddInt(1) // doc "c" updated
 	docsToDrop[2].AddInt(1) // doc "d" updated
 
-	testMergeWithUpdates(t, segmentDocIds, docsToDrop, 5)
+	testMergeWithUpdates(t, segmentDocIDs, docsToDrop, 5)
 }
 
 func makeDeletedBitmaps(num int) []*roaring.Bitmap {
@@ -582,35 +580,38 @@ func makeDeletedBitmaps(num int) []*roaring.Bitmap {
 }
 
 func TestMergeWithUpdatesOnOneDoc(t *testing.T) {
-	segmentDocIds := [][]string{
+	segmentDocIDs := [][]string{
 		{"a", "b"},
 		{"a", "c"}, // doc "a" updated
 		{"a", "d"}, // doc "a" updated
 		{"a", "e"}, // doc "a" updated
 	}
 
-	docsToDrop := makeDeletedBitmaps(len(segmentDocIds))
+	docsToDrop := makeDeletedBitmaps(len(segmentDocIDs))
 	docsToDrop[0].AddInt(0) // doc "a" updated
 	docsToDrop[1].AddInt(0) // doc "a" updated
 	docsToDrop[2].AddInt(0) // doc "a" updated
 
-	testMergeWithUpdates(t, segmentDocIds, docsToDrop, 5)
+	testMergeWithUpdates(t, segmentDocIDs, docsToDrop, 5)
 }
 
-func testMergeWithUpdates(t *testing.T, segmentDocIds [][]string, docsToDrop []*roaring.Bitmap, expectedNumDocs uint64) {
+func testMergeWithUpdates(t *testing.T, segmentDocIDs [][]string, docsToDrop []*roaring.Bitmap, expectedNumDocs uint64) {
 	path, cleanup := setupTestDir(t)
-	defer cleanup()
+	t.Cleanup(cleanup)
 
 	var segsToMerge []segment.Segment
 
-	// convert segmentDocIds to segsToMerge
-	for i, docIds := range segmentDocIds {
+	// convert segmentDocIDs to segsToMerge
+	for i, docIDs := range segmentDocIDs {
 		fname := fmt.Sprintf("segment%d.ice", i)
 
 		segPath := filepath.Join(path, fname)
 
-		testSeg, _, _ := buildTestSegmentMultiHelper(docIds)
-		err := persistToFile(testSeg, segPath)
+		testSeg, _, err := buildTestSegmentMultiHelper(docIDs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = persistToFile(testSeg, segPath)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -618,12 +619,11 @@ func testMergeWithUpdates(t *testing.T, segmentDocIds [][]string, docsToDrop []*
 		if err != nil {
 			t.Fatalf("error opening segment: %v", err)
 		}
-		defer func(closeF closeFunc) {
-			cerr := closeF()
-			if cerr != nil {
-				t.Fatalf("error closing segment: %v", err)
+		t.Cleanup(func() {
+			if closeErr := closeF(); closeErr != nil {
+				t.Errorf("error closing segment: %v", closeErr)
 			}
-		}(closeF)
+		})
 
 		segsToMerge = append(segsToMerge, seg)
 	}
@@ -666,9 +666,9 @@ func buildTestSegmentMulti2() (*Segment, uint64, error) {
 	return buildTestSegmentMultiHelper([]string{"c", "d"})
 }
 
-func buildTestSegmentMultiHelper(docIds []string) (*Segment, uint64, error) {
+func buildTestSegmentMultiHelper(docIDs []string) (*Segment, uint64, error) {
 	doc := &FakeDocument{
-		NewFakeField("_id", docIds[0], true, false, false),
+		NewFakeField("_id", docIDs[0], true, false, false),
 		NewFakeField("name", "mat", true, true, false),
 		NewFakeField("desc", "some thing", true, true, false),
 		NewFakeField("tag", "cold", true, true, false),
@@ -677,7 +677,7 @@ func buildTestSegmentMultiHelper(docIds []string) (*Segment, uint64, error) {
 	doc.FakeComposite("_all", []string{"_id"})
 
 	doc2 := &FakeDocument{
-		NewFakeField("_id", docIds[1], true, false, false),
+		NewFakeField("_id", docIDs[1], true, false, false),
 		NewFakeField("name", "joa", true, true, false),
 		NewFakeField("desc", "some thing", true, true, false),
 		NewFakeField("tag", "cold", true, true, false),

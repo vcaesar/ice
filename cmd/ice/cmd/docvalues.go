@@ -27,7 +27,7 @@ var docValuesCmd = &cobra.Command{
 	Use:   "docvalues [path] [docNum] [fields]",
 	Short: "docvalues prints the doc values details for a doc number",
 	Long:  `The docvalues command prints the docValues for the specified document number.`,
-	RunE: func(cmd *cobra.Command, args []string) error {
+	RunE: func(_ *cobra.Command, args []string) error {
 
 		if len(args) < docValuesArgDocNum {
 			return fmt.Errorf("must specify doc number")

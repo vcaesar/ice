@@ -89,9 +89,10 @@ func (s *Segment) Version() uint32 {
 	return s.footer.version
 }
 
-func (s *Segment) Timestamp() (int64, int64) {
+func (s *Segment) Timestamp() (minimum, maximum int64) {
 	if s.footer != nil {
-		return int64(s.footer.docTimeMin), int64(s.footer.docTimeMax)
+		// The uint64 wire fields contain signed, two's-complement timestamps.
+		return int64(s.footer.docTimeMin), int64(s.footer.docTimeMax) // #nosec G115 -- intentional signed timestamp bit reinterpretation.
 	}
 	return 0, 0
 }

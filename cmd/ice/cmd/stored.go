@@ -28,7 +28,7 @@ var storedCmd = &cobra.Command{
 	Use:   "stored [path] [docNum]",
 	Short: "prints the stored section for a doc number",
 	Long:  `The stored command will print the raw stored data bytes for the specified document number.`,
-	RunE: func(cmd *cobra.Command, args []string) error {
+	RunE: func(_ *cobra.Command, args []string) error {
 		if len(args) < storedArgDocNum {
 			return fmt.Errorf("must specify doc number")
 		}

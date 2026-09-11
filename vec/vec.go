@@ -50,7 +50,7 @@ func Encode(vector []float32) ([]byte, error) {
 	data := make([]byte, headerSize+4*len(vector))
 	copy(data, magic)
 	data[4] = 1
-	binary.LittleEndian.PutUint32(data[5:9], uint32(len(vector)))
+	binary.LittleEndian.PutUint32(data[5:9], uint32(len(vector))) // #nosec G115 -- len(vector) <= MaxUint32 above.
 	for i, v := range vector {
 		binary.LittleEndian.PutUint32(data[headerSize+4*i:], math.Float32bits(v))
 	}
@@ -67,7 +67,7 @@ func Decode(data []byte) ([]float32, error) {
 	if n == 0 || n*4 != uint64(len(data)-headerSize) {
 		return nil, fmt.Errorf("invalid vector payload length")
 	}
-	vector := make([]float32, int(n))
+	vector := make([]float32, (len(data)-headerSize)/4)
 	for i := range vector {
 		vector[i] = math.Float32frombits(binary.LittleEndian.Uint32(data[headerSize+4*i:]))
 	}

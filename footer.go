@@ -69,13 +69,12 @@ func parseFooter(data *segment.Data) (*footer, error) {
 			footerLen)
 	}
 
-	rv := &footer{}
 	crcOffset := data.Len() - crcWidth
 	crcData, err := data.Read(crcOffset, crcOffset+crcWidth)
 	if err != nil {
 		return nil, err
 	}
-	rv.crc = binary.BigEndian.Uint32(crcData)
+	rv := &footer{crc: binary.BigEndian.Uint32(crcData)}
 
 	verOffset := crcOffset - verWidth
 	verData, err := data.Read(verOffset, verOffset+verWidth)

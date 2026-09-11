@@ -87,7 +87,7 @@ func TestOpen(t *testing.T) {
 
 func expectNumberOfStoredFields(t *testing.T, seg *Segment, docNum uint64, expectedCount int) {
 	var fieldValuesSeen int
-	err := seg.VisitStoredFields(docNum, func(field string, value []byte) bool {
+	err := seg.VisitStoredFields(docNum, func(_ string, _ []byte) bool {
 		fieldValuesSeen++
 		return true
 	})

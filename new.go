@@ -17,6 +17,7 @@ package ice
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"math"
 	"sort"
 	"sync"
@@ -257,23 +258,34 @@ type interimLoc struct {
 }
 
 func (s *interim) convert() (f *footer, dictOffsets, storedFieldChunkOffsets []uint64, err error) {
+	if uint64(len(s.results)) > uint64(math.MaxUint32)+1 {
+		return nil, nil, nil, fmt.Errorf("too many documents for uint32 document numbers")
+	}
 	s.FieldsMap = map[string]uint16{}
 	s.FieldDocs = map[uint16]uint64{}
 	s.FieldFreqs = map[uint16]uint64{}
 
 	// FIXME review if this is still necessary
 	// YES, integration tests fail when removed
-	s.getOrDefineField(_idFieldName) // _id field is fieldID 0
+	if _, err = s.getOrDefineField(_idFieldName); err != nil { // _id field is fieldID 0
+		return nil, nil, nil, err
+	}
 
 	for _, result := range s.results {
 		result.EachField(func(field segment.Field) {
-			s.getOrDefineField(field.Name())
+			if err == nil {
+				_, err = s.getOrDefineField(field.Name())
+			}
 		})
+		if err != nil {
+			return nil, nil, nil, err
+		}
 	}
 
 	sort.Strings(s.FieldsInv[1:]) // keep _id as first field
 
 	for fieldID, fieldName := range s.FieldsInv {
+		// #nosec G115 -- getOrDefineField caps FieldsInv at MaxUint16; IDs reserve zero.
 		s.FieldsMap[fieldName] = uint16(fieldID + 1)
 	}
 
@@ -289,7 +301,9 @@ func (s *interim) convert() (f *footer, dictOffsets, storedFieldChunkOffsets []u
 		sort.Strings(dict)
 	}
 
-	s.processDocuments()
+	if err = s.processDocuments(); err != nil {
+		return nil, nil, nil, err
+	}
 
 	var storedIndexOffset uint64
 	storedIndexOffset, storedFieldChunkOffsets, err = s.writeStoredFields()
@@ -320,14 +334,18 @@ func (s *interim) convert() (f *footer, dictOffsets, storedFieldChunkOffsets []u
 		fieldsIndexOffset: fieldsIndexOffset,
 		docValueOffset:    fdvIndexOffset,
 		version:           Version,
-		docTimeMin:        uint64(docTimeMin),
-		docTimeMax:        uint64(docTimeMax),
+		docTimeMin:        uint64(docTimeMin), // #nosec G115 -- preserve signed timestamp bits in the uint64 wire format.
+		docTimeMax:        uint64(docTimeMax), // #nosec G115 -- preserve signed timestamp bits in the uint64 wire format.
 	}, dictOffsets, storedFieldChunkOffsets, nil
 }
 
-func (s *interim) getOrDefineField(fieldName string) int {
+func (s *interim) getOrDefineField(fieldName string) (uint16, error) {
 	fieldIDPlus1, exists := s.FieldsMap[fieldName]
 	if !exists {
+		if len(s.FieldsInv) >= math.MaxUint16 {
+			return 0, fmt.Errorf("too many fields for uint16 field IDs")
+		}
+		// #nosec G115 -- len(FieldsInv) < MaxUint16 above, so len+1 fits the reserved-zero field encoding.
 		fieldIDPlus1 = uint16(len(s.FieldsInv) + 1)
 		s.FieldsMap[fieldName] = fieldIDPlus1
 		s.FieldsInv = append(s.FieldsInv, fieldName)
@@ -343,7 +361,7 @@ func (s *interim) getOrDefineField(fieldName string) int {
 		}
 	}
 
-	return int(fieldIDPlus1 - 1)
+	return fieldIDPlus1 - 1, nil
 }
 
 // fill Dicts and DictKeys from analysis results
@@ -413,7 +431,7 @@ func (s *interim) prepareDictsForDocument(result segment.Document, pidNext, totL
 	pidNextOut, totLocsOut, totTFsOut int) {
 	fieldsSeen := map[uint16]struct{}{}
 	result.EachField(func(field segment.Field) {
-		fieldID := uint16(s.getOrDefineField(field.Name()))
+		fieldID := s.FieldsMap[field.Name()] - 1
 
 		fieldsSeen[fieldID] = struct{}{}
 		s.FieldFreqs[fieldID] += uint64(field.Length())
@@ -461,7 +479,7 @@ func (s *interim) prepareDictsForDocument(result segment.Document, pidNext, totL
 	return pidNext, totLocs, totTFs
 }
 
-func (s *interim) processDocuments() {
+func (s *interim) processDocuments() error {
 	numFields := len(s.FieldsInv)
 	reuseFieldLens := make([]int, numFields)
 	reuseFieldTFs := make([]tokenFrequencies, numFields)
@@ -472,16 +490,19 @@ func (s *interim) processDocuments() {
 			reuseFieldTFs[i] = nil
 		}
 
-		s.processDocument(uint64(docNum), result,
-			reuseFieldLens, reuseFieldTFs)
+		if err := s.processDocument(uint64(docNum), result,
+			reuseFieldLens, reuseFieldTFs); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 func (s *interim) processDocument(docNum uint64,
 	result segment.Document,
-	fieldLens []int, fieldTFs []tokenFrequencies) {
+	fieldLens []int, fieldTFs []tokenFrequencies) error {
 	visitField := func(field segment.Field) {
-		fieldID := uint16(s.getOrDefineField(field.Name()))
+		fieldID := s.FieldsMap[field.Name()] - 1
 		fieldLens[fieldID] += field.Length()
 
 		if existingFreqs := fieldTFs[fieldID]; existingFreqs == nil {
@@ -532,6 +553,7 @@ func (s *interim) processDocument(docNum uint64,
 		for term, tf := range tfs {
 			pid := dict[term] - 1
 			bs := s.Postings[pid]
+			// #nosec G115 -- convert bounds results to MaxUint32+1; docNum is a results index.
 			bs.Add(uint32(docNum))
 
 			s.FreqNorms[pid] = append(s.FreqNorms[pid],
@@ -545,9 +567,14 @@ func (s *interim) processDocument(docNum uint64,
 				locs := s.Locs[pid]
 
 				for _, loc := range tf.Locations {
-					var locf = uint16(fieldID)
+					// #nosec G115 -- fieldTFs has one entry per field; getOrDefineField caps fields at MaxUint16.
+					locf := uint16(fieldID)
 					if loc.FieldVal != "" {
-						locf = uint16(s.getOrDefineField(loc.FieldVal))
+						var err error
+						locf, err = s.getOrDefineField(loc.FieldVal)
+						if err != nil {
+							return err
+						}
 					}
 					locs = append(locs, interimLoc{
 						fieldID: locf,
@@ -561,6 +588,7 @@ func (s *interim) processDocument(docNum uint64,
 			}
 		}
 	}
+	return nil
 }
 
 func (s *interim) writeStoredFields() (
@@ -589,7 +617,7 @@ func (s *interim) writeStoredFields() (
 		}
 
 		result.EachField(func(field segment.Field) {
-			fieldID := uint16(s.getOrDefineField(field.Name()))
+			fieldID := s.FieldsMap[field.Name()] - 1
 
 			if field.Store() {
 				isf := docStoredFields[fieldID]
@@ -609,6 +637,7 @@ func (s *interim) writeStoredFields() (
 
 		// handle fields
 		for fieldID := 0; fieldID < len(s.FieldsInv); fieldID++ {
+			// #nosec G115 -- getOrDefineField caps FieldsInv at MaxUint16.
 			isf, exists := docStoredFields[uint16(fieldID)]
 			if exists {
 				curr, data, err = encodeStoredFieldValues(
@@ -846,10 +875,10 @@ func (s *interim) writeDictsTermField(docTermMap [][]byte, dict map[string]uint6
 			termSeparator)
 	}
 
-	if err := tfEncoder.Close(); err != nil {
+	if err = tfEncoder.Close(); err != nil {
 		return err
 	}
-	if err := locEncoder.Close(); err != nil {
+	if err = locEncoder.Close(); err != nil {
 		return err
 	}
 
@@ -872,8 +901,7 @@ func (s *interim) writeDictsTermField(docTermMap [][]byte, dict map[string]uint6
 	return nil
 }
 
-func (s *interim) calcTimestamp() (int64, int64) {
-	var min, max int64
+func (s *interim) calcTimestamp() (minimum, maximum int64) {
 	for i, v := range s.results {
 		timed, ok := v.(interface{ Timestamp() int64 })
 		if !ok {
@@ -884,12 +912,12 @@ func (s *interim) calcTimestamp() (int64, int64) {
 		if t == 0 {
 			return 0, 0
 		}
-		if i == 0 || t < min {
-			min = t
+		if i == 0 || t < minimum {
+			minimum = t
 		}
-		if i == 0 || t > max {
-			max = t
+		if i == 0 || t > maximum {
+			maximum = t
 		}
 	}
-	return min, max
+	return minimum, maximum
 }

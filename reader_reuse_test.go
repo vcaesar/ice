@@ -46,7 +46,10 @@ func TestCopyStoredDocsMalformedPayload(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		s := &Segment{data: segment.NewDataBytes(encoded), footer: &footer{numDocs: 1}, storedFieldChunkOffsets: []uint64{0, uint64(len(encoded))}}
+		s := &Segment{
+			data: segment.NewDataBytes(encoded), footer: &footer{numDocs: 1},
+			storedFieldChunkOffsets: []uint64{0, uint64(len(encoded))},
+		}
 		var output bytes.Buffer
 		coder := newChunkedDocumentCoder(128, &output)
 		if err := s.copyStoredDocs(0, make([]uint64, 1), coder); err == nil {

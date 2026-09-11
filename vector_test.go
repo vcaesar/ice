@@ -83,8 +83,8 @@ func TestSearchVectorsPersistenceMerge(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() {
-		if err := closeFile(); err != nil {
-			t.Error(err)
+		if closeErr := closeFile(); closeErr != nil {
+			t.Error(closeErr)
 		}
 	}()
 	checkVectorMatches(t, reopened, 10, nil, want)
@@ -93,7 +93,7 @@ func TestSearchVectorsPersistenceMerge(t *testing.T) {
 	}
 	second := vectorSegment(t, FakeDocument{vectorField(t, 4, 0)})
 	mergedPath := filepath.Join(path, "merged.ice")
-	if _, err := mergeSegments([]segment.Segment{reopened, second}, []*roaring.Bitmap{roaring.BitmapOf(2), nil}, mergedPath); err != nil {
+	if _, err = mergeSegments([]segment.Segment{reopened, second}, []*roaring.Bitmap{roaring.BitmapOf(2), nil}, mergedPath); err != nil {
 		t.Fatal(err)
 	}
 	merged, closeMerged, err := openFromFile(mergedPath)
@@ -101,8 +101,8 @@ func TestSearchVectorsPersistenceMerge(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() {
-		if err := closeMerged(); err != nil {
-			t.Error(err)
+		if closeErr := closeMerged(); closeErr != nil {
+			t.Error(closeErr)
 		}
 	}()
 	checkVectorMatches(t, merged, 10, nil, []vec.Match{{Number: 3, Score: 4}, {Number: 0, Score: 3}, {Number: 1, Score: 3}})
@@ -148,7 +148,8 @@ func TestSearchVectorsValidation(t *testing.T) {
 	}
 	ctx, cancel = context.WithCancel(context.Background())
 	defer cancel()
-	if _, err := s.SearchVectors(ctx, "vector", []float32{1, 0}, 1, vec.DotProduct, func(uint64) bool { cancel(); return false }); !errors.Is(err, context.Canceled) {
+	if _, err := s.SearchVectors(ctx, "vector", []float32{1, 0}, 1, vec.DotProduct,
+		func(uint64) bool { cancel(); return false }); !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancel during filter: %v", err)
 	}
 }

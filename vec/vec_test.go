@@ -51,8 +51,15 @@ func TestCodec(t *testing.T) {
 	if !bytes.Equal(golden, []byte{'I', 'C', 'E', 'V', 1, 1, 0, 0, 0, 0, 0, 128, 63}) {
 		t.Fatalf("wire format: %x", golden)
 	}
+}
+
+func TestCodecRejectsMalformedData(t *testing.T) {
+	data, err := Encode([]float32{1, -2})
+	if err != nil {
+		t.Fatal(err)
+	}
 	for i := 0; i < len(data); i++ {
-		if _, err := Decode(data[:i]); err == nil {
+		if _, decodeErr := Decode(data[:i]); decodeErr == nil {
 			t.Fatalf("accepted truncation %d", i)
 		}
 	}
@@ -75,7 +82,7 @@ func TestCodec(t *testing.T) {
 			case "inf":
 				binary.LittleEndian.PutUint32(bad[9:], math.Float32bits(float32(math.Inf(1))))
 			}
-			if _, err := Decode(bad); err == nil {
+			if _, decodeErr := Decode(bad); decodeErr == nil {
 				t.Fatal("accepted invalid data")
 			}
 		})

@@ -27,7 +27,7 @@ var dictCmd = &cobra.Command{
 	Use:   "dict [path] [field]",
 	Short: "dict prints the term dictionary for the specified field",
 	Long:  `The dict command lets you print the term dictionary for the specified field.`,
-	RunE: func(cmd *cobra.Command, args []string) error {
+	RunE: func(_ *cobra.Command, args []string) error {
 		if len(args) < dictArgField {
 			return fmt.Errorf("must specify field")
 		}

@@ -24,7 +24,7 @@ var footerCmd = &cobra.Command{
 	Use:   "footer [path]",
 	Short: "prints the contents of the footer",
 	Long:  `The footer command will print the contents of the footer.`,
-	RunE: func(cmd *cobra.Command, args []string) error {
+	RunE: func(_ *cobra.Command, _ []string) error {
 
 		// fmt.Printf("Length: %d\n", len(data))
 		fmt.Printf("CRC: %#x\n", seg.CRC())

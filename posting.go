@@ -26,13 +26,13 @@ import (
 // FST or vellum value (uint64) encoding is determined by the top two
 // highest-order or most significant bits...
 //
-//  encoding  : MSB
-//  name      : 63  62  61...to...bit #0 (LSB)
-//  ----------+---+---+---------------------------------------------------
-//   general  : 0 | 0 | 62-bits of postingsOffset.
-//   ~        : 0 | 1 | reserved for future.
-//   1-hit    : 1 | 0 | 31-bits of positive float31 norm | 31-bits docNum.
-//   ~        : 1 | 1 | reserved for future.
+//	encoding  : MSB
+//	name      : 63  62  61...to...bit #0 (LSB)
+//	----------+---+---+---------------------------------------------------
+//	 general  : 0 | 0 | 62-bits of postingsOffset.
+//	 ~        : 0 | 1 | reserved for future.
+//	 1-hit    : 1 | 0 | 31-bits of positive float31 norm | 31-bits docNum.
+//	 ~        : 1 | 1 | reserved for future.
 //
 // Encoding "general" is able to handle all cases, where the
 // postingsOffset points to more information about the postings for
@@ -344,6 +344,9 @@ func (i *PostingsIterator) Empty() bool {
 }
 
 func (i *PostingsIterator) loadChunk(chunk int) error {
+	if chunk < 0 || uint64(chunk) > math.MaxUint32 {
+		return fmt.Errorf("posting chunk number out of range: %d", chunk)
+	}
 	if i.includeFreqNorm {
 		err := i.freqNormReader.loadChunk(chunk)
 		if err != nil {
@@ -533,12 +536,16 @@ func (i *PostingsIterator) nextDocNumAtOrAfter(atOrAfter uint64) (docNum uint64,
 		return docNum, true, nil
 	}
 
+	if atOrAfter > math.MaxUint32 {
+		i.Actual = nil
+		return 0, false, nil
+	}
 	if i.Actual == nil || !i.Actual.HasNext() {
 		return 0, false, nil
 	}
 
 	if i.postings == nil || i.postings.postings == i.ActualBM {
-		return i.nextDocNumAtOrAfterClean(atOrAfter)
+		return i.nextDocNumAtOrAfterClean(uint32(atOrAfter))
 	}
 
 	i.Actual.AdvanceIfNeeded(uint32(atOrAfter))
@@ -584,9 +591,9 @@ func (i *PostingsIterator) nextDocNumAtOrAfter(atOrAfter uint64) (docNum uint64,
 // optimization when the postings list is "clean" (e.g., no updates &
 // no deletions) where the all bitmap is the same as the actual bitmap
 func (i *PostingsIterator) nextDocNumAtOrAfterClean(
-	atOrAfter uint64) (docNum uint64, exists bool, err error) {
+	atOrAfter uint32) (docNum uint64, exists bool, err error) {
 	if !i.includeFreqNorm {
-		i.Actual.AdvanceIfNeeded(uint32(atOrAfter))
+		i.Actual.AdvanceIfNeeded(atOrAfter)
 
 		if !i.Actual.HasNext() {
 			return 0, false, nil // couldn't find anything
@@ -600,7 +607,7 @@ func (i *PostingsIterator) nextDocNumAtOrAfterClean(
 	n := i.Actual.Next()
 	nChunk := n / uint32(i.postings.chunkSize)
 
-	for uint64(n) < atOrAfter && i.Actual.HasNext() {
+	for n < atOrAfter && i.Actual.HasNext() {
 		n = i.Actual.Next()
 
 		nChunkPrev := nChunk
@@ -613,7 +620,7 @@ func (i *PostingsIterator) nextDocNumAtOrAfterClean(
 		}
 	}
 
-	if uint64(n) < atOrAfter {
+	if n < atOrAfter {
 		// couldn't find anything
 		return 0, false, nil
 	}

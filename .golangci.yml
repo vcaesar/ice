@@ -104,6 +104,8 @@ linters:
       - path: _test\.go
         linters:
           - mnd
+          # Keep independent test fixtures readable without coupling their literals.
+          - goconst
       - path: cmd/ice/cmd
         linters:
           - gochecknoinits

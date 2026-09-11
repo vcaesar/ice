@@ -28,6 +28,8 @@ import (
 // file)
 const termNotEncoded = 0
 
+const initialIntCoderCapacity = 64
+
 type chunkedIntCoder struct {
 	final     []byte
 	chunkSize uint64
@@ -47,7 +49,7 @@ func newChunkedIntCoder(chunkSize, maxDocNum uint64) *chunkedIntCoder {
 	rv := &chunkedIntCoder{
 		chunkSize: chunkSize,
 		chunkLens: make([]uint64, total),
-		final:     make([]byte, 0, 64),
+		final:     make([]byte, 0, initialIntCoderCapacity),
 	}
 
 	return rv
