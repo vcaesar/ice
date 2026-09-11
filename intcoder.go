@@ -82,7 +82,9 @@ func (c *chunkedIntCoder) Add(docNum uint64, vals ...uint64) error {
 	chunk := docNum / c.chunkSize
 	if chunk != c.currChunk {
 		// starting a new chunk
-		c.Close()
+		if err := c.Close(); err != nil {
+			return err
+		}
 		c.chunkBuf.Reset()
 		c.currChunk = chunk
 	}

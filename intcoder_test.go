@@ -18,9 +18,12 @@ import (
 	"bytes"
 	"reflect"
 	"testing"
+
+	"github.com/blugelabs/ice/compress"
 )
 
 func TestChunkIntCoder(t *testing.T) {
+	useCompression(t, compress.ZSTD)
 	tests := []struct {
 		maxDocNum uint64
 		chunkSize uint64
@@ -66,7 +69,9 @@ func TestChunkIntCoder(t *testing.T) {
 				t.Fatalf("error adding to intcoder: %v", err)
 			}
 		}
-		cic.Close()
+		if err := cic.Close(); err != nil {
+			t.Fatal(err)
+		}
 		var actual bytes.Buffer
 		_, err := cic.Write(&actual)
 		if err != nil {

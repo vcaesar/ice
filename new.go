@@ -21,9 +21,9 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/RoaringBitmap/roaring"
+	"github.com/RoaringBitmap/roaring/v2"
 	"github.com/blevesearch/vellum"
-	segment "github.com/blugelabs/bluge_segment_api"
+	segment "github.com/vcaesar/bluge_segment_api"
 )
 
 var newSegmentBufferNumResultsBump = 100
@@ -846,8 +846,12 @@ func (s *interim) writeDictsTermField(docTermMap [][]byte, dict map[string]uint6
 			termSeparator)
 	}
 
-	tfEncoder.Close()
-	locEncoder.Close()
+	if err := tfEncoder.Close(); err != nil {
+		return err
+	}
+	if err := locEncoder.Close(); err != nil {
+		return err
+	}
 
 	var postingsOffset uint64
 	postingsOffset, err =
@@ -869,19 +873,23 @@ func (s *interim) writeDictsTermField(docTermMap [][]byte, dict map[string]uint6
 }
 
 func (s *interim) calcTimestamp() (int64, int64) {
-	min := int64(math.MaxInt64)
-	max := int64(0)
-	for _, v := range s.results {
-		t := v.Timestamp()
-		if t < min {
+	var min, max int64
+	for i, v := range s.results {
+		timed, ok := v.(interface{ Timestamp() int64 })
+		if !ok {
+			return 0, 0
+		}
+		t := timed.Timestamp()
+		// Unknown timestamps must not allow the segment to be pruned.
+		if t == 0 {
+			return 0, 0
+		}
+		if i == 0 || t < min {
 			min = t
 		}
-		if t > max {
+		if i == 0 || t > max {
 			max = t
 		}
-	}
-	if min == math.MaxInt64 {
-		min = 0
 	}
 	return min, max
 }

@@ -20,11 +20,12 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"reflect"
 	"sync"
 
-	"github.com/RoaringBitmap/roaring"
+	"github.com/RoaringBitmap/roaring/v2"
 	"github.com/blevesearch/vellum"
-	segment "github.com/blugelabs/bluge_segment_api"
+	segment "github.com/vcaesar/bluge_segment_api"
 )
 
 const Version uint32 = 3
@@ -50,7 +51,7 @@ type Segment struct {
 	// state loaded dynamically
 	m                             sync.RWMutex
 	fieldFSTs                     map[uint16]*vellum.FST
-	decompressedStoredFieldChunks map[uint32]*segmentCacheData
+	decompressedStoredFieldChunks []segmentCacheData
 }
 
 type segmentCacheData struct {
@@ -96,7 +97,15 @@ func (s *Segment) Timestamp() (int64, int64) {
 }
 
 func (s *Segment) Size() int {
-	return int(s.size)
+	size := int(s.size)
+	// Chunk data is loaded lazily and is not included in the static size.
+	for i := range s.decompressedStoredFieldChunks {
+		chunk := &s.decompressedStoredFieldChunks[i]
+		chunk.m.RLock()
+		size += cap(chunk.data)
+		chunk.m.RUnlock()
+	}
+	return size
 }
 
 func (s *Segment) updateSize() {
@@ -121,6 +130,9 @@ func (s *Segment) updateSize() {
 			sizeInBytes += v.size()
 		}
 	}
+
+	sizeInBytes += cap(s.storedFieldChunkOffsets) * sizeOfUint64
+	sizeInBytes += cap(s.decompressedStoredFieldChunks) * int(reflect.TypeOf(segmentCacheData{}).Size())
 
 	s.size = uint64(sizeInBytes)
 }
@@ -152,12 +164,14 @@ func (s *Segment) dictionary(field string) (rv *Dictionary, err error) {
 				var vellumLenData []byte
 				vellumLenData, err = s.data.Read(int(dictStart), int(dictStart+binary.MaxVarintLen64))
 				if err != nil {
+					s.m.Unlock()
 					return nil, err
 				}
 				vellumLen, read := binary.Uvarint(vellumLenData)
 				var fstBytes []byte
 				fstBytes, err = s.data.Read(int(dictStart+uint64(read)), int(dictStart+uint64(read)+vellumLen))
 				if err != nil {
+					s.m.Unlock()
 					return nil, err
 				}
 				rv.fst, err = vellum.Load(fstBytes)
@@ -183,7 +197,7 @@ func (s *Segment) dictionary(field string) (rv *Dictionary, err error) {
 // visitDocumentCtx holds data structures that are reusable across
 // multiple VisitStoredFields() calls to avoid memory allocations
 type visitDocumentCtx struct {
-	buf    []byte
+	// buf    []byte
 	reader bytes.Reader
 }
 
@@ -204,6 +218,7 @@ func (s *Segment) VisitStoredFields(num uint64, visitor segment.StoredFieldVisit
 
 func (s *Segment) visitDocument(vdc *visitDocumentCtx, num uint64,
 	visitor segment.StoredFieldVisitor) error {
+	defer vdc.reader.Reset(nil)
 	// first make sure this is a valid number in this segment
 	if num < s.footer.numDocs {
 		meta, uncompressed, err := s.getDocStoredMetaAndUnCompressed(num)
@@ -231,11 +246,16 @@ func (s *Segment) visitDocument(vdc *visitDocumentCtx, num uint64,
 				return err
 			}
 
+			if field >= uint64(len(s.fieldsInv)) {
+				return fmt.Errorf("invalid stored-field ID %d", field)
+			}
+			if offset > uint64(len(uncompressed)) || l > uint64(len(uncompressed))-offset {
+				return fmt.Errorf("stored-field range exceeds document data")
+			}
+
 			value := uncompressed[offset : offset+l]
 			keepGoing = visitor(s.fieldsInv[field], value)
 		}
-
-		vdc.buf = uncompressed
 	}
 	return nil
 }

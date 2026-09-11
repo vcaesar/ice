@@ -17,9 +17,12 @@ package ice
 import (
 	"bytes"
 	"testing"
+
+	"github.com/blugelabs/ice/compress"
 )
 
 func TestChunkedContentCoder(t *testing.T) {
+	useCompression(t, compress.ZSTD)
 	tests := []struct {
 		maxDocNum uint64
 		chunkSize uint64
@@ -68,7 +71,9 @@ func TestChunkedContentCoder(t *testing.T) {
 				t.Fatalf("error adding to contentcoder: %v", err)
 			}
 		}
-		_ = cic.Close()
+		if err := cic.Close(); err != nil {
+			t.Fatal(err)
+		}
 		_, err := cic.Write()
 		if err != nil {
 			t.Fatalf("error writing: %v", err)
@@ -109,8 +114,12 @@ func TestChunkedContentCoders(t *testing.T) {
 			t.Fatalf("error adding to contentcoder: %v", err)
 		}
 	}
-	_ = cic1.Close()
-	_ = cic2.Close()
+	if err := cic1.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := cic2.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	_, err := cic1.Write()
 	if err != nil {

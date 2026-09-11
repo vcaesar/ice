@@ -18,7 +18,7 @@ import (
 	"math"
 	"testing"
 
-	"github.com/RoaringBitmap/roaring"
+	"github.com/RoaringBitmap/roaring/v2"
 )
 
 func TestRoaringSizes(t *testing.T) {
@@ -40,11 +40,14 @@ func TestRoaringSizes(t *testing.T) {
 		{[]uint32{0, 1}, 20, 20},
 		{[]uint32{0, 10000000}, 28, 28},
 
-		{[]uint32{0, 1, 2}, 22, 15},
+		// roaring v2 only converts a container to a run container when the
+		// run encoding is strictly smaller. 3 consecutive values tie
+		// (array 3*2B vs run 1*4B+2B), so they stay an array container.
+		{[]uint32{0, 1, 2}, 22, 22},
 		{[]uint32{0, 1, 20000000}, 30, 30},
 
 		{[]uint32{0, 1, 2, 3}, 24, 15},
-		{[]uint32{0, 1, 2, 30000000}, 32, 21},
+		{[]uint32{0, 1, 2, 30000000}, 32, 32},
 	}
 
 	for _, test := range tests {

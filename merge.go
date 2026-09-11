@@ -23,10 +23,10 @@ import (
 	"math"
 	"sort"
 
-	"github.com/RoaringBitmap/roaring"
+	"github.com/RoaringBitmap/roaring/v2"
 	"github.com/blevesearch/vellum"
-	segment "github.com/blugelabs/bluge_segment_api"
 	"github.com/blugelabs/ice/compress"
+	segment "github.com/vcaesar/bluge_segment_api"
 )
 
 const docDropped = math.MaxInt64 // sentinel docNum to represent a deleted doc
@@ -127,8 +127,7 @@ func mergeToWriter(segments []*Segment, drops []*roaring.Bitmap,
 	var storedIndexOffset uint64
 	var fieldDocs, fieldFreqs map[uint16]uint64
 	var dictLocs []uint64
-	var docTimeMin = uint64(math.MaxInt64)
-	var docTimeMax uint64
+	var docTimeMin, docTimeMax int64
 	if numDocs > 0 {
 		storedIndexOffset, newDocNums, err = mergeStoredAndRemap(segments, drops,
 			fieldsMap, fieldsInv, fieldsSame, numDocs, cr, closeCh)
@@ -143,20 +142,21 @@ func mergeToWriter(segments []*Segment, drops []*roaring.Bitmap,
 			return nil, nil, err
 		}
 
-		for _, seg := range segments {
-			if seg.DocTimeMin() > 0 && seg.DocTimeMin() < docTimeMin {
-				docTimeMin = seg.DocTimeMin()
+		for i, seg := range segments {
+			min, max := seg.Timestamp()
+			if min == 0 && max == 0 {
+				docTimeMin, docTimeMax = 0, 0
+				break
 			}
-			if seg.DocTimeMax() > docTimeMax {
-				docTimeMax = seg.DocTimeMax()
+			if i == 0 || min < docTimeMin {
+				docTimeMin = min
+			}
+			if i == 0 || max > docTimeMax {
+				docTimeMax = max
 			}
 		}
 	} else {
 		dictLocs = make([]uint64, len(fieldsInv))
-	}
-
-	if docTimeMin == math.MaxInt64 {
-		docTimeMin = 0
 	}
 
 	var fieldsIndexOffset uint64
@@ -170,8 +170,8 @@ func mergeToWriter(segments []*Segment, drops []*roaring.Bitmap,
 		storedIndexOffset: storedIndexOffset,
 		fieldsIndexOffset: fieldsIndexOffset,
 		docValueOffset:    docValueOffset,
-		docTimeMin:        docTimeMin,
-		docTimeMax:        docTimeMax,
+		docTimeMin:        uint64(docTimeMin),
+		docTimeMax:        uint64(docTimeMax),
 	}, nil
 }
 
@@ -475,8 +475,12 @@ func prepareNewTerm(newSegDocCount uint64, chunkMode uint32, tfEncoder, locEncod
 
 func finishTerm(w *countHashWriter, newRoaring *roaring.Bitmap, tfEncoder, locEncoder *chunkedIntCoder,
 	newVellum *vellum.Builder, bufMaxVarintLen64, term []byte, lastDocNum, lastFreq, lastNorm *uint64) error {
-	tfEncoder.Close()
-	locEncoder.Close()
+	if err := tfEncoder.Close(); err != nil {
+		return err
+	}
+	if err := locEncoder.Close(); err != nil {
+		return err
+	}
 
 	// determines whether to use "1-hit" encoding optimization
 	// when a term appears in only 1 doc, with no loc info,
@@ -798,31 +802,29 @@ func (s *Segment) copyStoredDocs(newDocNum uint64, newDocNumOffsets []uint64, do
 		if err != nil {
 			return err
 		}
-		storedOffset := 0
-		n := 0
-		for storedOffset < len(uncompressed) {
-			n = 0
-			metaDataLenEnd := storedOffset + binary.MaxVarintLen64
-			if metaDataLenEnd > cap(uncompressed) {
-				metaDataLenEnd = cap(uncompressed)
+		payload := uncompressed
+		for len(payload) > 0 {
+			metaLen, read := binary.Uvarint(payload)
+			if read <= 0 {
+				return fmt.Errorf("invalid stored-field metadata length")
 			}
-			metaLenData := uncompressed[storedOffset:metaDataLenEnd]
-			metaLen, read := binary.Uvarint(metaLenData)
-			n += read
-			dataLenEnd := storedOffset + n + binary.MaxVarintLen64
-			if dataLenEnd > cap(uncompressed) {
-				dataLenEnd = cap(uncompressed)
+			payload = payload[read:]
+			dataLen, read := binary.Uvarint(payload)
+			if read <= 0 {
+				return fmt.Errorf("invalid stored-field data length")
 			}
-			dataLenData := uncompressed[storedOffset+n : dataLenEnd]
-			dataLen, read := binary.Uvarint(dataLenData)
-			n += read
+			payload = payload[read:]
+			if metaLen > uint64(len(payload)) || dataLen > uint64(len(payload))-metaLen {
+				return fmt.Errorf("stored-field lengths exceed chunk data")
+			}
+			if newDocNum >= uint64(len(newDocNumOffsets)) {
+				return fmt.Errorf("stored-field document count exceeds output capacity")
+			}
 			newDocNumOffsets[newDocNum] = docChunkCoder.Size()
-			metaBytes := uncompressed[storedOffset+n : storedOffset+n+int(metaLen)]
-			data := uncompressed[storedOffset+n+int(metaLen) : storedOffset+n+int(metaLen+dataLen)]
-			if _, err := docChunkCoder.Add(newDocNum, metaBytes, data); err != nil {
+			if _, err := docChunkCoder.Add(newDocNum, payload[:metaLen], payload[metaLen:metaLen+dataLen]); err != nil {
 				return err
 			}
-			storedOffset += n + int(metaLen+dataLen)
+			payload = payload[metaLen+dataLen:]
 			newDocNum++
 		}
 	}

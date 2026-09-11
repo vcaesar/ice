@@ -3,9 +3,12 @@ package ice
 import (
 	"bytes"
 	"testing"
+
+	"github.com/blugelabs/ice/compress"
 )
 
 func TestChunkedDocumentCoder(t *testing.T) {
+	useCompression(t, compress.ZSTD)
 	tests := []struct {
 		chunkSize        uint64
 		docNums          []uint64

@@ -117,7 +117,7 @@ func (c *chunkedDocumentCoder) Write() error {
 
 func (c *chunkedDocumentCoder) Reset() {
 	c.compressed = c.compressed[:0]
-	c.offsets = c.offsets[:0]
+	c.offsets = append(c.offsets[:0], 0)
 	c.n = 0
 	c.bytes = 0
 	c.buf.Reset()
