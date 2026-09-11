@@ -43,6 +43,9 @@ func newWithChunkMode(results []segment.Document, normCalc func(string, int) flo
 	s := interimPool.Get().(*interim)
 
 	s.normCalc = normCalc
+	if s.visitTerm == nil {
+		s.initVisitors()
+	}
 
 	var br bytes.Buffer
 	if s.lastNumDocs > 0 {
@@ -179,6 +182,13 @@ type interim struct {
 
 	docTimeMin int64
 	docTimeMax int64
+
+	// reusable callback state, see initVisitors
+	termVisitor termVisitor
+	locCounter  locCounter
+	visitTerm   func(segment.FieldTerm)
+	visitLoc    func(segment.Location)
+	countLoc    func(segment.Location)
 }
 
 func (s *interim) reset() (err error) {
@@ -187,6 +197,9 @@ func (s *interim) reset() (err error) {
 	s.w = nil
 	s.FieldsMap = nil
 	s.FieldsInv = nil
+	s.termVisitor.dict = nil
+	s.termVisitor.locs = nil
+	s.termVisitor.err = nil
 	for i := range s.Dicts {
 		s.Dicts[i] = nil
 	}
@@ -454,13 +467,14 @@ func (s *interim) prepareDictsForDocument(result segment.Document, pidNext, totL
 		var numTerms int
 		field.EachTerm(func(term segment.FieldTerm) {
 			numTerms++
-			termStr := string(term.Term())
-			pidPlus1, exists := dict[termStr]
+			// look up without allocating; only materialize the string for new terms
+			pidPlus1, exists := dict[string(term.Term())]
 			if !exists {
 				pidNext++
 				// #nosec G115 -- pidNext counts entries in the int-sized postings slices, starting at zero.
 				pidPlus1 = uint64(pidNext)
 
+				termStr := string(term.Term())
 				dict[termStr] = pidPlus1
 				dictKeys = append(dictKeys, termStr)
 
@@ -472,13 +486,11 @@ func (s *interim) prepareDictsForDocument(result segment.Document, pidNext, totL
 
 			s.numTermsPerPostingsList[pid]++
 
-			var numLocations int
-			term.EachLocation(func(_ segment.Location) {
-				numLocations++
-			})
-			s.numLocsPerPostingsList[pid] += numLocations
+			s.locCounter.n = 0
+			term.EachLocation(s.countLoc)
+			s.numLocsPerPostingsList[pid] += s.locCounter.n
 
-			totLocs += numLocations
+			totLocs += s.locCounter.n
 		})
 
 		totTFs += numTerms
@@ -496,15 +508,17 @@ func (s *interim) processDocuments() error {
 	numFields := len(s.FieldsInv)
 	reuseFieldLens := make([]int, numFields)
 	reuseFieldTFs := make([]tokenFrequencies, numFields)
+	reuseFieldSeen := make([]bool, numFields)
 
 	for docNum, result := range s.results {
 		for i := 0; i < numFields; i++ { // clear these for reuse
 			reuseFieldLens[i] = 0
 			reuseFieldTFs[i] = nil
+			reuseFieldSeen[i] = false
 		}
 
 		if err := s.processDocument(uint64(docNum), result,
-			reuseFieldLens, reuseFieldTFs); err != nil {
+			reuseFieldLens, reuseFieldTFs, reuseFieldSeen); err != nil {
 			return err
 		}
 	}
@@ -513,10 +527,31 @@ func (s *interim) processDocuments() error {
 
 func (s *interim) processDocument(docNum uint64,
 	result segment.Document,
+	fieldLens []int, fieldTFs []tokenFrequencies, fieldSeen []bool) error {
+	// a field name repeated within one document has to be rolled up into a
+	// single posting per term; otherwise the fields can be written directly
+	repeated := false
+	result.EachField(func(field segment.Field) {
+		fieldID := s.FieldsMap[field.Name()] - 1
+		fieldLens[fieldID] += field.Length()
+		if fieldSeen[fieldID] {
+			repeated = true
+		}
+		fieldSeen[fieldID] = true
+	})
+	if !repeated {
+		return s.processDocumentDirect(docNum, result, fieldLens)
+	}
+	return s.processDocumentRollup(docNum, result, fieldLens, fieldTFs)
+}
+
+// processDocumentRollup merges repeated field values into one tokenFreq per
+// term before writing postings.
+func (s *interim) processDocumentRollup(docNum uint64,
+	result segment.Document,
 	fieldLens []int, fieldTFs []tokenFrequencies) error {
 	visitField := func(field segment.Field) {
 		fieldID := s.FieldsMap[field.Name()] - 1
-		fieldLens[fieldID] += field.Length()
 
 		if existingFreqs := fieldTFs[fieldID]; existingFreqs == nil {
 			fieldTFs[fieldID] = make(map[string]*tokenFreq)
@@ -608,6 +643,111 @@ func (s *interim) processDocument(docNum uint64,
 			}
 		}
 	}
+	return nil
+}
+
+// processDocumentDirect writes postings straight from the document's fields
+// without the per-document tokenFreq/tokenLocation rollup, valid only when
+// no field name repeats within the document (fieldLens already summed).
+func (s *interim) processDocumentDirect(docNum uint64, result segment.Document, fieldLens []int) error {
+	tv := &s.termVisitor
+	tv.docNum = docNum
+	tv.err = nil
+	result.EachField(func(field segment.Field) {
+		if tv.err != nil {
+			return
+		}
+		tv.fieldID = s.FieldsMap[field.Name()] - 1
+		tv.dict = s.Dicts[tv.fieldID]
+		tv.norm = s.normCalc(s.FieldsInv[tv.fieldID], fieldLens[tv.fieldID])
+		field.EachTerm(s.visitTerm)
+	})
+	return tv.err
+}
+
+// locCounter and termVisitor hold the state of the EachLocation/EachTerm
+// callbacks so the bound callbacks (built once in newInterim) capture no
+// per-call variables and cost no allocations per term.
+type locCounter struct {
+	n int
+}
+
+type termVisitor struct {
+	s       *interim
+	docNum  uint64
+	fieldID uint16
+	dict    map[string]uint64
+	norm    float32
+	locs    []interimLoc
+	numLocs int
+	err     error
+}
+
+func (s *interim) initVisitors() {
+	s.termVisitor.s = s
+	s.visitTerm = s.termVisitor.visitTerm
+	s.visitLoc = s.termVisitor.visitLoc
+	s.countLoc = s.locCounter.count
+}
+
+func (c *locCounter) count(segment.Location) {
+	c.n++
+}
+
+func (v *termVisitor) visitTerm(term segment.FieldTerm) {
+	if v.err != nil {
+		return
+	}
+	v.err = v.s.addPosting(v.dict[string(term.Term())]-1, term)
+}
+
+func (v *termVisitor) visitLoc(loc segment.Location) {
+	if v.err != nil {
+		return
+	}
+	pos, start, end := loc.Pos(), loc.Start(), loc.End()
+	if pos < 0 || start < 0 || end < 0 {
+		v.err = fmt.Errorf("negative term location")
+		return
+	}
+	locf := v.fieldID
+	if locField := loc.Field(); locField != "" {
+		locf, v.err = v.s.getOrDefineField(locField)
+		if v.err != nil {
+			return
+		}
+	}
+	v.locs = append(v.locs, interimLoc{
+		fieldID: locf,
+		pos:     uint64(pos),
+		start:   uint64(start),
+		end:     uint64(end),
+	})
+	v.numLocs++
+}
+
+func (s *interim) addPosting(pid uint64, term segment.FieldTerm) error {
+	frequency := term.Frequency()
+	if frequency < 0 {
+		return fmt.Errorf("negative term frequency")
+	}
+	v := &s.termVisitor
+	// #nosec G115 -- convert bounds results to MaxUint32+1; docNum is a results index.
+	s.Postings[pid].Add(uint32(v.docNum))
+
+	v.locs = s.Locs[pid]
+	v.numLocs = 0
+	term.EachLocation(s.visitLoc)
+	if v.err != nil {
+		return v.err
+	}
+	s.Locs[pid] = v.locs
+	v.locs = nil
+	s.FreqNorms[pid] = append(s.FreqNorms[pid], interimFreqNorm{
+		freq:    uint64(frequency),
+		norm:    v.norm,
+		numLocs: v.numLocs,
+	})
 	return nil
 }
 

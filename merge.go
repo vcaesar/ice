@@ -637,11 +637,21 @@ func mergeTermFreqNormLocs(fieldsMap map[string]uint16, postItr *PostingsIterato
 		}
 
 		if len(locs) > 0 {
+			// encode every location's 4 ints once into bufLoc, size them, then
+			// hand the whole run to the encoder in a single call
+			need := numUintsLocation * len(locs)
+			if cap(bufLoc) < need {
+				bufLoc = make([]uint64, need)
+			}
+			args := bufLoc[:need]
 			numBytesLocs := 0
-			for _, loc := range locs {
-				// #nosec G115 -- PostingsIterator.readLocation validates nonnegative int-sized locations.
-				numBytesLocs += totalUvarintBytes(uint64(fieldsMap[loc.Field()]-1),
-					uint64(loc.Pos()), uint64(loc.Start()), uint64(loc.End()))
+			for li, loc := range locs {
+				a := args[li*numUintsLocation : (li+1)*numUintsLocation]
+				a[0] = uint64(fieldsMap[loc.Field()] - 1)
+				a[1] = uint64(loc.Pos())   // #nosec G115 -- readLocation validates nonnegative int-sized locations.
+				a[2] = uint64(loc.Start()) // #nosec G115 -- readLocation validates nonnegative int-sized locations.
+				a[3] = uint64(loc.End())   // #nosec G115 -- readLocation validates nonnegative int-sized locations.
+				numBytesLocs += totalUvarintBytes(a[0], a[1], a[2], a[3])
 			}
 
 			err = locEncoder.Add(hitNewDocNum, uint64(numBytesLocs))
@@ -649,19 +659,9 @@ func mergeTermFreqNormLocs(fieldsMap map[string]uint16, postItr *PostingsIterato
 				return 0, 0, 0, nil, err
 			}
 
-			for _, loc := range locs {
-				if cap(bufLoc) < numUintsLocation {
-					bufLoc = make([]uint64, 0, numUintsLocation)
-				}
-				args := bufLoc[0:4]
-				args[0] = uint64(fieldsMap[loc.Field()] - 1)
-				args[1] = uint64(loc.Pos())   // #nosec G115 -- readLocation validates nonnegative int-sized locations.
-				args[2] = uint64(loc.Start()) // #nosec G115 -- readLocation validates nonnegative int-sized locations.
-				args[3] = uint64(loc.End())   // #nosec G115 -- readLocation validates nonnegative int-sized locations.
-				err = locEncoder.Add(hitNewDocNum, args...)
-				if err != nil {
-					return 0, 0, 0, nil, err
-				}
+			err = locEncoder.Add(hitNewDocNum, args...)
+			if err != nil {
+				return 0, 0, 0, nil, err
 			}
 		}
 
