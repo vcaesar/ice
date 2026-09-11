@@ -19,7 +19,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/blugelabs/ice/compress"
+	"github.com/vcaesar/ice/compress"
 )
 
 func TestChunkIntCoder(t *testing.T) {

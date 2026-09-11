@@ -25,8 +25,8 @@ import (
 
 	"github.com/RoaringBitmap/roaring/v2"
 	"github.com/blevesearch/vellum"
-	"github.com/blugelabs/ice/compress"
 	segment "github.com/vcaesar/bluge_segment_api"
+	"github.com/vcaesar/ice/compress"
 )
 
 const docDropped = math.MaxInt64 // sentinel docNum to represent a deleted doc

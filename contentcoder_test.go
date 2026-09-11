@@ -18,7 +18,7 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/blugelabs/ice/compress"
+	"github.com/vcaesar/ice/compress"
 )
 
 func TestChunkedContentCoder(t *testing.T) {

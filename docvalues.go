@@ -21,8 +21,8 @@ import (
 	"math"
 	"sort"
 
-	"github.com/blugelabs/ice/compress"
 	segment "github.com/vcaesar/bluge_segment_api"
+	"github.com/vcaesar/ice/compress"
 )
 
 type docNumTermsVisitor func(docNum uint64, terms []byte) error

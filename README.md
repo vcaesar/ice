@@ -1,10 +1,10 @@
 # ice
 
-[![PkgGoDev](https://pkg.go.dev/badge/github.com/blugelabs/ice)](https://pkg.go.dev/github.com/blugelabs/ice)
-[![Tests](https://github.com/blugelabs/ice/workflows/Tests/badge.svg?branch=master&event=push)](https://github.com/blugelabs/ice/actions?query=workflow%3ATests+event%3Apush+branch%3Amaster)
-[![Lint](https://github.com/blugelabs/ice/workflows/Lint/badge.svg?branch=master&event=push)](https://github.com/blugelabs/ice/actions?query=workflow%3ALint+event%3Apush+branch%3Amaster)
+[![PkgGoDev](https://pkg.go.dev/badge/github.com/vcaesar/ice)](https://pkg.go.dev/github.com/vcaesar/ice)
+[![Tests](https://github.com/vcaesar/ice/workflows/Tests/badge.svg?branch=master&event=push)](https://github.com/vcaesar/ice/actions?query=workflow%3ATests+event%3Apush+branch%3Amaster)
+[![Lint](https://github.com/vcaesar/ice/workflows/Lint/badge.svg?branch=master&event=push)](https://github.com/vcaesar/ice/actions?query=workflow%3ALint+event%3Apush+branch%3Amaster)
 
-The file is written in the reverse order that we typically access data.  This helps us write in one pass since later sections of the file require file offsets of things we've already written.
+The file is written in the reverse order that we typically access data. This helps us write in one pass since later sections of the file require file offsets of things we've already written.
 
 Current usage:
 
@@ -14,7 +14,7 @@ Current usage:
   - 3 important offsets (docValue, fields index and stored data index)
   - 2 important values (number of docs and chunk factor)
 - field data is processed once and memoized onto the heap so that we never have to go back to disk for it
-- access to stored data by doc number means first navigating to the stored data index, then accessing a fixed position offset into that slice, which gives us the actual address of the data.  the first bytes of that section tell us the size of data so that we know where it ends.
+- access to stored data by doc number means first navigating to the stored data index, then accessing a fixed position offset into that slice, which gives us the actual address of the data. the first bytes of that section tell us the size of data so that we know where it ends.
 - access to all other indexed data follows the following pattern:
   - first know the field name -> convert to id
   - next navigate to term dictionary for that field
@@ -125,7 +125,7 @@ If you know the doc number you're interested in, this format lets you jump to th
   - file writing phase:
     - write big endian uint64 of start offset for each field
 
-NOTE: currently we don't know or record the length of this fields index.  Instead we rely on the fact that we know it immediately precedes a footer of known size.
+NOTE: currently we don't know or record the length of this fields index. Instead we rely on the fact that we know it immediately precedes a footer of known size.
 
 ## fields DocValue
 
@@ -155,7 +155,7 @@ read operation leverage that meta information to extract the document specific d
 
 ---
 
-# ice file format diagrams 
+# ice file format diagrams
 
 ## Legend
 
@@ -164,7 +164,7 @@ read operation leverage that meta information to extract the document specific d
     |========|
     |        | section
     |========|
-    
+
 ### Fixed-size fields
 
     |--------|        |----|        |--|        |-|
@@ -185,9 +185,9 @@ read operation leverage that meta information to extract the document specific d
 
 ### Chunked data
 
-	[--------]
-	[        ]
-	[--------]
+    [--------]
+    [        ]
+    [--------]
 
 ## Overview
 
@@ -197,11 +197,11 @@ Footer section describes the configuration of particular ice file. The format of
             | Stored Fields                                    |
             |==================================================|
     |-----> | Stored Fields Index                              |
-    |       |==================================================|   
-    |       | Dictionaries + Postings + DocValues              | 
+    |       |==================================================|
+    |       | Dictionaries + Postings + DocValues              |
     |       |==================================================|
     | |---> | DocValues Index                                  |
-    | |     |==================================================|   
+    | |     |==================================================|
     | |     | Fields                                           |
     | |     |==================================================|
     | | |-> | Fields Index                                     |
@@ -243,7 +243,7 @@ Stored Fields Data is an arbitrary size record, which consists of metadata and [
     |~~~~~~~~|~~~~~~~~|~~~~~~~~...~~~~~~~~|~~~~~~~~...~~~~~~~~|
     |    MDS |    CDS |                MD |                CD |
     |~~~~~~~~|~~~~~~~~|~~~~~~~~...~~~~~~~~|~~~~~~~~...~~~~~~~~|
-    
+
     MDS. Metadata size.
     CDS. Compressed data size.
     MD. Metadata.
@@ -252,7 +252,6 @@ Stored Fields Data is an arbitrary size record, which consists of metadata and [
 ## Fields
 
 Fields Index section located between addresses `F` and `len(file) - len(footer)` and consist of `uint64` values (`F1`, `F2`, ...) which are offsets to records in Fields section. We have `F# = (len(file) - len(footer) - F) / sizeof(uint64)` fields.
-
 
     (...)                                              [F]                       [F + F#]
     | Fields                                           | Fields Index.                  |
@@ -265,61 +264,61 @@ Fields Index section located between addresses `F` and `len(file) - len(footer)`
     ||=================================================|==============|=================|
      |                                                                |
      |----------------------------------------------------------------|
-        
+
 
 ## Dictionaries + Postings
 
 Each of fields has its own dictionary, encoded in [Vellum](https://github.com/couchbase/vellum) format. Dictionary consists of pairs `(term, offset)`, where `offset` indicates the position of postings (list of documents) for this particular term.
 
-	|================================================================|- Dictionaries + 
-	|                                                                |   Postings +
-	|                                                                |    DocValues
-	|    Freq/Norm (chunked)                                         |
-	|    [~~~~~~|~~~~~~~~~~~~~~~~~~~~~~~~~~~~~]                      |
-	| |->[ Freq | Norm (float32 under varint) ]                      |
-	| |  [~~~~~~|~~~~~~~~~~~~~~~~~~~~~~~~~~~~~]                      |
-	| |                                                              |
-	| |------------------------------------------------------------| |
-	|    Location Details (chunked)                                | |
-	|    [~~~~~~|~~~~~|~~~~~~~|~~~~~]                              | |
-	| |->[ Size | Pos | Start | End ]                              | |
-	| |  [~~~~~~|~~~~~|~~~~~~~|~~~~~]                              | |
-	| |                                                            | |
-	| |----------------------|                                     | |
-	|          Postings List |                                     | |
-	|         |~~~~~~~~|~~~~~|~~|~~~~~~~~|-----------...--|        | |
-	|      |->|    F/N |     LD | Length | ROARING BITMAP |        | |
-	|      |  |~~~~~|~~|~~~~~~~~|~~~~~~~~|-----------...--|        | |
-	|      |        |----------------------------------------------| |
-	|      |--------------------------------------|                  |
-	|          Dictionary                         |                  |
-	|         |~~~~~~~~|--------------------------|-...-|            |
-	|      |->| Length | VELLUM DATA : (TERM -> OFFSET) |            |
-	|      |  |~~~~~~~~|----------------------------...-|            |
-	|      |                                                         |
-	|======|=========================================================|- DocValues Index
-	|      |                                                         |
-	|======|=========================================================|- Fields
-	|      |                                                         |
-	| |~~~~|~~~|~~~~~~~~|---...---|                                  |
-	| |   Dict | Length |    Name |                                  |
-	| |~~~~~~~~|~~~~~~~~|---...---|                                  |
-	|                                                                |
-	|================================================================|
+    |================================================================|- Dictionaries +
+    |                                                                |   Postings +
+    |                                                                |    DocValues
+    |    Freq/Norm (chunked)                                         |
+    |    [~~~~~~|~~~~~~~~~~~~~~~~~~~~~~~~~~~~~]                      |
+    | |->[ Freq | Norm (float32 under varint) ]                      |
+    | |  [~~~~~~|~~~~~~~~~~~~~~~~~~~~~~~~~~~~~]                      |
+    | |                                                              |
+    | |------------------------------------------------------------| |
+    |    Location Details (chunked)                                | |
+    |    [~~~~~~|~~~~~|~~~~~~~|~~~~~]                              | |
+    | |->[ Size | Pos | Start | End ]                              | |
+    | |  [~~~~~~|~~~~~|~~~~~~~|~~~~~]                              | |
+    | |                                                            | |
+    | |----------------------|                                     | |
+    |          Postings List |                                     | |
+    |         |~~~~~~~~|~~~~~|~~|~~~~~~~~|-----------...--|        | |
+    |      |->|    F/N |     LD | Length | ROARING BITMAP |        | |
+    |      |  |~~~~~|~~|~~~~~~~~|~~~~~~~~|-----------...--|        | |
+    |      |        |----------------------------------------------| |
+    |      |--------------------------------------|                  |
+    |          Dictionary                         |                  |
+    |         |~~~~~~~~|--------------------------|-...-|            |
+    |      |->| Length | VELLUM DATA : (TERM -> OFFSET) |            |
+    |      |  |~~~~~~~~|----------------------------...-|            |
+    |      |                                                         |
+    |======|=========================================================|- DocValues Index
+    |      |                                                         |
+    |======|=========================================================|- Fields
+    |      |                                                         |
+    | |~~~~|~~~|~~~~~~~~|---...---|                                  |
+    | |   Dict | Length |    Name |                                  |
+    | |~~~~~~~~|~~~~~~~~|---...---|                                  |
+    |                                                                |
+    |================================================================|
 
 ## DocValues
 
 DocValues Index is `F#` pairs of varints, one pair per field. Each pair of varints indicates start and end point of DocValues slice.
 
-	|================================================================|
-	|     |------...--|                                              |
-	|  |->| DocValues |<-|                                           |
-	|  |  |------...--|  |                                           |
-	|==|=================|===========================================|- DocValues Index
-	||~|~~~~~~~~~|~~~~~~~|~~|           |~~~~~~~~~~~~~~|~~~~~~~~~~~~||
-	|| DV1 START | DV1 STOP | . . . . . | DV(F#) START | DV(F#) END ||
-	||~~~~~~~~~~~|~~~~~~~~~~|           |~~~~~~~~~~~~~~|~~~~~~~~~~~~||
-	|================================================================|
+    |================================================================|
+    |     |------...--|                                              |
+    |  |->| DocValues |<-|                                           |
+    |  |  |------...--|  |                                           |
+    |==|=================|===========================================|- DocValues Index
+    ||~|~~~~~~~~~|~~~~~~~|~~|           |~~~~~~~~~~~~~~|~~~~~~~~~~~~||
+    || DV1 START | DV1 STOP | . . . . . | DV(F#) START | DV(F#) END ||
+    ||~~~~~~~~~~~|~~~~~~~~~~|           |~~~~~~~~~~~~~~|~~~~~~~~~~~~||
+    |================================================================|
 
 DocValues is chunked Snappy-compressed values for each document and field.
 

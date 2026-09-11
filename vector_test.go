@@ -23,8 +23,8 @@ import (
 	"testing"
 
 	"github.com/RoaringBitmap/roaring/v2"
-	"github.com/blugelabs/ice/vec"
 	segment "github.com/vcaesar/bluge_segment_api"
+	"github.com/vcaesar/ice/vec"
 )
 
 func vectorField(t *testing.T, values ...float32) *FakeField {

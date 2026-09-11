@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/blugelabs/ice/compress"
 	segment "github.com/vcaesar/bluge_segment_api"
+	"github.com/vcaesar/ice/compress"
 )
 
 func optimizationFileData(t *testing.T, contents []byte) *segment.Data {

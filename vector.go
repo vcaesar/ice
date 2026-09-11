@@ -20,7 +20,7 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/blugelabs/ice/vec"
+	"github.com/vcaesar/ice/vec"
 )
 
 // SearchVectors exhaustively searches encoded vectors in stored field values.

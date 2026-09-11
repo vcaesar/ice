@@ -22,8 +22,8 @@ import (
 	"github.com/blevesearch/mmap-go"
 	segment "github.com/vcaesar/bluge_segment_api"
 
-	"github.com/blugelabs/ice"
 	"github.com/spf13/cobra"
+	"github.com/vcaesar/ice"
 )
 
 var seg *ice.Segment

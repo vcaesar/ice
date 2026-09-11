@@ -8,8 +8,8 @@ import (
 
 	"github.com/RoaringBitmap/roaring/v2"
 	"github.com/blevesearch/vellum"
-	"github.com/blugelabs/ice/compress"
 	segment "github.com/vcaesar/bluge_segment_api"
+	"github.com/vcaesar/ice/compress"
 )
 
 func useCompression(t *testing.T, algorithm int) {
