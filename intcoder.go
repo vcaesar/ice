@@ -96,19 +96,17 @@ func (c *chunkedIntCoder) Add(docNum uint64, vals ...uint64) error {
 		c.currChunk = chunk
 	}
 
-	if len(c.buf) < binary.MaxVarintLen64 {
-		c.buf = make([]byte, binary.MaxVarintLen64)
+	// encode every value into buf first so the chunk buffer sees one write
+	need := binary.MaxVarintLen64 * len(vals)
+	if len(c.buf) < need {
+		c.buf = make([]byte, need)
 	}
-
+	n := 0
 	for _, val := range vals {
-		wb := binary.PutUvarint(c.buf, val)
-		_, err := c.chunkBuf.Write(c.buf[:wb])
-		if err != nil {
-			return err
-		}
+		n += binary.PutUvarint(c.buf[n:], val)
 	}
-
-	return nil
+	_, err := c.chunkBuf.Write(c.buf[:n])
+	return err
 }
 
 // Close indicates you are done calling Add() this allows the final chunk
