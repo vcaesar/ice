@@ -137,7 +137,7 @@ func (c *chunkedDocumentCoder) Reset() {
 
 // Size returns buffer size of current chunk
 func (c *chunkedDocumentCoder) Size() uint64 {
-	return uint64(c.buf.Len())
+	return uint64(c.buf.Len()) // #nosec G115 -- bytes.Buffer.Len() is nonnegative.
 }
 
 // Len returns chunks num

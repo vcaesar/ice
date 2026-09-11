@@ -46,7 +46,7 @@ type Segment struct {
 	dictLocs       []uint64
 	fieldDvReaders map[uint16]*docValueReader // naive chunk cache per field
 	fieldDvNames   []string                   // field names cached in fieldDvReaders
-	size           uint64
+	size           int
 
 	// state loaded dynamically
 	m                             sync.RWMutex
@@ -98,7 +98,7 @@ func (s *Segment) Timestamp() (minimum, maximum int64) {
 }
 
 func (s *Segment) Size() int {
-	size := int(s.size)
+	size := s.size
 	// Chunk data is loaded lazily and is not included in the static size.
 	for i := range s.decompressedStoredFieldChunks {
 		chunk := &s.decompressedStoredFieldChunks[i]
@@ -135,7 +135,7 @@ func (s *Segment) updateSize() {
 	sizeInBytes += cap(s.storedFieldChunkOffsets) * sizeOfUint64
 	sizeInBytes += cap(s.decompressedStoredFieldChunks) * int(reflect.TypeOf(segmentCacheData{}).Size())
 
-	s.size = uint64(sizeInBytes)
+	s.size = sizeInBytes
 }
 
 // DictionaryReader returns the term dictionary for the specified field
@@ -162,15 +162,14 @@ func (s *Segment) dictionary(field string) (rv *Dictionary, err error) {
 			s.m.Lock()
 			if rv.fst, ok = s.fieldFSTs[rv.fieldID]; !ok {
 				// read the length of the vellum data
-				var vellumLenData []byte
-				vellumLenData, err = s.data.Read(int(dictStart), int(dictStart+binary.MaxVarintLen64))
+				var vellumLen uint64
+				vellumLen, err = readDataUvarint(s.data, &dictStart)
 				if err != nil {
 					s.m.Unlock()
 					return nil, err
 				}
-				vellumLen, read := binary.Uvarint(vellumLenData)
 				var fstBytes []byte
-				fstBytes, err = s.data.Read(int(dictStart+uint64(read)), int(dictStart+uint64(read)+vellumLen))
+				fstBytes, err = readDataAt(s.data, dictStart, vellumLen)
 				if err != nil {
 					s.m.Unlock()
 					return nil, err
@@ -347,28 +346,16 @@ func (s *Segment) loadDvReaders() error {
 		return nil
 	}
 
-	var read uint64
+	pos := s.footer.docValueOffset
 	for fieldID, field := range s.fieldsInv {
-		var fieldLocStart, fieldLocEnd uint64
-		var n int
-		fieldLocStartData, err := s.data.Read(int(s.footer.docValueOffset+read), int(s.footer.docValueOffset+read+binary.MaxVarintLen64))
+		fieldLocStart, err := readDataUvarint(s.data, &pos)
 		if err != nil {
 			return err
 		}
-		fieldLocStart, n = binary.Uvarint(fieldLocStartData)
-		if n <= 0 {
-			return fmt.Errorf("loadDvReaders: failed to read the docvalue offset start for field %d", fieldID)
-		}
-		read += uint64(n)
-		fieldLocEndData, err := s.data.Read(int(s.footer.docValueOffset+read), int(s.footer.docValueOffset+read+binary.MaxVarintLen64))
+		fieldLocEnd, err := readDataUvarint(s.data, &pos)
 		if err != nil {
 			return err
 		}
-		fieldLocEnd, n = binary.Uvarint(fieldLocEndData)
-		if n <= 0 {
-			return fmt.Errorf("loadDvReaders: failed to read the docvalue offset end for field %d", fieldID)
-		}
-		read += uint64(n)
 
 		fieldDvReader, err := s.loadFieldDocValueReader(field, fieldLocStart, fieldLocEnd)
 		if err != nil {

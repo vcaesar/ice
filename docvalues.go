@@ -22,6 +22,7 @@ import (
 	"sort"
 
 	segment "github.com/vcaesar/bluge_segment_api"
+
 	"github.com/vcaesar/ice/compress"
 )
 
@@ -82,7 +83,8 @@ func (s *Segment) loadFieldDocValueReader(field string,
 		return nil, nil
 	}
 
-	if fieldDvLocStart > fieldDvLocEnd || fieldDvLocEnd > uint64(s.data.Len()) ||
+	dataLen := s.data.Len()
+	if dataLen < 0 || fieldDvLocStart > fieldDvLocEnd || fieldDvLocEnd > uint64(dataLen) ||
 		fieldDvLocEnd-fieldDvLocStart <= fieldDvStartEndWidth {
 		return nil, fmt.Errorf("invalid doc-value range: %d-%d", fieldDvLocStart, fieldDvLocEnd)
 	}
@@ -94,6 +96,7 @@ func (s *Segment) loadFieldDocValueReader(field string,
 	}
 	chunkOffsetsLen := binary.BigEndian.Uint64(tail[:fieldDvStartWidth])
 	numChunks := binary.BigEndian.Uint64(tail[fieldDvStartWidth:])
+	// #nosec G115 -- the validated field range is wider than fieldDvStartEndWidth.
 	if chunkOffsetsLen > uint64(end-start-fieldDvStartEndWidth) || numChunks > chunkOffsetsLen {
 		return nil, fmt.Errorf("invalid doc-value chunk offset length or count")
 	}
@@ -112,6 +115,7 @@ func (s *Segment) loadFieldDocValueReader(field string,
 	var previous uint64
 	for i := range fdvIter.chunkOffsets {
 		loc, read := binary.Uvarint(locData)
+		// #nosec G115 -- chunkOffsetsLen was checked to fit inside the field range.
 		if read <= 0 || loc < previous || loc > uint64(chunkOffsetsPosition-start) {
 			return nil, fmt.Errorf("corrupted chunk offset during segment load")
 		}
@@ -132,7 +136,8 @@ func (di *docValueReader) loadDvChunk(chunkNumber uint64, s *Segment) error {
 	}
 	// #nosec G115 -- chunkNumber is less than the int-sized offsets slice length.
 	start, end := readChunkBoundary(int(chunkNumber), di.chunkOffsets)
-	if start > end || di.dvDataLoc > uint64(s.data.Len()) || end > uint64(s.data.Len())-di.dvDataLoc {
+	dataLen := s.data.Len()
+	if dataLen < 0 || start > end || di.dvDataLoc > uint64(dataLen) || end > uint64(dataLen)-di.dvDataLoc {
 		return fmt.Errorf("doc-value chunk offsets out of range")
 	}
 	if start >= end {
@@ -153,7 +158,8 @@ func (di *docValueReader) loadDvChunk(chunkNumber uint64, s *Segment) error {
 		return fmt.Errorf("failed to read the chunk")
 	}
 	data = data[read:]
-	if numDocs > uint64(len(data)/2) { // Each metadata entry needs at least two varint bytes.
+	const minMetadataBytes = 2 // Document delta and offset delta each need at least one varint byte.
+	if numDocs > uint64(len(data)/minMetadataBytes) {
 		return fmt.Errorf("invalid doc-value document count")
 	}
 	// #nosec G115 -- numDocs <= len(data)/2, so it fits int.

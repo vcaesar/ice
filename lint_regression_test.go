@@ -15,6 +15,176 @@ import (
 	segment "github.com/vcaesar/bluge_segment_api"
 )
 
+func TestIntDecoderHeaderBounds(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		data   []byte
+		offset uint64
+	}{
+		{"offset overflow", []byte{0}, math.MaxUint64},
+		{"offset at end", []byte{0}, 1},
+		{"truncated count", []byte{0, 0x80}, 1},
+		{"overflowing count varint", append([]byte{0}, bytes.Repeat([]byte{0xff}, 10)...), 1},
+		{"count exceeds data", binary.AppendUvarint([]byte{0}, math.MaxUint64), 1},
+		{"truncated offset", []byte{0, 1, 0x80}, 1},
+		{"overflowing offset varint", append([]byte{0, 1}, bytes.Repeat([]byte{0xff}, 10)...), 1},
+		{"offset exceeds data", binary.AppendUvarint([]byte{0, 1}, math.MaxUint64), 1},
+		{"decreasing offsets", []byte{0, 2, 1, 0, 0}, 1},
+		{"missing second offset", []byte{0, 2, 0x80, 1}, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := newChunkedIntDecoder(segment.NewDataBytes(tc.data), tc.offset, nil); err == nil {
+				t.Fatal("accepted invalid integer chunk header")
+			}
+		})
+	}
+}
+
+func TestIntDecoderShortHeaderAndReuse(t *testing.T) {
+	var decoder *chunkedIntDecoder
+	for _, offsets := range [][]byte{{0, 0}, {0}, {}, {0, 0, 0}} {
+		data := append(binary.AppendUvarint([]byte{0}, uint64(len(offsets))), offsets...)
+		var err error
+		decoder, err = newChunkedIntDecoder(segment.NewDataBytes(data), 1, decoder)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(decoder.chunkOffsets) != len(offsets) || decoder.dataStartOffset != uint64(len(data)) {
+			t.Fatalf("incorrect decoded header: %+v", decoder)
+		}
+	}
+	decoder, err := newChunkedIntDecoder(nil, termNotEncoded, decoder)
+	if err != nil || len(decoder.chunkOffsets) != 0 || decoder.dataStartOffset != 0 {
+		t.Fatalf("incorrect absent header: %+v, %v", decoder, err)
+	}
+}
+
+func TestIntCoderChunkSizeBoundsAndReuse(t *testing.T) {
+	coder := newChunkedIntCoder(1, 0)
+	for _, count := range []uint64{4, 2, 1} {
+		coder.SetChunkSize(1, count-1)
+		if uint64(len(coder.chunkLens)) != count {
+			t.Fatalf("incorrect chunk count: %d", len(coder.chunkLens))
+		}
+	}
+	for _, maxDocNum := range []uint64{math.MaxInt, math.MaxUint64} {
+		t.Run(fmt.Sprint(maxDocNum), func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Fatal("accepted overflowing chunk count")
+				}
+			}()
+			coder.SetChunkSize(1, maxDocNum)
+		})
+	}
+}
+
+func TestEncodeNormBounds(t *testing.T) {
+	for _, count := range []int{0, 1, math.MaxInt32} {
+		if got := decodeNorm("", encodeNorm("", count)); got != count {
+			t.Fatalf("term count %d became %d", count, got)
+		}
+	}
+	for _, count := range []int{-1, math.MaxInt} {
+		if count >= 0 && uint64(count) <= math.MaxUint32 {
+			continue
+		}
+		t.Run(fmt.Sprint(count), func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Fatal("accepted out-of-range term count")
+				}
+			}()
+			encodeNorm("", count)
+		})
+	}
+}
+
+func TestIntDecoderChunkBounds(t *testing.T) {
+	for _, tc := range []struct {
+		base    uint64
+		offsets []uint64
+		chunk   int
+	}{
+		{0, []uint64{0}, -1},
+		{0, []uint64{0}, 1},
+		{math.MaxUint64, []uint64{1}, 0},
+		{1, []uint64{math.MaxUint64}, 0},
+		{0, []uint64{1, 0}, 1},
+	} {
+		d := &chunkedIntDecoder{
+			startOffset: 1, dataStartOffset: tc.base, chunkOffsets: tc.offsets,
+			data: segment.NewDataBytes([]byte{0}),
+		}
+		if err := d.loadChunk(tc.chunk); err == nil {
+			t.Fatalf("accepted invalid chunk: %+v", tc)
+		}
+	}
+}
+
+func TestLoadFieldsIndexBounds(t *testing.T) {
+	for _, offset := range []uint64{math.MaxUint64, 9, 1} {
+		s := &Segment{data: segment.NewDataBytes(make([]byte, 8)), footer: &footer{fieldsIndexOffset: offset}}
+		if err := s.loadFields(); err == nil {
+			t.Fatalf("accepted invalid index offset %d", offset)
+		}
+	}
+	s := &Segment{data: segment.NewDataBytes([]byte{}), footer: &footer{}}
+	if err := s.loadFields(); err != nil {
+		t.Fatalf("empty index: %v", err)
+	}
+}
+
+func TestPostingsExcludedChunkSizeBounds(t *testing.T) {
+	for _, size := range []uint64{0, 1, math.MaxUint32, math.MaxUint32 + 1, math.MaxUint64} {
+		list := &PostingsList{postings: roaring.BitmapOf(0, 1), except: roaring.BitmapOf(0), chunkSize: size}
+		itr, err := list.Iterator(false, false, false, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hit, err := itr.Next()
+		if size == 0 {
+			if err == nil {
+				t.Fatal("accepted zero chunk size")
+			}
+		} else if err != nil || hit == nil || hit.Number() != 1 {
+			t.Fatalf("chunk size %d: hit %v, err %v", size, hit, err)
+		}
+	}
+}
+
+func TestPostingsNormBitsBounds(t *testing.T) {
+	for _, norm := range []uint64{math.MaxUint32, math.MaxUint32 + 1, math.MaxUint64} {
+		coder := newChunkedIntCoder(1, 0)
+		if err := coder.Add(0, encodeFreqHasLocs(1, false), norm); err != nil {
+			t.Fatal(err)
+		}
+		if err := coder.Close(); err != nil {
+			t.Fatal(err)
+		}
+		buf := bytes.NewBuffer([]byte{0})
+		if _, err := coder.Write(buf); err != nil {
+			t.Fatal(err)
+		}
+		list := &PostingsList{
+			postings: roaring.BitmapOf(0), chunkSize: 1, freqOffset: 1,
+			sb: &Segment{data: segment.NewDataBytes(buf.Bytes())},
+		}
+		itr, err := list.Iterator(true, true, false, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hit, err := itr.Next()
+		if norm > math.MaxUint32 {
+			if err == nil {
+				t.Fatal("accepted overflowing norm bits")
+			}
+		} else if err != nil || hit == nil {
+			t.Fatalf("valid norm bits rejected: %v", err)
+		}
+	}
+}
+
 func TestSetupTestDirCleanup(t *testing.T) {
 	path, cleanup := setupTestDir(t)
 	if err := os.WriteFile(filepath.Join(path, "fixture"), []byte("data"), 0600); err != nil {
@@ -225,7 +395,7 @@ func TestContentCoderOffsetsAndReuse(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := &Segment{data: segment.NewDataBytes(out.Bytes())}
-	d, err := s.loadFieldDocValueReader("field", 0, uint64(out.Len()))
+	d, err := s.loadFieldDocValueReader("field", 0, uint64(len(out.Bytes())))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -286,8 +456,12 @@ func TestDocumentCoderWriterAndOffsets(t *testing.T) {
 		t.Fatal(err)
 	}
 	data := out.Bytes()
+	if len(data) < 8 {
+		t.Fatal("missing chunk trailer")
+	}
 	count := binary.BigEndian.Uint32(data[len(data)-4:])
 	size := binary.BigEndian.Uint32(data[len(data)-8:])
+	// #nosec G115 -- the trailer length check above ensures len(data) >= 8.
 	if uint64(count) != uint64(len(c.offsets)) || size == 0 || uint64(size) > uint64(len(data)-8) {
 		t.Fatalf("incorrect chunk trailer: count=%d size=%d", count, size)
 	}

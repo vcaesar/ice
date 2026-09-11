@@ -165,7 +165,7 @@ func (c *chunkedContentCoder) Add(docNum uint64, vals []byte) error {
 
 	c.chunkMeta = append(c.chunkMeta, metaData{
 		DocNum:      docNum,
-		DocDvOffset: uint64(c.chunkBuf.Len()),
+		DocDvOffset: uint64(c.chunkBuf.Len()), // #nosec G115 -- bytes.Buffer.Len() is nonnegative.
 	})
 	return nil
 }

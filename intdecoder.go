@@ -19,6 +19,7 @@ import (
 	"fmt"
 
 	segment "github.com/vcaesar/bluge_segment_api"
+
 	"github.com/vcaesar/ice/compress"
 )
 
@@ -39,34 +40,66 @@ func newChunkedIntDecoder(data *segment.Data, offset uint64, rv *chunkedIntDecod
 		rv.startOffset = offset
 		rv.data = data
 	}
-	var n, numChunks uint64
-	var read int
 	if offset == termNotEncoded {
-		numChunks = 0
+		rv.chunkOffsets = rv.chunkOffsets[:0]
+		rv.dataStartOffset = 0
+		return rv, nil
+	}
+	dataLen := data.Len()
+	if dataLen < 0 || offset >= uint64(dataLen) {
+		return nil, fmt.Errorf("integer chunk header offset out of range: %d", offset)
+	}
+	// #nosec G115 -- offset is less than the nonnegative int-sized data length.
+	pos := int(offset)
+	numChunks, err := readChunkHeaderUvarint(data, &pos)
+	if err != nil {
+		return nil, err
+	}
+	if numChunks > uint64(dataLen-pos) {
+		return nil, fmt.Errorf("invalid integer chunk count: %d", numChunks)
+	}
+	// #nosec G115 -- each chunk needs at least one byte in the remaining int-sized data.
+	count := int(numChunks)
+	if cap(rv.chunkOffsets) >= count {
+		rv.chunkOffsets = rv.chunkOffsets[:count]
 	} else {
-		numChunksData, err := data.Read(int(offset+n), int(offset+n+binary.MaxVarintLen64))
-		if err != nil {
-			return nil, err
+		rv.chunkOffsets = make([]uint64, count)
+	}
+	var previous uint64
+	for i := range rv.chunkOffsets {
+		chunkOffset, readErr := readChunkHeaderUvarint(data, &pos)
+		if readErr != nil {
+			return nil, readErr
 		}
-		numChunks, read = binary.Uvarint(numChunksData)
-	}
-
-	n += uint64(read)
-	if cap(rv.chunkOffsets) >= int(numChunks) {
-		rv.chunkOffsets = rv.chunkOffsets[:int(numChunks)]
-	} else {
-		rv.chunkOffsets = make([]uint64, int(numChunks))
-	}
-	for i := 0; i < int(numChunks); i++ {
-		chunkOffsetData, err := data.Read(int(offset+n), int(offset+n+binary.MaxVarintLen64))
-		if err != nil {
-			return nil, err
+		if chunkOffset < previous {
+			return nil, fmt.Errorf("decreasing integer chunk offset")
 		}
-		rv.chunkOffsets[i], read = binary.Uvarint(chunkOffsetData)
-		n += uint64(read)
+		rv.chunkOffsets[i] = chunkOffset
+		previous = chunkOffset
 	}
-	rv.dataStartOffset = offset + n
+	if previous > uint64(dataLen-pos) {
+		return nil, fmt.Errorf("integer chunk offset exceeds data length")
+	}
+	// #nosec G115 -- pos starts nonnegative and advances only within data.Len().
+	rv.dataStartOffset = uint64(pos)
 	return rv, nil
+}
+
+func readChunkHeaderUvarint(data *segment.Data, pos *int) (uint64, error) {
+	if *pos < 0 || *pos >= data.Len() {
+		return 0, fmt.Errorf("integer chunk header truncated")
+	}
+	end := *pos + min(binary.MaxVarintLen64, data.Len()-*pos)
+	buf, err := data.Read(*pos, end)
+	if err != nil {
+		return 0, err
+	}
+	value, n := binary.Uvarint(buf)
+	if n <= 0 {
+		return 0, fmt.Errorf("invalid integer chunk header varint")
+	}
+	*pos += n
+	return value, nil
 }
 
 func (d *chunkedIntDecoder) loadChunk(chunk int) error {
@@ -75,15 +108,20 @@ func (d *chunkedIntDecoder) loadChunk(chunk int) error {
 		return nil
 	}
 
-	if chunk >= len(d.chunkOffsets) {
+	if chunk < 0 || chunk >= len(d.chunkOffsets) {
 		return fmt.Errorf("tried to load freq chunk that doesn't exist %d/(%d)",
 			chunk, len(d.chunkOffsets))
 	}
 
 	end, start := d.dataStartOffset, d.dataStartOffset
 	s, e := readChunkBoundary(chunk, d.chunkOffsets)
+	dataLen := d.data.Len()
+	if dataLen < 0 || s > e || start > uint64(dataLen) || e > uint64(dataLen)-start {
+		return fmt.Errorf("integer chunk offsets out of range")
+	}
 	start += s
 	end += e
+	// #nosec G115 -- both sums are bounded by the int-sized data length above.
 	curChunkBytesData, err := d.data.Read(int(start), int(end))
 	if err != nil {
 		return err

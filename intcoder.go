@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"io"
+	"math"
 
 	"github.com/vcaesar/ice/compress"
 )
@@ -69,7 +70,11 @@ func (c *chunkedIntCoder) Reset() {
 // SetChunkSize changes the chunk size.  It is only valid to do so
 // with a new chunkedIntCoder, or immediately after calling Reset()
 func (c *chunkedIntCoder) SetChunkSize(chunkSize, maxDocNum uint64) {
-	total := int(maxDocNum/chunkSize + 1)
+	chunks := maxDocNum / chunkSize
+	if chunks >= math.MaxInt {
+		panic("chunk count does not fit int")
+	}
+	total := int(chunks) + 1
 	c.chunkSize = chunkSize
 	if cap(c.chunkLens) < total {
 		c.chunkLens = make([]uint64, total)
@@ -160,7 +165,7 @@ func (c *chunkedIntCoder) writeAt(w io.Writer) (startOffset uint64, err error) {
 	}
 
 	if chw := w.(*countHashWriter); chw != nil {
-		startOffset = uint64(chw.Count())
+		startOffset = uint64(chw.Count()) // #nosec G115 -- countHashWriter checks overflow and counts nonnegative writes.
 	}
 
 	_, err = c.Write(w)

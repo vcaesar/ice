@@ -49,6 +49,9 @@ var noCloseFunc = func() error {
 }
 
 func encodeNorm(_ string, numTerms int) float32 {
+	if numTerms < 0 || uint64(numTerms) > math.MaxUint32 {
+		panic("term count does not fit uint32")
+	}
 	return math.Float32frombits(uint32(numTerms))
 }
 

@@ -17,9 +17,38 @@ package ice
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
+
+	segment "github.com/vcaesar/bluge_segment_api"
 
 	"github.com/vcaesar/ice/compress"
 )
+
+func readDataAt(data *segment.Data, offset, length uint64) ([]byte, error) {
+	size := data.Len()
+	if size < 0 || offset > uint64(size) || length > uint64(size)-offset {
+		return nil, fmt.Errorf("segment data range out of bounds: offset %d, length %d", offset, length)
+	}
+	// #nosec G115 -- offset and offset+length are bounded by the nonnegative int-sized data length.
+	return data.Read(int(offset), int(offset+length))
+}
+
+func readDataUvarint(data *segment.Data, offset *uint64) (uint64, error) {
+	size := data.Len()
+	if size < 0 || *offset >= uint64(size) {
+		return 0, fmt.Errorf("segment varint offset out of bounds: %d", *offset)
+	}
+	buf, err := readDataAt(data, *offset, min(binary.MaxVarintLen64, uint64(size)-*offset))
+	if err != nil {
+		return 0, err
+	}
+	value, n := binary.Uvarint(buf)
+	if n <= 0 {
+		return 0, fmt.Errorf("invalid segment varint")
+	}
+	*offset += uint64(n)
+	return value, nil
+}
 
 func (s *Segment) initDecompressedStoredFieldChunks(n int) {
 	s.m.Lock()
@@ -35,14 +64,21 @@ func (s *Segment) getDocStoredMetaAndUnCompressed(docNum uint64) (meta, data []b
 
 	// document chunk coder
 	var uncompressed []byte
-	chunkI := uint32(docNum) / defaultDocumentChunkSize
+	chunkI := docNum / uint64(defaultDocumentChunkSize)
+	if chunkI >= uint64(len(s.decompressedStoredFieldChunks)) {
+		return nil, nil, fmt.Errorf("stored-field chunk out of bounds")
+	}
 	storedFieldDecompressed := &s.decompressedStoredFieldChunks[chunkI]
 	storedFieldDecompressed.m.Lock()
 	if storedFieldDecompressed.data == nil {
+		if chunkI+1 >= uint64(len(s.storedFieldChunkOffsets)) {
+			storedFieldDecompressed.m.Unlock()
+			return nil, nil, fmt.Errorf("stored-field chunk offsets out of bounds")
+		}
 		// we haven't already loaded and decompressed this chunk
-		chunkOffsetStart := s.storedFieldChunkOffsets[int(chunkI)]
-		chunkOffsetEnd := s.storedFieldChunkOffsets[int(chunkI)+1]
-		compressed, err := s.data.Read(int(chunkOffsetStart), int(chunkOffsetEnd))
+		chunkOffsetStart := s.storedFieldChunkOffsets[chunkI]
+		chunkOffsetEnd := s.storedFieldChunkOffsets[chunkI+1]
+		compressed, err := readDataAt(s.data, chunkOffsetStart, chunkOffsetEnd-chunkOffsetStart)
 		if err != nil {
 			storedFieldDecompressed.m.Unlock()
 			return nil, nil, err
@@ -83,8 +119,11 @@ func (s *Segment) getDocStoredMetaAndUnCompressed(docNum uint64) (meta, data []b
 }
 
 func (s *Segment) getDocStoredOffsetsOnly(docNum uint64) (indexOffset, storedOffset uint64, err error) {
+	if docNum >= s.footer.numDocs || docNum > (math.MaxUint64-s.footer.storedIndexOffset)/fileAddrWidth {
+		return 0, 0, fmt.Errorf("stored document number out of bounds: %d", docNum)
+	}
 	indexOffset = s.footer.storedIndexOffset + (fileAddrWidth * docNum)
-	storedOffsetData, err := s.data.Read(int(indexOffset), int(indexOffset+fileAddrWidth))
+	storedOffsetData, err := readDataAt(s.data, indexOffset, fileAddrWidth)
 	if err != nil {
 		return 0, 0, err
 	}

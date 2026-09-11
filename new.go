@@ -295,14 +295,16 @@ func (s *interim) convert() (f *footer, dictOffsets, storedFieldChunkOffsets []u
 		s.IncludeDocValues = make([]bool, len(s.FieldsInv))
 	}
 
-	s.prepareDicts()
+	if prepareErr := s.prepareDicts(); prepareErr != nil {
+		return nil, nil, nil, prepareErr
+	}
 
 	for _, dict := range s.DictKeys {
 		sort.Strings(dict)
 	}
 
-	if err = s.processDocuments(); err != nil {
-		return nil, nil, nil, err
+	if processErr := s.processDocuments(); processErr != nil {
+		return nil, nil, nil, processErr
 	}
 
 	var storedIndexOffset uint64
@@ -365,14 +367,18 @@ func (s *interim) getOrDefineField(fieldName string) (uint16, error) {
 }
 
 // fill Dicts and DictKeys from analysis results
-func (s *interim) prepareDicts() {
+func (s *interim) prepareDicts() error {
 	var pidNext int
 
 	var totTFs int
 	var totLocs int
 
 	for _, result := range s.results {
-		pidNext, totLocs, totTFs = s.prepareDictsForDocument(result, pidNext, totLocs, totTFs)
+		var err error
+		pidNext, totLocs, totTFs, err = s.prepareDictsForDocument(result, pidNext, totLocs, totTFs)
+		if err != nil {
+			return err
+		}
 	}
 
 	numPostingsLists := pidNext
@@ -425,16 +431,22 @@ func (s *interim) prepareDicts() {
 		s.Locs[pid] = locsBacking[0:0]
 		locsBacking = locsBacking[numLocs:]
 	}
+	return nil
 }
 
 func (s *interim) prepareDictsForDocument(result segment.Document, pidNext, totLocs, totTFs int) (
-	pidNextOut, totLocsOut, totTFsOut int) {
+	pidNextOut, totLocsOut, totTFsOut int, err error) {
 	fieldsSeen := map[uint16]struct{}{}
 	result.EachField(func(field segment.Field) {
 		fieldID := s.FieldsMap[field.Name()] - 1
 
+		length := field.Length()
+		if length < 0 {
+			err = fmt.Errorf("negative field length")
+			return
+		}
 		fieldsSeen[fieldID] = struct{}{}
-		s.FieldFreqs[fieldID] += uint64(field.Length())
+		s.FieldFreqs[fieldID] += uint64(length)
 
 		dict := s.Dicts[fieldID]
 		dictKeys := s.DictKeys[fieldID]
@@ -446,6 +458,7 @@ func (s *interim) prepareDictsForDocument(result segment.Document, pidNext, totL
 			pidPlus1, exists := dict[termStr]
 			if !exists {
 				pidNext++
+				// #nosec G115 -- pidNext counts entries in the int-sized postings slices, starting at zero.
 				pidPlus1 = uint64(pidNext)
 
 				dict[termStr] = pidPlus1
@@ -476,7 +489,7 @@ func (s *interim) prepareDictsForDocument(result segment.Document, pidNext, totL
 	for k := range fieldsSeen {
 		s.FieldDocs[k]++
 	}
-	return pidNext, totLocs, totTFs
+	return pidNext, totLocs, totTFs, err
 }
 
 func (s *interim) processDocuments() error {
@@ -556,9 +569,13 @@ func (s *interim) processDocument(docNum uint64,
 			// #nosec G115 -- convert bounds results to MaxUint32+1; docNum is a results index.
 			bs.Add(uint32(docNum))
 
+			frequency := tf.Frequency()
+			if frequency < 0 {
+				return fmt.Errorf("negative term frequency")
+			}
 			s.FreqNorms[pid] = append(s.FreqNorms[pid],
 				interimFreqNorm{
-					freq:    uint64(tf.Frequency()),
+					freq:    uint64(frequency),
 					norm:    norm,
 					numLocs: len(tf.Locations),
 				})
@@ -567,6 +584,9 @@ func (s *interim) processDocument(docNum uint64,
 				locs := s.Locs[pid]
 
 				for _, loc := range tf.Locations {
+					if loc.PositionVal < 0 || loc.StartVal < 0 || loc.EndVal < 0 {
+						return fmt.Errorf("negative term location")
+					}
 					// #nosec G115 -- fieldTFs has one entry per field; getOrDefineField caps fields at MaxUint16.
 					locf := uint16(fieldID)
 					if loc.FieldVal != "" {
@@ -664,7 +684,7 @@ func (s *interim) writeStoredFields() (
 	}
 	storedFieldChunkOffsets = docChunkCoder.Offsets()
 
-	storedIndexOffset = uint64(s.w.Count())
+	storedIndexOffset = uint64(s.w.Count()) // #nosec G115 -- countHashWriter checks overflow and counts nonnegative writes.
 
 	for _, docStoredOffset := range docStoredOffsets {
 		err = binary.Write(s.w, binary.BigEndian, docStoredOffset)
@@ -687,7 +707,9 @@ func (s *interim) writeDicts() (fdvIndexOffset uint64, dictOffsets []uint64, err
 	// these int coders are initialized with chunk size 1024
 	// however this will be reset to the correct chunk size
 	// while processing each individual field-term section
+	// #nosec G115 -- convert calls writeDicts only for nonempty results.
 	tfEncoder := newChunkedIntCoder(uint64(legacyChunkMode), uint64(len(s.results)-1))
+	// #nosec G115 -- convert calls writeDicts only for nonempty results.
 	locEncoder := newChunkedIntCoder(uint64(legacyChunkMode), uint64(len(s.results)-1))
 
 	var docTermMap [][]byte
@@ -706,7 +728,7 @@ func (s *interim) writeDicts() (fdvIndexOffset uint64, dictOffsets []uint64, err
 		}
 	}
 
-	fdvIndexOffset = uint64(s.w.Count())
+	fdvIndexOffset = uint64(s.w.Count()) // #nosec G115 -- countHashWriter checks overflow and counts nonnegative writes.
 
 	for i := 0; i < len(fdvOffsetsStart); i++ {
 		n := binary.PutUvarint(buf, fdvOffsetsStart[i])
@@ -750,7 +772,7 @@ func (s *interim) writeDictsField(docTermMap [][]byte, fieldID int, terms []stri
 	}
 
 	// record where this dictionary starts
-	dictOffsets[fieldID] = uint64(s.w.Count())
+	dictOffsets[fieldID] = uint64(s.w.Count()) // #nosec G115 -- countHashWriter checks overflow and counts nonnegative writes.
 
 	vellumData := s.builderBuf.Bytes()
 
@@ -781,6 +803,7 @@ func (s *interim) writeDictsField(docTermMap [][]byte, fieldID int, terms []stri
 	if err != nil {
 		return err
 	}
+	// #nosec G115 -- called by writeDicts only for nonempty results.
 	fdvEncoder := newChunkedContentCoder(chunkSize, uint64(len(s.results)-1), s.w, false)
 	if s.IncludeDocValues[fieldID] {
 		for docNum, docTerms := range docTermMap {
@@ -796,14 +819,14 @@ func (s *interim) writeDictsField(docTermMap [][]byte, fieldID int, terms []stri
 			return err
 		}
 
-		fdvOffsetsStart[fieldID] = uint64(s.w.Count())
+		fdvOffsetsStart[fieldID] = uint64(s.w.Count()) // #nosec G115 -- countHashWriter checks overflow and counts nonnegative writes.
 
 		_, err = fdvEncoder.Write()
 		if err != nil {
 			return err
 		}
 
-		fdvOffsetsEnd[fieldID] = uint64(s.w.Count())
+		fdvOffsetsEnd[fieldID] = uint64(s.w.Count()) // #nosec G115 -- countHashWriter checks overflow and counts nonnegative writes.
 
 		fdvEncoder.Reset()
 	} else {
@@ -829,7 +852,9 @@ func (s *interim) writeDictsTermField(docTermMap [][]byte, dict map[string]uint6
 	if err != nil {
 		return err
 	}
+	// #nosec G115 -- called by writeDicts only for nonempty results.
 	tfEncoder.SetChunkSize(chunkSize, uint64(len(s.results)-1))
+	// #nosec G115 -- called by writeDicts only for nonempty results.
 	locEncoder.SetChunkSize(chunkSize, uint64(len(s.results)-1))
 
 	postingsItr := postingsBS.Iterator()
@@ -875,11 +900,11 @@ func (s *interim) writeDictsTermField(docTermMap [][]byte, dict map[string]uint6
 			termSeparator)
 	}
 
-	if err = tfEncoder.Close(); err != nil {
-		return err
+	if closeErr := tfEncoder.Close(); closeErr != nil {
+		return closeErr
 	}
-	if err = locEncoder.Close(); err != nil {
-		return err
+	if closeErr := locEncoder.Close(); closeErr != nil {
+		return closeErr
 	}
 
 	var postingsOffset uint64

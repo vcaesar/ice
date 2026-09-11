@@ -26,6 +26,7 @@ import (
 	"github.com/RoaringBitmap/roaring/v2"
 	"github.com/blevesearch/vellum"
 	segment "github.com/vcaesar/bluge_segment_api"
+
 	"github.com/vcaesar/ice/compress"
 )
 
@@ -109,7 +110,7 @@ func mergeSegmentBasesWriter(segmentBases []*Segment, drops []*roaring.Bitmap, w
 		return nil, 0, err
 	}
 
-	return newDocNums, uint64(cr.Count()), nil
+	return newDocNums, uint64(cr.Count()), nil // #nosec G115 -- countHashWriter checks overflow and counts nonnegative writes.
 }
 
 func mergeToWriter(segments []*Segment, drops []*roaring.Bitmap,
@@ -380,7 +381,7 @@ func persistMergedRestField(segments []*Segment, dropsIn []*roaring.Bitmap, fiel
 
 func writeMergedDict(w *countHashWriter, newVellum io.Closer, vellumBuf *bytes.Buffer,
 	bufMaxVarintLen64 []byte, fieldID int, dictLocs []uint64) error {
-	dictOffset := uint64(w.Count())
+	dictOffset := uint64(w.Count()) // #nosec G115 -- countHashWriter checks overflow and counts nonnegative writes.
 
 	err := newVellum.Close()
 	if err != nil {
@@ -408,7 +409,7 @@ func writeMergedDict(w *countHashWriter, newVellum io.Closer, vellumBuf *bytes.B
 func buildMergedDocVals(newSegDocCount uint64, w *countHashWriter, closeCh chan struct{}, fieldName string, fieldID int,
 	fieldDvLocsStart, fieldDvLocsEnd []uint64, segmentsInFocus []*Segment, newDocNums [][]uint64) error {
 	// get the field doc value offset (start)
-	fieldDvLocsStart[fieldID] = uint64(w.Count())
+	fieldDvLocsStart[fieldID] = uint64(w.Count()) // #nosec G115 -- countHashWriter checks overflow and counts nonnegative writes.
 
 	// update the field doc values
 	// NOTE: doc values continue to use legacy chunk mode
@@ -461,7 +462,7 @@ func buildMergedDocVals(newSegDocCount uint64, w *countHashWriter, closeCh chan 
 		}
 
 		// get the field doc value offset (end)
-		fieldDvLocsEnd[fieldID] = uint64(w.Count())
+		fieldDvLocsEnd[fieldID] = uint64(w.Count()) // #nosec G115 -- countHashWriter checks overflow and counts nonnegative writes.
 	} else {
 		fieldDvLocsStart[fieldID] = fieldNotUninverted
 		fieldDvLocsEnd[fieldID] = fieldNotUninverted
@@ -547,7 +548,7 @@ func finishTerm(w *countHashWriter, newRoaring *roaring.Bitmap, tfEncoder, locEn
 }
 
 func writeDvLocs(w *countHashWriter, bufMaxVarintLen64 []byte, fieldDvLocsStart, fieldDvLocsEnd []uint64) (uint64, error) {
-	fieldDvLocsOffset := uint64(w.Count())
+	fieldDvLocsOffset := uint64(w.Count()) // #nosec G115 -- countHashWriter checks overflow and counts nonnegative writes.
 
 	buf := bufMaxVarintLen64
 	for i := 0; i < len(fieldDvLocsStart); i++ {
@@ -622,6 +623,9 @@ func mergeTermFreqNormLocs(fieldsMap map[string]uint16, postItr *PostingsIterato
 		docTracking.Add(uint32(hitNewDocNum))
 
 		nextFreq := next.Frequency()
+		if nextFreq < 0 {
+			return 0, 0, 0, nil, fmt.Errorf("negative posting frequency")
+		}
 		nextNorm := uint64(math.Float32bits(float32(next.Norm())))
 
 		locs := next.Locations()
@@ -635,6 +639,7 @@ func mergeTermFreqNormLocs(fieldsMap map[string]uint16, postItr *PostingsIterato
 		if len(locs) > 0 {
 			numBytesLocs := 0
 			for _, loc := range locs {
+				// #nosec G115 -- PostingsIterator.readLocation validates nonnegative int-sized locations.
 				numBytesLocs += totalUvarintBytes(uint64(fieldsMap[loc.Field()]-1),
 					uint64(loc.Pos()), uint64(loc.Start()), uint64(loc.End()))
 			}
@@ -650,9 +655,9 @@ func mergeTermFreqNormLocs(fieldsMap map[string]uint16, postItr *PostingsIterato
 				}
 				args := bufLoc[0:4]
 				args[0] = uint64(fieldsMap[loc.Field()] - 1)
-				args[1] = uint64(loc.Pos())
-				args[2] = uint64(loc.Start())
-				args[3] = uint64(loc.End())
+				args[1] = uint64(loc.Pos())   // #nosec G115 -- readLocation validates nonnegative int-sized locations.
+				args[2] = uint64(loc.Start()) // #nosec G115 -- readLocation validates nonnegative int-sized locations.
+				args[3] = uint64(loc.End())   // #nosec G115 -- readLocation validates nonnegative int-sized locations.
 				err = locEncoder.Add(hitNewDocNum, args...)
 				if err != nil {
 					return 0, 0, 0, nil, err
@@ -738,7 +743,7 @@ func mergeStoredAndRemap(segments []*Segment, drops []*roaring.Bitmap,
 	}
 
 	// return value is the start of the stored index
-	storedIndexOffset = uint64(w.Count())
+	storedIndexOffset = uint64(w.Count()) // #nosec G115 -- countHashWriter checks overflow and counts nonnegative writes.
 
 	// now write out the stored doc index
 	for _, docNumOffset := range docNumOffsets {
@@ -824,7 +829,7 @@ func (s *Segment) copyStoredDocs(newDocNum uint64, newDocNumOffsets []uint64, do
 		if chunkOffstart == chunkOffend {
 			continue
 		}
-		compressed, err := s.data.Read(int(chunkOffstart), int(chunkOffend))
+		compressed, err := readDataAt(s.data, chunkOffstart, chunkOffend-chunkOffstart)
 		if err != nil {
 			return err
 		}

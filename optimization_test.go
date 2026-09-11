@@ -11,6 +11,7 @@ import (
 	"time"
 
 	segment "github.com/vcaesar/bluge_segment_api"
+
 	"github.com/vcaesar/ice/compress"
 )
 
