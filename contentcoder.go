@@ -19,7 +19,7 @@ import (
 	"encoding/binary"
 	"io"
 
-	"github.com/blugelabs/ice/compress"
+	"github.com/vcaesar/ice/compress"
 )
 
 var termSeparator byte = 0xff

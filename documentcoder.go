@@ -5,7 +5,7 @@ import (
 	"encoding/binary"
 	"io"
 
-	"github.com/blugelabs/ice/compress"
+	"github.com/vcaesar/ice/compress"
 )
 
 const defaultDocumentChunkSize uint32 = 128

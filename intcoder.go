@@ -19,7 +19,7 @@ import (
 	"encoding/binary"
 	"io"
 
-	"github.com/blugelabs/ice/compress"
+	"github.com/vcaesar/ice/compress"
 )
 
 // We can safely use 0 to represent termNotEncoded since 0

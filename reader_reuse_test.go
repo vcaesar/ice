@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/blugelabs/ice/compress"
 	segment "github.com/vcaesar/bluge_segment_api"
+	"github.com/vcaesar/ice/compress"
 )
 
 func TestDocumentValueStateReuse(t *testing.T) {
