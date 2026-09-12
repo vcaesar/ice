@@ -54,6 +54,7 @@ func load(data *segment.Data) (*Segment, error) {
 	if err != nil {
 		return nil, err
 	}
+	rv.initFieldStats()
 
 	err = rv.loadStoredFieldChunk()
 	if err != nil {

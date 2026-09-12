@@ -103,6 +103,7 @@ func initSegmentBase(mem []byte, footer *footer,
 		fieldFSTs:               make(map[uint16]*vellum.FST),
 		storedFieldChunkOffsets: storedFieldChunkOffsets,
 	}
+	sb.initFieldStats()
 	sb.initDecompressedStoredFieldChunks(len(storedFieldChunkOffsets))
 	sb.updateSize()
 
