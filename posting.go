@@ -212,13 +212,13 @@ func (p *PostingsList) iterator(includeFreq, includeNorm, includeLocs bool,
 		}
 	}
 
-	rv.all = p.postings.Iterator()
+	// the roaring iterators are created on first use: multi-term
+	// searchers open hundreds of iterators per query only to OR their
+	// ActualBM's together
 	if p.except != nil {
 		rv.ActualBM = roaring.AndNot(p.postings, p.except)
-		rv.Actual = rv.ActualBM.Iterator()
 	} else {
 		rv.ActualBM = p.postings
-		rv.Actual = rv.all // Optimize to use same iterator for all & Actual.
 	}
 
 	return rv, nil
@@ -325,9 +325,21 @@ type PostingsIterator struct {
 
 	includeFreqNorm bool
 	includeLocs     bool
+	started         bool // all/Actual iterators created
 }
 
 var emptyPostingsIterator = &PostingsIterator{}
+
+// startIterators creates the roaring iterators deferred by iterator().
+func (i *PostingsIterator) startIterators() {
+	i.started = true
+	i.all = i.postings.postings.Iterator()
+	if i.ActualBM == i.postings.postings {
+		i.Actual = i.all // Optimize to use same iterator for all & Actual.
+	} else {
+		i.Actual = i.ActualBM.Iterator()
+	}
+}
 
 func (i *PostingsIterator) Size() int {
 	sizeInBytes := reflectStaticSizePostingsIterator + sizeOfPtr +
@@ -537,22 +549,20 @@ func (i *PostingsIterator) nextAtOrAfter(atOrAfter uint64) (segment.Posting, err
 // sets up the currChunk / loc related fields of the iterator.
 func (i *PostingsIterator) nextDocNumAtOrAfter(atOrAfter uint64) (docNum uint64, exists bool, err error) {
 	if i.normBits1Hit != 0 {
-		if i.docNum1Hit == docNum1HitFinished {
-			return 0, false, nil
-		}
-		if i.docNum1Hit < atOrAfter {
-			// advanced past our 1-hit
-			i.docNum1Hit = docNum1HitFinished // consume our 1-hit docNum
-			return 0, false, nil
-		}
-		docNum := i.docNum1Hit
-		i.docNum1Hit = docNum1HitFinished // consume our 1-hit docNum
-		return docNum, true, nil
+		docNum, exists = i.nextDocNum1Hit(atOrAfter)
+		return docNum, exists, nil
 	}
 
 	if atOrAfter > math.MaxUint32 {
 		i.Actual = nil
+		i.started = true
 		return 0, false, nil
+	}
+	if !i.started {
+		if i.ActualBM == nil {
+			return 0, false, nil
+		}
+		i.startIterators()
 	}
 	if i.Actual == nil || !i.Actual.HasNext() {
 		return 0, false, nil
@@ -604,6 +614,21 @@ func (i *PostingsIterator) nextDocNumAtOrAfter(atOrAfter uint64) (docNum uint64,
 	}
 
 	return uint64(n), true, nil
+}
+
+// nextDocNum1Hit consumes the single docNum of a "1-hit" encoded
+// postings list, if it is at or after atOrAfter.
+func (i *PostingsIterator) nextDocNum1Hit(atOrAfter uint64) (docNum uint64, exists bool) {
+	if i.docNum1Hit == docNum1HitFinished {
+		return 0, false
+	}
+	docNum = i.docNum1Hit
+	i.docNum1Hit = docNum1HitFinished // consume our 1-hit docNum
+	if docNum < atOrAfter {
+		// advanced past our 1-hit
+		return 0, false
+	}
+	return docNum, true
 }
 
 // optimization when the postings list is "clean" (e.g., no updates &
@@ -717,6 +742,10 @@ func (i *PostingsIterator) ActualBitmap() *roaring.Bitmap {
 func (i *PostingsIterator) ReplaceActual(abm *roaring.Bitmap) {
 	i.ActualBM = abm
 	i.Actual = abm.Iterator()
+	i.started = true
+	if i.all == nil && i.postings != nil && i.postings.postings != nil {
+		i.all = i.postings.postings.Iterator()
+	}
 }
 
 func (i *PostingsIterator) Count() uint64 {
