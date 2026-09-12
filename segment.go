@@ -40,6 +40,7 @@ type Segment struct {
 	fieldsInv  []string          // fieldID -> fieldName
 	fieldDocs  map[uint16]uint64 // fieldID -> # docs with value in field
 	fieldFreqs map[uint16]uint64 // fieldID -> # total tokens in field
+	fieldStats []CollectionStats // fieldID -> CollectionStats, see initFieldStats
 
 	storedFieldChunkOffsets []uint64 // stored field chunk offset
 

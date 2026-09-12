@@ -43,12 +43,25 @@ func (c *CollectionStats) Merge(other segment.CollectionStats) {
 }
 
 func (s *Segment) CollectionStats(field string) (segment.CollectionStats, error) {
-	var rv = &CollectionStats{}
-	fieldIDPlus1 := s.fieldsMap[field]
-	if fieldIDPlus1 > 0 {
-		rv.totalDocCount = s.footer.numDocs
-		rv.docCount = s.fieldDocs[fieldIDPlus1-1]
-		rv.sumTotalTermFreq = s.fieldFreqs[fieldIDPlus1-1]
+	// copy: segment.CollectionStats exposes Merge, and callers (bluge
+	// Snapshot.CollectionStats) Merge into the first segment's result.
+	rv := &CollectionStats{}
+	if fieldIDPlus1 := s.fieldsMap[field]; fieldIDPlus1 > 0 {
+		*rv = s.fieldStats[fieldIDPlus1-1]
 	}
 	return rv, nil
+}
+
+// initFieldStats precomputes per-field stats once at segment open so
+// CollectionStats avoids map lookups per query.
+func (s *Segment) initFieldStats() {
+	s.fieldStats = make([]CollectionStats, len(s.fieldsInv))
+	for id := range s.fieldsInv {
+		// #nosec G115 -- field ids are assigned from a uint16 counter.
+		s.fieldStats[id] = CollectionStats{
+			totalDocCount:    s.footer.numDocs,
+			docCount:         s.fieldDocs[uint16(id)],
+			sumTotalTermFreq: s.fieldFreqs[uint16(id)],
+		}
+	}
 }
