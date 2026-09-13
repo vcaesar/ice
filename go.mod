@@ -1,6 +1,6 @@
 module github.com/vcaesar/ice
 
-go 1.27.1
+go 1.26.0
 
 require (
 	github.com/RoaringBitmap/roaring/v2 v2.27.0
@@ -8,7 +8,7 @@ require (
 	github.com/blevesearch/vellum v1.2.0
 	github.com/klauspost/compress v1.20.0
 	github.com/spf13/cobra v1.10.2
-	github.com/vcaesar/bluge_segment_api v1.1.0
+	github.com/vcaesar/bluge_segment_api v1.2.0
 )
 
 require (
