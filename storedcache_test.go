@@ -220,6 +220,77 @@ func TestStoredChunkCacheLoadErrorNotCached(t *testing.T) {
 	}
 }
 
+// A failing load caches nothing, so waiters released by it must still share
+// that single attempt instead of racing into duplicate loads.
+func TestStoredChunkCacheCoalescesFailedLoad(t *testing.T) {
+	var c storedChunkCache
+	c.init(4)
+	want := errors.New("boom")
+	var loads atomic.Int32
+	release := make(chan struct{})
+	load := func() ([]byte, error) { //nolint:unparam // matches getOrLoad's loader signature
+		loads.Add(1)
+		<-release
+		return nil, want
+	}
+	const callers = 8
+	var wg sync.WaitGroup
+	for range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := c.getOrLoad(3, load); !errors.Is(err, want) {
+				t.Errorf("err=%v, want %v", err, want)
+			}
+		}()
+	}
+	// Release only once every caller has registered a miss, so all of them
+	// are waiting on the single inflight load.
+	c.m.Lock()
+	for c.misses != callers || len(c.inflight) != 1 {
+		c.m.Unlock()
+		runtime.Gosched()
+		c.m.Lock()
+	}
+	c.m.Unlock()
+	close(release)
+	wg.Wait()
+	if got := loads.Load(); got != 1 {
+		t.Fatalf("load ran %d times, want 1", got)
+	}
+	if c.len() != 0 || len(c.inflight) != 0 {
+		t.Fatal("failed load must leave no cache or inflight entry")
+	}
+}
+
+func TestStoredChunkCacheSizeAccounting(t *testing.T) {
+	var c storedChunkCache
+	c.init(2)
+	c.put(0, make([]byte, 0, 16))
+	c.put(1, make([]byte, 0, 32))
+	if got := c.size(); got != 48 {
+		t.Fatalf("size=%d, want 48", got)
+	}
+	c.put(0, make([]byte, 0, 4)) // overwrite shrinks
+	if got := c.size(); got != 36 {
+		t.Fatalf("size after overwrite=%d, want 36", got)
+	}
+	c.put(2, make([]byte, 0, 8)) // evicts chunk 1 (32)
+	if got := c.size(); got != 12 {
+		t.Fatalf("size after eviction=%d, want 12", got)
+	}
+	if _, err := c.getOrLoad(3, func() ([]byte, error) { return make([]byte, 0, 64), nil }); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.size(); got != 72 { // chunk 0 (4) evicted, 8 + 64 resident
+		t.Fatalf("size after load=%d, want 72", got)
+	}
+	c.init(2)
+	if got := c.size(); got != 0 {
+		t.Fatalf("size after re-init=%d, want 0", got)
+	}
+}
+
 func TestOptionsStoredChunkCacheSize(t *testing.T) {
 	doc := &FakeDocument{NewFakeField(_idFieldName, "a", true, false, false)}
 	for _, tc := range []struct {

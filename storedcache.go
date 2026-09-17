@@ -47,6 +47,7 @@ type storedChunkCache struct {
 	order    list.List
 	items    map[uint64]*list.Element
 	inflight map[uint64]*storedChunkLoad
+	bytes    int
 	hits     uint64
 	misses   uint64
 }
@@ -68,6 +69,7 @@ func (c *storedChunkCache) init(capacity int) {
 	c.order.Init()
 	c.items = make(map[uint64]*list.Element, capacity)
 	c.inflight = make(map[uint64]*storedChunkLoad)
+	c.bytes = 0
 	c.hits, c.misses = 0, 0
 	c.m.Unlock()
 }
@@ -97,13 +99,17 @@ func (c *storedChunkCache) getOrLoad(chunk uint64, load func() ([]byte, error)) 
 	c.m.Unlock()
 
 	l.data, l.err = load()
-	if l.err == nil {
-		c.put(chunk, l.data)
-	}
+
+	// Publish the result, drop the inflight entry and signal waiters while
+	// holding the lock, so a concurrent caller either joins this load or
+	// observes the cached value instead of starting a duplicate load.
 	c.m.Lock()
+	if l.err == nil {
+		c.putLocked(chunk, l.data)
+	}
 	delete(c.inflight, chunk)
-	c.m.Unlock()
 	close(l.done)
+	c.m.Unlock()
 	return l.data, l.err
 }
 
@@ -122,20 +128,30 @@ func (c *storedChunkCache) get(chunk uint64) ([]byte, bool) {
 
 func (c *storedChunkCache) put(chunk uint64, data []byte) {
 	c.m.Lock()
-	defer c.m.Unlock()
+	c.putLocked(chunk, data)
+	c.m.Unlock()
+}
+
+// putLocked inserts data for chunk; the caller must hold c.m.
+func (c *storedChunkCache) putLocked(chunk uint64, data []byte) {
 	if c.capacity <= 0 {
 		return
 	}
 	if el, ok := c.items[chunk]; ok {
-		el.Value.(*storedChunkEntry).data = data
+		entry := el.Value.(*storedChunkEntry)
+		c.bytes += cap(data) - cap(entry.data)
+		entry.data = data
 		c.order.MoveToFront(el)
 		return
 	}
 	for c.order.Len() >= c.capacity {
 		last := c.order.Back()
-		delete(c.items, last.Value.(*storedChunkEntry).chunk)
+		evicted := last.Value.(*storedChunkEntry)
+		c.bytes -= cap(evicted.data)
+		delete(c.items, evicted.chunk)
 		c.order.Remove(last)
 	}
+	c.bytes += cap(data)
 	c.items[chunk] = c.order.PushFront(&storedChunkEntry{chunk: chunk, data: data})
 }
 
@@ -143,11 +159,7 @@ func (c *storedChunkCache) put(chunk uint64, data []byte) {
 func (c *storedChunkCache) size() int {
 	c.m.Lock()
 	defer c.m.Unlock()
-	var n int
-	for el := c.order.Front(); el != nil; el = el.Next() {
-		n += cap(el.Value.(*storedChunkEntry).data)
-	}
-	return n
+	return c.bytes
 }
 
 func (c *storedChunkCache) len() int {

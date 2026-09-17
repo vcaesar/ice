@@ -152,7 +152,9 @@ func TestNumericColumnSegment(t *testing.T) {
 
 func TestNumericColumnMerge(t *testing.T) {
 	path, cleanup := setupTestDir(t)
-	defer cleanup()
+	// Registered first so it runs last: the mmapped segments below must be
+	// closed before the directory is removed (Windows cannot unlink open files).
+	t.Cleanup(cleanup)
 
 	open := func(name string, build segmentBuilder) *Segment {
 		seg, closeF, err := createDiskSegment(build, filepath.Join(path, name))
