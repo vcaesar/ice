@@ -8,7 +8,7 @@ require (
 	github.com/blevesearch/vellum v1.2.0
 	github.com/klauspost/compress v1.20.0
 	github.com/spf13/cobra v1.10.2
-	github.com/vcaesar/bluge_segment_api v1.2.0
+	github.com/vcaesar/bluge_segment_api v1.2.1
 )
 
 require (

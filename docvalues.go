@@ -30,7 +30,9 @@ type docNumTermsVisitor func(docNum uint64, terms []byte) error
 
 type docVisitState struct {
 	dvrs    map[uint16]*docValueReader
+	nums    map[uint16]*numericColumnCursor
 	segment *Segment
+	scratch []byte // prefix coded terms handed to the legacy visitor
 }
 
 type docValueReader struct {
@@ -280,19 +282,21 @@ func (di *docValueReader) getDocValueLocs(docNum uint64) (start, end uint64) {
 // VisitDocumentFieldTerms is an implementation of the
 // DocumentFieldTermVisitable interface
 func (s *Segment) visitDocumentFieldTerms(localDocNum uint64, fields []string,
-	visitor segment.DocumentValueVisitor, dvs *docVisitState) (
+	visitor segment.DocumentValueVisitor, numVisitor NumericValueVisitor, dvs *docVisitState) (
 	*docVisitState, error) {
 	if dvs == nil {
 		dvs = &docVisitState{segment: s}
 	} else if dvs.segment != s {
 		dvs.segment = s
 		dvs.dvrs = nil
+		dvs.nums = nil
 	}
 
 	if dvs.dvrs == nil {
 		var ok bool
 		var fieldIDPlus1 uint16
 		dvs.dvrs = make(map[uint16]*docValueReader, len(fields))
+		dvs.nums = make(map[uint16]*numericColumnCursor)
 		for _, field := range fields {
 			if fieldIDPlus1, ok = s.fieldsMap[field]; !ok {
 				continue
@@ -301,6 +305,9 @@ func (s *Segment) visitDocumentFieldTerms(localDocNum uint64, fields []string,
 			if dvIter, exists := s.fieldDvReaders[fieldID]; exists &&
 				dvIter != nil {
 				dvs.dvrs[fieldID] = dvIter.cloneInto(dvs.dvrs[fieldID])
+			}
+			if col, exists := s.fieldNumCols[fieldID]; exists {
+				dvs.nums[fieldID] = newNumericColumnCursor(col)
 			}
 		}
 	}
@@ -313,6 +320,7 @@ func (s *Segment) visitDocumentFieldTerms(localDocNum uint64, fields []string,
 	}
 	docInChunk := localDocNum / chunkFactor
 	var dvr *docValueReader
+	dvs.scratch = dvs.scratch[:0]
 	for _, field := range fields {
 		var ok bool
 		var fieldIDPlus1 uint16
@@ -320,6 +328,12 @@ func (s *Segment) visitDocumentFieldTerms(localDocNum uint64, fields []string,
 			continue
 		}
 		fieldID := fieldIDPlus1 - 1
+		if cur, isNum := dvs.nums[fieldID]; isNum {
+			if err := dvs.visitNumeric(cur, localDocNum, visitor, numVisitor); err != nil {
+				return dvs, err
+			}
+			continue
+		}
 		if dvr, ok = dvs.dvrs[fieldID]; ok && dvr != nil {
 			// check if the chunk is already loaded
 			if docInChunk != dvr.curChunkNumber() {
@@ -337,6 +351,23 @@ func (s *Segment) visitDocumentFieldTerms(localDocNum uint64, fields []string,
 	return dvs, nil
 }
 
+// visitNumeric hands column values to numVisitor when set, otherwise to the
+// term visitor as prefix coded terms valid until the next visit.
+func (dvs *docVisitState) visitNumeric(cur *numericColumnCursor, docNum uint64,
+	visitor segment.DocumentValueVisitor, numVisitor NumericValueVisitor) error {
+	if numVisitor != nil {
+		return cur.visit(dvs.segment, docNum, numVisitor)
+	}
+	return cur.visit(dvs.segment, docNum, func(field string, v int64) {
+		start := len(dvs.scratch)
+		dvs.scratch = appendPrefixCodedInt64(dvs.scratch, v)
+		visitor(field, dvs.scratch[start:])
+	})
+}
+
+// NumericValueVisitor receives typed values of numeric column fields.
+type NumericValueVisitor = segment.NumericValueVisitor
+
 type DocumentValueReader struct {
 	fields  []string
 	state   *docVisitState
@@ -344,7 +375,19 @@ type DocumentValueReader struct {
 }
 
 func (d *DocumentValueReader) VisitDocumentValues(number uint64, visitor segment.DocumentValueVisitor) error {
-	state, err := d.segment.visitDocumentFieldTerms(number, d.fields, visitor, d.state)
+	state, err := d.segment.visitDocumentFieldTerms(number, d.fields, visitor, nil, d.state)
+	if err != nil {
+		return err
+	}
+	d.state = state
+	return nil
+}
+
+// VisitDocumentNumbers is like VisitDocumentValues but numeric column
+// fields go to numVisitor as int64 instead of prefix coded terms.
+func (d *DocumentValueReader) VisitDocumentNumbers(number uint64, visitor segment.DocumentValueVisitor,
+	numVisitor segment.NumericValueVisitor) error {
+	state, err := d.segment.visitDocumentFieldTerms(number, d.fields, visitor, numVisitor, d.state)
 	if err != nil {
 		return err
 	}

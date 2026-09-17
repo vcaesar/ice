@@ -106,8 +106,8 @@ func TestOptimizationVisitDocumentValidationAndCleanup(t *testing.T) {
 			payload = append(payload, tc.meta...)
 			payload = append(payload, "abc"...)
 			s := &Segment{data: segment.NewDataBytes(make([]byte, 8)), footer: &footer{numDocs: 1}, fieldsInv: []string{"field"}}
-			s.initDecompressedStoredFieldChunks(1)
-			s.decompressedStoredFieldChunks[0].data = payload
+			s.initStoredChunkCache(StoredChunkCacheSize)
+			s.storedChunks.put(0, payload)
 			ctx := &visitDocumentCtx{}
 			ctx.reader.Reset([]byte("previous data"))
 			calls := 0
@@ -139,10 +139,10 @@ func TestOptimizationStoredCacheSize(t *testing.T) {
 		footer:                  &footer{numDocs: 1},
 		storedFieldChunkOffsets: []uint64{8, uint64(8 + len(compressed))},
 	}
-	s.initDecompressedStoredFieldChunks(2)
+	s.initStoredChunkCache(StoredChunkCacheSize)
 	s.updateSize()
 	before := s.Size()
-	wantBase := reflectStaticSizeSegment + s.data.Size() + 2*sizeOfUint64 + 2*int(reflect.TypeOf(segmentCacheData{}).Size())
+	wantBase := reflectStaticSizeSegment + s.data.Size() + 2*sizeOfUint64
 	if before != wantBase {
 		t.Fatalf("base size=%d, want %d", before, wantBase)
 	}
@@ -163,7 +163,11 @@ func TestOptimizationStoredCacheSize(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	want := before + cap(s.decompressedStoredFieldChunks[0].data)
+	chunk, ok := s.storedChunks.get(0)
+	if !ok {
+		t.Fatal("chunk 0 not cached")
+	}
+	want := before + cap(chunk)
 	if got := s.Size(); got != want || got <= before {
 		t.Fatalf("loaded size=%d, want %d > %d", got, want, before)
 	}
@@ -171,7 +175,7 @@ func TestOptimizationStoredCacheSize(t *testing.T) {
 	if got := s.Size(); got != want {
 		t.Fatalf("updateSize double counted data: got %d, want %d", got, want)
 	}
-	s.decompressedStoredFieldChunks[1].data = make([]byte, 1, 64)
+	s.storedChunks.put(1, make([]byte, 1, 64))
 	if got := s.Size(); got != want+64 {
 		t.Fatalf("size did not include second chunk capacity: got %d, want %d", got, want+64)
 	}
@@ -183,7 +187,7 @@ func TestOptimizationStoredReadFailureSizeAndCleanup(t *testing.T) {
 		footer:                  &footer{numDocs: 1},
 		storedFieldChunkOffsets: []uint64{8, 16},
 	}
-	s.initDecompressedStoredFieldChunks(1)
+	s.initStoredChunkCache(StoredChunkCacheSize)
 	s.updateSize()
 	before := s.Size()
 	ctx := &visitDocumentCtx{}
@@ -198,7 +202,7 @@ func TestOptimizationStoredReadFailureSizeAndCleanup(t *testing.T) {
 	go func() { done <- s.Size() }()
 	select {
 	case got := <-done:
-		if got != before || s.decompressedStoredFieldChunks[0].data != nil {
+		if got != before || s.storedChunks.len() != 0 {
 			t.Fatal("failed read changed cache accounting")
 		}
 	case <-time.After(time.Second):

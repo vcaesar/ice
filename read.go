@@ -50,10 +50,25 @@ func readDataUvarint(data *segment.Data, offset *uint64) (uint64, error) {
 	return value, nil
 }
 
-func (s *Segment) initDecompressedStoredFieldChunks(n int) {
-	s.m.Lock()
-	s.decompressedStoredFieldChunks = make([]segmentCacheData, n)
-	s.m.Unlock()
+func (s *Segment) initStoredChunkCache(capacity int) {
+	s.storedChunks.init(capacity)
+}
+
+// storedChunk returns decompressed stored-field chunk chunkI, decompressing
+// and caching it on a miss; concurrent misses share one decompression.
+func (s *Segment) storedChunk(chunkI uint64) ([]byte, error) {
+	return s.storedChunks.getOrLoad(chunkI, func() ([]byte, error) {
+		if chunkI+1 >= uint64(len(s.storedFieldChunkOffsets)) {
+			return nil, fmt.Errorf("stored-field chunk offsets out of bounds")
+		}
+		chunkOffsetStart := s.storedFieldChunkOffsets[chunkI]
+		chunkOffsetEnd := s.storedFieldChunkOffsets[chunkI+1]
+		compressed, err := readDataAt(s.data, chunkOffsetStart, chunkOffsetEnd-chunkOffsetStart)
+		if err != nil {
+			return nil, err
+		}
+		return compress.Decompress(nil, compressed)
+	})
 }
 
 func (s *Segment) getDocStoredMetaAndUnCompressed(docNum uint64) (meta, data []byte, err error) {
@@ -62,39 +77,10 @@ func (s *Segment) getDocStoredMetaAndUnCompressed(docNum uint64) (meta, data []b
 		return nil, nil, err
 	}
 
-	// document chunk coder
-	var uncompressed []byte
-	chunkI := docNum / uint64(defaultDocumentChunkSize)
-	if chunkI >= uint64(len(s.decompressedStoredFieldChunks)) {
-		return nil, nil, fmt.Errorf("stored-field chunk out of bounds")
+	uncompressed, err := s.storedChunk(docNum / uint64(defaultDocumentChunkSize))
+	if err != nil {
+		return nil, nil, err
 	}
-	storedFieldDecompressed := &s.decompressedStoredFieldChunks[chunkI]
-	storedFieldDecompressed.m.Lock()
-	if storedFieldDecompressed.data == nil {
-		if chunkI+1 >= uint64(len(s.storedFieldChunkOffsets)) {
-			storedFieldDecompressed.m.Unlock()
-			return nil, nil, fmt.Errorf("stored-field chunk offsets out of bounds")
-		}
-		// we haven't already loaded and decompressed this chunk
-		chunkOffsetStart := s.storedFieldChunkOffsets[chunkI]
-		chunkOffsetEnd := s.storedFieldChunkOffsets[chunkI+1]
-		compressed, err := readDataAt(s.data, chunkOffsetStart, chunkOffsetEnd-chunkOffsetStart)
-		if err != nil {
-			storedFieldDecompressed.m.Unlock()
-			return nil, nil, err
-		}
-
-		// decompress it
-		decoded, err := compress.Decompress(nil, compressed)
-		if err != nil {
-			storedFieldDecompressed.m.Unlock()
-			return nil, nil, err
-		}
-		storedFieldDecompressed.data = decoded
-	}
-	// once initialized it wouldn't change, so we can unlock the mutex
-	uncompressed = storedFieldDecompressed.data
-	storedFieldDecompressed.m.Unlock()
 
 	if storedOffset > uint64(len(uncompressed)) {
 		return nil, nil, fmt.Errorf("invalid stored-field offset %d", storedOffset)

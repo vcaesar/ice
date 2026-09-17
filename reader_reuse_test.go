@@ -11,7 +11,7 @@ import (
 
 func TestDocumentValueStateReuse(t *testing.T) {
 	s := &Segment{}
-	state, err := s.visitDocumentFieldTerms(0, nil, nil, nil)
+	state, err := s.visitDocumentFieldTerms(0, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -20,7 +20,7 @@ func TestDocumentValueStateReuse(t *testing.T) {
 	}
 	marker := &docValueReader{}
 	state.dvrs[42] = marker
-	next, err := s.visitDocumentFieldTerms(0, nil, nil, state)
+	next, err := s.visitDocumentFieldTerms(0, nil, nil, nil, state)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -28,7 +28,7 @@ func TestDocumentValueStateReuse(t *testing.T) {
 		t.Fatal("reader state rebuilt on reuse")
 	}
 	other := &Segment{}
-	next, err = other.visitDocumentFieldTerms(0, nil, nil, state)
+	next, err = other.visitDocumentFieldTerms(0, nil, nil, nil, state)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,14 +61,14 @@ func TestCopyStoredDocsMalformedPayload(t *testing.T) {
 
 func BenchmarkDocumentValueStateReuse(b *testing.B) {
 	s := &Segment{}
-	state, err := s.visitDocumentFieldTerms(0, nil, nil, nil)
+	state, err := s.visitDocumentFieldTerms(0, nil, nil, nil, nil)
 	if err != nil {
 		b.Fatal(err)
 	}
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		state, err = s.visitDocumentFieldTerms(0, nil, nil, state)
+		state, err = s.visitDocumentFieldTerms(0, nil, nil, nil, state)
 		if err != nil {
 			b.Fatal(err)
 		}

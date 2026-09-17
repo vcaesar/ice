@@ -233,6 +233,7 @@ func persistMergedRest(segments []*Segment, dropsIn []*roaring.Bitmap,
 	dictLocs = make([]uint64, len(fieldsInv))
 	fieldDvLocsStart := make([]uint64, len(fieldsInv))
 	fieldDvLocsEnd := make([]uint64, len(fieldsInv))
+	fieldDvNumeric := make([]bool, len(fieldsInv))
 
 	// these int coders are initialized with chunk size 1024
 	// however this will be reset to the correct chunk size
@@ -256,7 +257,7 @@ func persistMergedRest(segments []*Segment, dropsIn []*roaring.Bitmap,
 	for fieldID, fieldName := range fieldsInv {
 		err = persistMergedRestField(segments, dropsIn, fieldsMap, newDocNumsIn, newSegDocCount, chunkMode, w,
 			closeCh, fieldName, newRoaring, fieldDocTracking, tfEncoder, locEncoder, newVellum, &vellumBuf,
-			bufMaxVarintLen64, fieldFreqs, fieldID, dictLocs, fieldDvLocsStart, fieldDvLocsEnd)
+			bufMaxVarintLen64, fieldFreqs, fieldID, dictLocs, fieldDvLocsStart, fieldDvLocsEnd, fieldDvNumeric)
 		if err != nil {
 			return nil, nil, nil, 0, err
 		}
@@ -272,7 +273,7 @@ func persistMergedRest(segments []*Segment, dropsIn []*roaring.Bitmap,
 		fieldDocs[uint16(fieldID)] += fieldDocTracking.GetCardinality()
 	}
 
-	docValueOffset, err = writeDvLocs(w, bufMaxVarintLen64, fieldDvLocsStart, fieldDvLocsEnd)
+	docValueOffset, err = writeDvLocs(w, bufMaxVarintLen64, fieldDvLocsStart, fieldDvLocsEnd, fieldDvNumeric)
 	if err != nil {
 		return nil, nil, nil, 0, err
 	}
@@ -284,7 +285,7 @@ func persistMergedRestField(segments []*Segment, dropsIn []*roaring.Bitmap, fiel
 	newDocNumsIn [][]uint64, newSegDocCount uint64, chunkMode uint32, w *countHashWriter, closeCh chan struct{},
 	fieldName string, newRoaring, fieldDocTracking *roaring.Bitmap, tfEncoder, locEncoder *chunkedIntCoder,
 	newVellum *vellum.Builder, vellumBuf *bytes.Buffer, bufMaxVarintLen64 []byte, fieldFreqs map[uint16]uint64,
-	fieldID int, dictLocs, fieldDvLocsStart, fieldDvLocsEnd []uint64) error {
+	fieldID int, dictLocs, fieldDvLocsStart, fieldDvLocsEnd []uint64, fieldDvNumeric []bool) error {
 	var postings *PostingsList
 	var postItr *PostingsIterator
 	var bufLoc []uint64
@@ -372,7 +373,7 @@ func persistMergedRestField(segments []*Segment, dropsIn []*roaring.Bitmap, fiel
 	}
 
 	err = buildMergedDocVals(newSegDocCount, w, closeCh, fieldName, fieldID, fieldDvLocsStart, fieldDvLocsEnd,
-		segmentsInFocus, newDocNums)
+		fieldDvNumeric, segmentsInFocus, newDocNums)
 	if err != nil {
 		return err
 	}
@@ -407,7 +408,12 @@ func writeMergedDict(w *countHashWriter, newVellum io.Closer, vellumBuf *bytes.B
 }
 
 func buildMergedDocVals(newSegDocCount uint64, w *countHashWriter, closeCh chan struct{}, fieldName string, fieldID int,
-	fieldDvLocsStart, fieldDvLocsEnd []uint64, segmentsInFocus []*Segment, newDocNums [][]uint64) error {
+	fieldDvLocsStart, fieldDvLocsEnd []uint64, fieldDvNumeric []bool, segmentsInFocus []*Segment, newDocNums [][]uint64) error {
+	if allNumericColumns(segmentsInFocus, fieldName) {
+		fieldDvNumeric[fieldID] = true
+		return buildMergedNumericColumn(newSegDocCount, w, closeCh, fieldName, fieldID,
+			fieldDvLocsStart, fieldDvLocsEnd, segmentsInFocus, newDocNums)
+	}
 	// get the field doc value offset (start)
 	fieldDvLocsStart[fieldID] = uint64(w.Count()) // #nosec G115 -- countHashWriter checks overflow and counts nonnegative writes.
 
@@ -429,6 +435,15 @@ func buildMergedDocVals(newSegDocCount uint64, w *countHashWriter, closeCh chan 
 		}
 
 		fieldIDPlus1 := seg.fieldsMap[fieldName]
+		if col, exists := seg.fieldNumCols[fieldIDPlus1-1]; exists {
+			// mixed with term doc values elsewhere: degrade to terms
+			fdvReadersAvailable = true
+			err = mergeNumericAsTerms(seg, col, newDocNums[segmentI], fdvEncoder)
+			if err != nil {
+				return err
+			}
+			continue
+		}
 		if dvIter, exists := seg.fieldDvReaders[fieldIDPlus1-1]; exists &&
 			dvIter != nil {
 			fdvReadersAvailable = true
@@ -468,6 +483,88 @@ func buildMergedDocVals(newSegDocCount uint64, w *countHashWriter, closeCh chan 
 		fieldDvLocsEnd[fieldID] = fieldNotUninverted
 	}
 	return nil
+}
+
+// allNumericColumns reports whether every segment holding doc values for
+// the field holds them as a numeric column, and at least one does.
+func allNumericColumns(segments []*Segment, fieldName string) bool {
+	var numeric bool
+	for _, seg := range segments {
+		fieldIDPlus1, ok := seg.fieldsMap[fieldName]
+		if !ok {
+			continue
+		}
+		if _, ok := seg.fieldNumCols[fieldIDPlus1-1]; ok {
+			numeric = true
+			continue
+		}
+		if dv, ok := seg.fieldDvReaders[fieldIDPlus1-1]; ok && dv != nil {
+			return false
+		}
+	}
+	return numeric
+}
+
+func buildMergedNumericColumn(newSegDocCount uint64, w *countHashWriter, closeCh chan struct{}, fieldName string,
+	fieldID int, fieldDvLocsStart, fieldDvLocsEnd []uint64, segmentsInFocus []*Segment, newDocNums [][]uint64) error {
+	cw := newNumericColumnWriter(newSegDocCount)
+	for segmentI, seg := range segmentsInFocus {
+		if isClosed(closeCh) {
+			return segment.ErrClosed
+		}
+		col, ok := seg.fieldNumCols[seg.fieldsMap[fieldName]-1]
+		if !ok {
+			continue
+		}
+		mapping := newDocNums[segmentI]
+		err := newNumericColumnCursor(col).iterate(seg, func(docNum uint64, v int64) error {
+			if mapping[docNum] == docDropped {
+				return nil
+			}
+			return cw.Add(mapping[docNum], v)
+		})
+		if err != nil {
+			return err
+		}
+	}
+	fieldDvLocsStart[fieldID] = uint64(w.Count()) // #nosec G115 -- countHashWriter checks overflow and counts nonnegative writes.
+	if _, err := cw.Write(w); err != nil {
+		return err
+	}
+	fieldDvLocsEnd[fieldID] = uint64(w.Count()) // #nosec G115 -- countHashWriter checks overflow and counts nonnegative writes.
+	return nil
+}
+
+// mergeNumericAsTerms feeds a numeric column into a term doc value encoder,
+// grouping the values of each doc into one prefix coded term list.
+func mergeNumericAsTerms(seg *Segment, col *numericColumn, mapping []uint64, enc *chunkedContentCoder) error {
+	var terms []byte
+	curDoc := uint64(docDropped)
+	flush := func() error {
+		if curDoc == docDropped || len(terms) == 0 {
+			return nil
+		}
+		return enc.Add(curDoc, terms)
+	}
+	err := newNumericColumnCursor(col).iterate(seg, func(docNum uint64, v int64) error {
+		newDoc := mapping[docNum]
+		if newDoc == docDropped {
+			return nil
+		}
+		if newDoc != curDoc {
+			if err := flush(); err != nil {
+				return err
+			}
+			curDoc = newDoc
+			terms = terms[:0]
+		}
+		terms = append(appendPrefixCodedInt64(terms, v), termSeparator)
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	return flush()
 }
 
 func prepareNewTerm(newSegDocCount uint64, chunkMode uint32, tfEncoder, locEncoder *chunkedIntCoder,
@@ -547,13 +644,23 @@ func finishTerm(w *countHashWriter, newRoaring *roaring.Bitmap, tfEncoder, locEn
 	return nil
 }
 
-func writeDvLocs(w *countHashWriter, bufMaxVarintLen64 []byte, fieldDvLocsStart, fieldDvLocsEnd []uint64) (uint64, error) {
+func writeDvLocs(w *countHashWriter, bufMaxVarintLen64 []byte, fieldDvLocsStart, fieldDvLocsEnd []uint64,
+	numeric []bool) (uint64, error) {
 	fieldDvLocsOffset := uint64(w.Count()) // #nosec G115 -- countHashWriter checks overflow and counts nonnegative writes.
 
 	buf := bufMaxVarintLen64
 	for i := 0; i < len(fieldDvLocsStart); i++ {
-		n := binary.PutUvarint(buf, fieldDvLocsStart[i])
+		kind := dvKindTerms
+		if numeric[i] {
+			kind = dvKindNumeric
+		}
+		n := binary.PutUvarint(buf, kind)
 		_, err := w.Write(buf[:n])
+		if err != nil {
+			return 0, err
+		}
+		n = binary.PutUvarint(buf, fieldDvLocsStart[i])
+		_, err = w.Write(buf[:n])
 		if err != nil {
 			return 0, err
 		}

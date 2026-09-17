@@ -29,6 +29,10 @@ import (
 // various helpers to test with files, even though
 // ice no longer knows about files itself
 
+// setupTestDir returns a temp dir and its removal func. Callers must run
+// cleanup after every segment opened under path is closed (register it with
+// t.Cleanup before the segment closers, or defer it first), because Windows
+// cannot unlink files that are still mmapped or open.
 func setupTestDir(t *testing.T) (path string, cleanup func()) {
 	path, err := os.MkdirTemp(t.TempDir(), "ice-test")
 	if err != nil {
@@ -103,7 +107,7 @@ func openFromFile(path string) (*Segment, closeFunc, error) {
 
 	data := segment.NewDataBytes(mm)
 
-	seg, err := load(data)
+	seg, err := load(data, DefaultOptions())
 	if err != nil {
 		_ = closeFunc()
 		return nil, noCloseFunc, fmt.Errorf("error loading segment: %v", err)
