@@ -103,7 +103,7 @@ func TestStoredFieldsDecompressionErrorUnlocks(t *testing.T) {
 		footer:                  &footer{storedIndexOffset: 1, numDocs: 1},
 		storedFieldChunkOffsets: []uint64{0, 1},
 	}
-	s.initDecompressedStoredFieldChunks(1)
+	s.initStoredChunkCache(StoredChunkCacheSize)
 	if _, _, err := s.getDocStoredMetaAndUnCompressed(0); err == nil {
 		t.Fatal("expected corrupt compression error")
 	}
@@ -142,8 +142,8 @@ func TestStoredFieldsMalformedPayload(t *testing.T) {
 			index := make([]byte, 8)
 			binary.BigEndian.PutUint64(index, test.offset)
 			s := &Segment{data: segment.NewDataBytes(index), footer: &footer{numDocs: 1}}
-			s.initDecompressedStoredFieldChunks(1)
-			s.decompressedStoredFieldChunks[0].data = test.payload
+			s.initStoredChunkCache(StoredChunkCacheSize)
+			s.storedChunks.put(0, test.payload)
 			if _, _, err := s.getDocStoredMetaAndUnCompressed(0); err == nil {
 				t.Fatal("expected malformed stored-field error")
 			}

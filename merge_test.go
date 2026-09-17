@@ -190,7 +190,7 @@ func testMergeWithEmptySegments(t *testing.T, before bool, numEmptySegments int)
 }
 
 func createAndPersistEmptySegment(t *testing.T, path string) {
-	emptySegment, _, err := newWithChunkMode([]segment.Document{}, encodeNorm, 1024)
+	emptySegment, _, err := newWithChunkMode([]segment.Document{}, encodeNorm, 1024, DefaultOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -687,7 +687,7 @@ func buildTestSegmentMultiHelper(docIDs []string) (*Segment, uint64, error) {
 
 	results := []segment.Document{doc, doc2}
 
-	seg, size, err := newWithChunkMode(results, encodeNorm, 1024)
+	seg, size, err := newWithChunkMode(results, encodeNorm, 1024, DefaultOptions())
 	return seg.(*Segment), size, err
 }
 

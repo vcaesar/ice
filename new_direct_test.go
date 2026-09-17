@@ -66,7 +66,7 @@ func TestProcessDocumentDirectMatchesRollup(t *testing.T) {
 	rollup.FakeComposite("_all", []string{"_id"})
 
 	build := func(doc *FakeDocument) *Segment {
-		seg, _, err := newWithChunkMode([]segment.Document{doc}, encodeNorm, defaultChunkMode)
+		seg, _, err := newWithChunkMode([]segment.Document{doc}, encodeNorm, defaultChunkMode, DefaultOptions())
 		if err != nil {
 			t.Fatal(err)
 		}

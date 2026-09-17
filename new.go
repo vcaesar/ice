@@ -35,11 +35,17 @@ var newSegmentBufferAvgBytesPerDocFactor = 1.0
 // of a segment for the source documents
 func New(results []segment.Document, normCalc func(string, int) float32) (
 	segment.Segment, uint64, error) {
-	return newWithChunkMode(results, normCalc, defaultChunkMode)
+	return DefaultOptions().New(results, normCalc)
+}
+
+// New is like the package-level New but applies o to the segment.
+func (o Options) New(results []segment.Document, normCalc func(string, int) float32) (
+	segment.Segment, uint64, error) {
+	return newWithChunkMode(results, normCalc, defaultChunkMode, o)
 }
 
 func newWithChunkMode(results []segment.Document, normCalc func(string, int) float32,
-	chunkMode uint32) (segment.Segment, uint64, error) {
+	chunkMode uint32, opts Options) (segment.Segment, uint64, error) {
 	s := interimPool.Get().(*interim)
 
 	s.normCalc = normCalc
@@ -76,7 +82,7 @@ func newWithChunkMode(results []segment.Document, normCalc func(string, int) flo
 	sb, err := initSegmentBase(br.Bytes(), footer,
 		s.FieldsMap, s.FieldsInv,
 		s.FieldDocs, s.FieldFreqs,
-		dictOffsets, storedFieldChunkOffsets)
+		dictOffsets, storedFieldChunkOffsets, opts)
 
 	if err == nil && s.reset() == nil {
 		s.lastNumDocs = len(results)
@@ -90,7 +96,7 @@ func newWithChunkMode(results []segment.Document, normCalc func(string, int) flo
 func initSegmentBase(mem []byte, footer *footer,
 	fieldsMap map[string]uint16, fieldsInv []string,
 	fieldsDocs, fieldsFreqs map[uint16]uint64,
-	dictLocs []uint64, storedFieldChunkOffsets []uint64) (*Segment, error) {
+	dictLocs []uint64, storedFieldChunkOffsets []uint64, opts Options) (*Segment, error) {
 	sb := &Segment{
 		data:                    segment.NewDataBytes(mem),
 		footer:                  footer,
@@ -100,11 +106,12 @@ func initSegmentBase(mem []byte, footer *footer,
 		fieldFreqs:              fieldsFreqs,
 		dictLocs:                dictLocs,
 		fieldDvReaders:          make(map[uint16]*docValueReader),
+		fieldNumCols:            make(map[uint16]*numericColumn),
 		fieldFSTs:               make(map[uint16]*vellum.FST),
 		storedFieldChunkOffsets: storedFieldChunkOffsets,
 	}
 	sb.initFieldStats()
-	sb.initDecompressedStoredFieldChunks(len(storedFieldChunkOffsets))
+	sb.initStoredChunkCache(opts.StoredChunkCacheSize)
 	sb.updateSize()
 
 	err := sb.loadDvReaders()
@@ -153,6 +160,16 @@ type interim struct {
 	// Fields whose IncludeDocValues is true
 	//  field id -> bool
 	IncludeDocValues []bool
+
+	// NumericOnly is true while every doc value seen for the field came
+	// from a NumericField; such fields are written as a numeric column.
+	//  field id -> bool
+	NumericOnly []bool
+
+	// NumericValues holds (docNum, value) pairs in doc order
+	//  field id -> values
+	NumericValues [][]interimNumeric
+	numericWriter *numericColumnWriter
 
 	// postings id -> bitmap of docNums
 	Postings []*roaring.Bitmap
@@ -213,6 +230,11 @@ func (s *interim) reset() (err error) {
 		s.IncludeDocValues[i] = false
 	}
 	s.IncludeDocValues = s.IncludeDocValues[:0]
+	s.NumericOnly = s.NumericOnly[:0]
+	for i := range s.NumericValues {
+		s.NumericValues[i] = s.NumericValues[i][:0]
+	}
+	s.NumericValues = s.NumericValues[:0]
 	for _, idn := range s.Postings {
 		idn.Clear()
 	}
@@ -264,6 +286,11 @@ type interimFreqNorm struct {
 	numLocs int
 }
 
+type interimNumeric struct {
+	docNum uint64
+	val    int64
+}
+
 type interimLoc struct {
 	fieldID uint16
 	pos     uint64
@@ -307,6 +334,19 @@ func (s *interim) convert() (f *footer, dictOffsets, storedFieldChunkOffsets []u
 		s.IncludeDocValues = s.IncludeDocValues[:len(s.FieldsInv)]
 	} else {
 		s.IncludeDocValues = make([]bool, len(s.FieldsInv))
+	}
+	if cap(s.NumericOnly) >= len(s.FieldsInv) {
+		s.NumericOnly = s.NumericOnly[:len(s.FieldsInv)]
+	} else {
+		s.NumericOnly = make([]bool, len(s.FieldsInv))
+	}
+	for i := range s.NumericOnly {
+		s.NumericOnly[i] = true
+	}
+	if cap(s.NumericValues) >= len(s.FieldsInv) {
+		s.NumericValues = s.NumericValues[:len(s.FieldsInv)]
+	} else {
+		s.NumericValues = make([][]interimNumeric, len(s.FieldsInv))
 	}
 
 	if prepareErr := s.prepareDicts(); prepareErr != nil {
@@ -788,6 +828,16 @@ func (s *interim) writeStoredFields() (
 
 			if field.IndexDocValues() {
 				s.IncludeDocValues[fieldID] = true
+				if nf, ok := field.(NumericField); ok {
+					if v, ok := nf.NumericValue(); ok {
+						s.NumericValues[fieldID] = append(s.NumericValues[fieldID],
+							interimNumeric{docNum: uint64(docNum), val: v}) // #nosec G115 -- docNum is a nonnegative slice index.
+					} else {
+						s.NumericOnly[fieldID] = false
+					}
+				} else {
+					s.NumericOnly[fieldID] = false
+				}
 			}
 		})
 
@@ -872,8 +922,17 @@ func (s *interim) writeDicts() (fdvIndexOffset uint64, dictOffsets []uint64, err
 	fdvIndexOffset = uint64(s.w.Count()) // #nosec G115 -- countHashWriter checks overflow and counts nonnegative writes.
 
 	for i := 0; i < len(fdvOffsetsStart); i++ {
-		n := binary.PutUvarint(buf, fdvOffsetsStart[i])
+		kind := dvKindTerms
+		if s.IncludeDocValues[i] && s.NumericOnly[i] {
+			kind = dvKindNumeric
+		}
+		n := binary.PutUvarint(buf, kind)
 		_, err := s.w.Write(buf[:n])
+		if err != nil {
+			return 0, nil, err
+		}
+		n = binary.PutUvarint(buf, fdvOffsetsStart[i])
+		_, err = s.w.Write(buf[:n])
 		if err != nil {
 			return 0, nil, err
 		}
@@ -939,7 +998,10 @@ func (s *interim) writeDictsField(docTermMap [][]byte, fieldID int, terms []stri
 	}
 
 	// write the field doc values
-	// NOTE: doc values continue to use legacy chunk mode
+	if s.IncludeDocValues[fieldID] && s.NumericOnly[fieldID] {
+		return s.writeNumericColumn(fieldID, fdvOffsetsStart, fdvOffsetsEnd)
+	}
+	// NOTE: term doc values continue to use legacy chunk mode
 	chunkSize, err := getChunkSize(legacyChunkMode, 0, 0)
 	if err != nil {
 		return err
@@ -974,6 +1036,26 @@ func (s *interim) writeDictsField(docTermMap [][]byte, fieldID int, terms []stri
 		fdvOffsetsStart[fieldID] = fieldNotUninverted
 		fdvOffsetsEnd[fieldID] = fieldNotUninverted
 	}
+	return nil
+}
+
+func (s *interim) writeNumericColumn(fieldID int, fdvOffsetsStart, fdvOffsetsEnd []uint64) error {
+	numDocs := uint64(len(s.results)) // #nosec G115 -- slice length is nonnegative.
+	if s.numericWriter == nil {
+		s.numericWriter = newNumericColumnWriter(numDocs)
+	} else {
+		s.numericWriter.Reset(numDocs)
+	}
+	for _, nv := range s.NumericValues[fieldID] {
+		if err := s.numericWriter.Add(nv.docNum, nv.val); err != nil {
+			return err
+		}
+	}
+	fdvOffsetsStart[fieldID] = uint64(s.w.Count()) // #nosec G115 -- countHashWriter checks overflow and counts nonnegative writes.
+	if _, err := s.numericWriter.Write(s.w); err != nil {
+		return err
+	}
+	fdvOffsetsEnd[fieldID] = uint64(s.w.Count()) // #nosec G115 -- countHashWriter checks overflow and counts nonnegative writes.
 	return nil
 }
 

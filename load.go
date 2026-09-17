@@ -22,12 +22,17 @@ import (
 	segment "github.com/vcaesar/bluge_segment_api"
 )
 
-// Open returns an impl of a segment
+// Load returns an impl of a segment
 func Load(data *segment.Data) (segment.Segment, error) {
-	return load(data)
+	return DefaultOptions().Load(data)
 }
 
-func load(data *segment.Data) (*Segment, error) {
+// Load is like the package-level Load but applies o to the segment.
+func (o Options) Load(data *segment.Data) (segment.Segment, error) {
+	return load(data, o)
+}
+
+func load(data *segment.Data, opts Options) (*Segment, error) {
 	footer, err := parseFooter(data)
 	if err != nil {
 		return nil, fmt.Errorf("error parsing footer: %w", err)
@@ -37,6 +42,7 @@ func load(data *segment.Data) (*Segment, error) {
 		footer:         footer,
 		fieldsMap:      make(map[string]uint16),
 		fieldDvReaders: make(map[uint16]*docValueReader),
+		fieldNumCols:   make(map[uint16]*numericColumn),
 		fieldFSTs:      make(map[uint16]*vellum.FST),
 		fieldDocs:      make(map[uint16]uint64),
 		fieldFreqs:     make(map[uint16]uint64),
@@ -61,7 +67,7 @@ func load(data *segment.Data) (*Segment, error) {
 		return nil, err
 	}
 
-	rv.initDecompressedStoredFieldChunks(len(rv.storedFieldChunkOffsets))
+	rv.initStoredChunkCache(opts.StoredChunkCacheSize)
 
 	err = rv.loadDvReaders()
 	if err != nil {

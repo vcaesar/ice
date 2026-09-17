@@ -103,7 +103,7 @@ func openFromFile(path string) (*Segment, closeFunc, error) {
 
 	data := segment.NewDataBytes(mm)
 
-	seg, err := load(data)
+	seg, err := load(data, DefaultOptions())
 	if err != nil {
 		_ = closeFunc()
 		return nil, noCloseFunc, fmt.Errorf("error loading segment: %v", err)

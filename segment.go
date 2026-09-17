@@ -20,7 +20,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"reflect"
 	"sync"
 
 	"github.com/RoaringBitmap/roaring/v2"
@@ -28,7 +27,11 @@ import (
 	segment "github.com/vcaesar/bluge_segment_api"
 )
 
-const Version uint32 = 3
+const Version uint32 = 4
+
+// versionTermDocValues is the last version whose doc values are all term
+// encoded; it is still readable, and merges rewrite it as Version.
+const versionTermDocValues uint32 = 3
 
 const Type string = "ice"
 
@@ -46,18 +49,14 @@ type Segment struct {
 
 	dictLocs       []uint64
 	fieldDvReaders map[uint16]*docValueReader // naive chunk cache per field
+	fieldNumCols   map[uint16]*numericColumn  // typed numeric doc values per field
 	fieldDvNames   []string                   // field names cached in fieldDvReaders
 	size           int
 
 	// state loaded dynamically
-	m                             sync.RWMutex
-	fieldFSTs                     map[uint16]*vellum.FST
-	decompressedStoredFieldChunks []segmentCacheData
-}
-
-type segmentCacheData struct {
-	data []byte
-	m    sync.RWMutex
+	m            sync.RWMutex
+	fieldFSTs    map[uint16]*vellum.FST
+	storedChunks storedChunkCache
 }
 
 func (s *Segment) WriteTo(w io.Writer, _ chan struct{}) (int64, error) {
@@ -99,15 +98,14 @@ func (s *Segment) Timestamp() (minimum, maximum int64) {
 }
 
 func (s *Segment) Size() int {
-	size := s.size
 	// Chunk data is loaded lazily and is not included in the static size.
-	for i := range s.decompressedStoredFieldChunks {
-		chunk := &s.decompressedStoredFieldChunks[i]
-		chunk.m.RLock()
-		size += cap(chunk.data)
-		chunk.m.RUnlock()
-	}
-	return size
+	return s.size + s.storedChunks.size()
+}
+
+// StoredChunkCacheStats returns hits, misses and resident entries of the
+// decompressed stored-field chunk cache.
+func (s *Segment) StoredChunkCacheStats() (hits, misses uint64, entries int) {
+	return s.storedChunks.stats()
 }
 
 func (s *Segment) updateSize() {
@@ -132,9 +130,11 @@ func (s *Segment) updateSize() {
 			sizeInBytes += v.size()
 		}
 	}
+	for _, v := range s.fieldNumCols {
+		sizeInBytes += sizeOfUint16 + sizeOfPtr + v.size()
+	}
 
 	sizeInBytes += cap(s.storedFieldChunkOffsets) * sizeOfUint64
-	sizeInBytes += cap(s.decompressedStoredFieldChunks) * int(reflect.TypeOf(segmentCacheData{}).Size())
 
 	s.size = sizeInBytes
 }
@@ -349,6 +349,13 @@ func (s *Segment) loadDvReaders() error {
 
 	pos := s.footer.docValueOffset
 	for fieldID, field := range s.fieldsInv {
+		kind := dvKindTerms
+		var err error
+		if s.footer.version >= Version {
+			if kind, err = readDataUvarint(s.data, &pos); err != nil {
+				return err
+			}
+		}
 		fieldLocStart, err := readDataUvarint(s.data, &pos)
 		if err != nil {
 			return err
@@ -358,13 +365,27 @@ func (s *Segment) loadDvReaders() error {
 			return err
 		}
 
-		fieldDvReader, err := s.loadFieldDocValueReader(field, fieldLocStart, fieldLocEnd)
-		if err != nil {
-			return err
-		}
-		if fieldDvReader != nil {
-			s.fieldDvReaders[uint16(fieldID)] = fieldDvReader
+		switch kind {
+		case dvKindTerms:
+			fieldDvReader, err := s.loadFieldDocValueReader(field, fieldLocStart, fieldLocEnd)
+			if err != nil {
+				return err
+			}
+			if fieldDvReader != nil {
+				// #nosec G115 -- fieldsInv is capped at MaxUint16 entries.
+				s.fieldDvReaders[uint16(fieldID)] = fieldDvReader
+				s.fieldDvNames = append(s.fieldDvNames, field)
+			}
+		case dvKindNumeric:
+			col, err := s.loadNumericColumn(field, fieldLocStart, fieldLocEnd)
+			if err != nil {
+				return err
+			}
+			// #nosec G115 -- fieldsInv is capped at MaxUint16 entries.
+			s.fieldNumCols[uint16(fieldID)] = col
 			s.fieldDvNames = append(s.fieldDvNames, field)
+		default:
+			return fmt.Errorf("unknown doc value kind %d for field %s", kind, field)
 		}
 	}
 

@@ -431,7 +431,7 @@ func TestDocValueVisitPropagatesBoundsError(t *testing.T) {
 	state := &docVisitState{segment: s, dvrs: map[uint16]*docValueReader{0: d}}
 	if _, err := s.visitDocumentFieldTerms(0, []string{"field"}, func(_ string, _ []byte) {
 		t.Error("visitor called for invalid data")
-	}, state); err == nil {
+	}, nil, state); err == nil {
 		t.Fatal("doc-value bounds error was discarded")
 	}
 }

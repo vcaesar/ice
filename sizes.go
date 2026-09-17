@@ -34,6 +34,8 @@ func init() {
 	reflectStaticSizeMetaData = int(reflect.TypeOf(md).Size())
 	var dvi docValueReader
 	reflectStaticSizedocValueReader = int(reflect.TypeOf(dvi).Size())
+	var nbm numericBlockMeta
+	reflectStaticSizeNumericBlockMeta = int(reflect.TypeOf(nbm).Size())
 	var pl PostingsList
 	reflectStaticSizePostingsList = int(reflect.TypeOf(pl).Size())
 	var pi PostingsIterator
@@ -52,6 +54,7 @@ var sizeOfUint64 int
 var reflectStaticSizeSegment int
 var reflectStaticSizeMetaData int
 var reflectStaticSizedocValueReader int
+var reflectStaticSizeNumericBlockMeta int
 var reflectStaticSizePostingsList int
 var reflectStaticSizePostingsIterator int
 var reflectStaticSizePosting int
