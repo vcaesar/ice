@@ -161,7 +161,11 @@ func TestNumericColumnMerge(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		t.Cleanup(func() { _ = closeF() })
+		t.Cleanup(func() {
+			if err := closeF(); err != nil {
+				t.Errorf("closing %s: %v", name, err)
+			}
+		})
 		return seg
 	}
 	numA := open("a.ice", func() (*Segment, error) { return buildTypedSegment([]string{"a", "b", "c"}, 1, false) })

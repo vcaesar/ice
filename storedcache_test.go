@@ -17,6 +17,7 @@ package ice
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -260,6 +261,63 @@ func TestStoredChunkCacheCoalescesFailedLoad(t *testing.T) {
 	}
 	if c.len() != 0 || len(c.inflight) != 0 {
 		t.Fatal("failed load must leave no cache or inflight entry")
+	}
+}
+
+// A caller holding the cache mutex must never observe a removed load whose
+// waiters have not been notified. Repeat to exercise the completion boundary.
+func TestStoredChunkCacheLoadCompletion(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		t.Run(fmt.Sprintf("error=%t", fail), func(t *testing.T) {
+			var c storedChunkCache
+			c.init(0) // Successful loads also leave no cached entry.
+			wantErr := errors.New("boom")
+			for range 2000 {
+				started := make(chan struct{})
+				release := make(chan struct{})
+				finished := make(chan struct{})
+				go func() {
+					defer close(finished)
+					_, err := c.getOrLoad(3, func() ([]byte, error) {
+						close(started)
+						<-release
+						if fail {
+							return nil, wantErr
+						}
+						return []byte("ok"), nil
+					})
+					if (fail && !errors.Is(err, wantErr)) || (!fail && err != nil) {
+						t.Errorf("unexpected load error: %v", err)
+					}
+				}()
+				<-started
+				c.m.Lock()
+				load := c.inflight[3]
+				c.m.Unlock()
+				close(release)
+				incomplete := false
+				for {
+					c.m.Lock()
+					_, pending := c.inflight[3]
+					if !pending {
+						select {
+						case <-load.done:
+						default:
+							incomplete = true
+						}
+					}
+					c.m.Unlock()
+					if !pending {
+						break
+					}
+					runtime.Gosched()
+				}
+				<-finished
+				if incomplete {
+					t.Fatal("inflight load removed before notifying waiters")
+				}
+			}
+		})
 	}
 }
 
