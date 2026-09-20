@@ -59,6 +59,27 @@ func (c *chunkedDocumentCoder) Add(_ uint64, meta, data []byte) (int, error) {
 	return wn, c.newLine()
 }
 
+// copyChunk appends one full compressed chunk at an empty chunk boundary.
+func (c *chunkedDocumentCoder) copyChunk(compressed []byte) error {
+	if c.chunkSize == 0 || c.n%c.chunkSize != 0 || c.buf.Len() != 0 {
+		return fmt.Errorf("unaligned stored-field chunk copy")
+	}
+	if uint64(len(compressed)) > math.MaxUint64-c.bytes || c.chunkSize > math.MaxUint64-c.n {
+		return fmt.Errorf("stored-field chunk copy overflow")
+	}
+	n, err := c.w.Write(compressed)
+	if err != nil {
+		return err
+	}
+	if n != len(compressed) {
+		return io.ErrShortWrite
+	}
+	c.bytes += uint64(len(compressed))
+	c.n += c.chunkSize
+	c.offsets = append(c.offsets, c.bytes)
+	return nil
+}
+
 func (c *chunkedDocumentCoder) writeToBuf(data []byte) (int, error) {
 	return c.buf.Write(data)
 }

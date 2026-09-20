@@ -920,9 +920,9 @@ func mergeStoredAndRemapSegment(seg *Segment, dropsI *roaring.Bitmap, segNewDocN
 	return newDocNum, nil
 }
 
-// copyStoredDocs writes out a segment's stored doc info, optimized by
-// using a single Write() call for the entire set of bytes.  The
-// newDocNumOffsets is filled with the new offsets for each doc.
+// copyStoredDocs preserves compressed full chunks when destination boundaries
+// align. Callers must ensure identical field IDs and no deletions.
+// Partial and unaligned chunks are decoded and re-encoded.
 func (s *Segment) copyStoredDocs(newDocNum uint64, newDocNumOffsets []uint64, docChunkCoder *chunkedDocumentCoder) error {
 	if s.footer.numDocs <= 0 {
 		return nil
@@ -939,6 +939,17 @@ func (s *Segment) copyStoredDocs(newDocNum uint64, newDocNumOffsets []uint64, do
 		compressed, err := readDataAt(s.data, chunkOffstart, chunkOffend-chunkOffstart)
 		if err != nil {
 			return err
+		}
+		const chunkSize = uint64(defaultDocumentChunkSize)
+		sourceDoc := uint64(i) * chunkSize // i indexes the source chunk table.
+		if sourceDoc < s.footer.numDocs && s.footer.numDocs-sourceDoc >= chunkSize &&
+			docChunkCoder.chunkSize == chunkSize && docChunkCoder.n == newDocNum &&
+			newDocNum%chunkSize == 0 && docChunkCoder.Size() == 0 {
+			if copyErr := s.copyStoredChunk(sourceDoc, newDocNum, newDocNumOffsets, compressed, docChunkCoder); copyErr != nil {
+				return copyErr
+			}
+			newDocNum += chunkSize
+			continue
 		}
 		uncompressed, err = compress.Decompress(uncompressed[:cap(uncompressed)], compressed)
 		if err != nil {
@@ -972,6 +983,30 @@ func (s *Segment) copyStoredDocs(newDocNum uint64, newDocNumOffsets []uint64, do
 	}
 
 	return nil
+}
+
+func (s *Segment) copyStoredChunk(sourceDoc, newDocNum uint64, offsets []uint64,
+	compressed []byte, coder *chunkedDocumentCoder) error {
+	const chunkSize = uint64(defaultDocumentChunkSize)
+	if newDocNum > uint64(len(offsets)) || chunkSize > uint64(len(offsets))-newDocNum {
+		return fmt.Errorf("stored-field document count exceeds output capacity")
+	}
+	if sourceDoc > (math.MaxUint64-s.footer.storedIndexOffset)/fileAddrWidth {
+		return fmt.Errorf("stored-field index offset overflow")
+	}
+	index, err := readDataAt(s.data, s.footer.storedIndexOffset+sourceDoc*fileAddrWidth, chunkSize*fileAddrWidth)
+	if err != nil {
+		return err
+	}
+	// Offsets are relative to the uncompressed chunk, so need no rebasing.
+	for j := uint64(0); j < chunkSize; j++ {
+		offset := binary.BigEndian.Uint64(index[j*fileAddrWidth:])
+		if (j == 0 && offset != 0) || (j > 0 && offset <= offsets[newDocNum+j-1]) {
+			return fmt.Errorf("invalid stored-field document offsets")
+		}
+		offsets[newDocNum+j] = offset
+	}
+	return coder.copyChunk(compressed)
 }
 
 // mergeFields builds a unified list of fields used across all the
