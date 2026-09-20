@@ -920,9 +920,10 @@ func mergeStoredAndRemapSegment(seg *Segment, dropsI *roaring.Bitmap, segNewDocN
 	return newDocNum, nil
 }
 
-// copyStoredDocs preserves compressed full chunks when destination boundaries
-// align. Callers must ensure identical field IDs and no deletions.
-// Partial and unaligned chunks are decoded and re-encoded.
+// copyStoredDocs decodes every source chunk so corrupt data fails the merge.
+// Full chunks whose records match the source document index are copied
+// compressed when destination boundaries align; anything else is re-encoded.
+// Callers must ensure identical field IDs and no deletions.
 func (s *Segment) copyStoredDocs(newDocNum uint64, newDocNumOffsets []uint64, docChunkCoder *chunkedDocumentCoder) error {
 	if s.footer.numDocs <= 0 {
 		return nil
@@ -940,44 +941,38 @@ func (s *Segment) copyStoredDocs(newDocNum uint64, newDocNumOffsets []uint64, do
 		if err != nil {
 			return err
 		}
+		uncompressed, err = compress.Decompress(uncompressed[:cap(uncompressed)], compressed)
+		if err != nil {
+			return err
+		}
 		const chunkSize = uint64(defaultDocumentChunkSize)
 		sourceDoc := uint64(i) * chunkSize // i indexes the source chunk table.
 		if sourceDoc < s.footer.numDocs && s.footer.numDocs-sourceDoc >= chunkSize &&
 			docChunkCoder.chunkSize == chunkSize && docChunkCoder.n == newDocNum &&
 			newDocNum%chunkSize == 0 && docChunkCoder.Size() == 0 {
-			if copyErr := s.copyStoredChunk(sourceDoc, newDocNum, newDocNumOffsets, compressed, docChunkCoder); copyErr != nil {
+			copied, copyErr := s.copyStoredChunk(sourceDoc, newDocNum, newDocNumOffsets, compressed, uncompressed, docChunkCoder)
+			if copyErr != nil {
 				return copyErr
 			}
-			newDocNum += chunkSize
-			continue
-		}
-		uncompressed, err = compress.Decompress(uncompressed[:cap(uncompressed)], compressed)
-		if err != nil {
-			return err
+			if copied {
+				newDocNum += chunkSize
+				continue
+			}
 		}
 		payload := uncompressed
 		for len(payload) > 0 {
-			metaLen, read := binary.Uvarint(payload)
-			if read <= 0 {
-				return fmt.Errorf("invalid stored-field metadata length")
-			}
-			payload = payload[read:]
-			dataLen, read := binary.Uvarint(payload)
-			if read <= 0 {
-				return fmt.Errorf("invalid stored-field data length")
-			}
-			payload = payload[read:]
-			if metaLen > uint64(len(payload)) || dataLen > uint64(len(payload))-metaLen {
-				return fmt.Errorf("stored-field lengths exceed chunk data")
+			var meta, data []byte
+			meta, data, payload, err = nextStoredDoc(payload)
+			if err != nil {
+				return err
 			}
 			if newDocNum >= uint64(len(newDocNumOffsets)) {
 				return fmt.Errorf("stored-field document count exceeds output capacity")
 			}
 			newDocNumOffsets[newDocNum] = docChunkCoder.Size()
-			if _, err := docChunkCoder.Add(newDocNum, payload[:metaLen], payload[metaLen:metaLen+dataLen]); err != nil {
+			if _, err := docChunkCoder.Add(newDocNum, meta, data); err != nil {
 				return err
 			}
-			payload = payload[metaLen+dataLen:]
 			newDocNum++
 		}
 	}
@@ -985,28 +980,57 @@ func (s *Segment) copyStoredDocs(newDocNum uint64, newDocNumOffsets []uint64, do
 	return nil
 }
 
+// nextStoredDoc splits the first stored document record off payload.
+func nextStoredDoc(payload []byte) (meta, data, rest []byte, err error) {
+	metaLen, read := binary.Uvarint(payload)
+	if read <= 0 {
+		return nil, nil, nil, fmt.Errorf("invalid stored-field metadata length")
+	}
+	payload = payload[read:]
+	dataLen, read := binary.Uvarint(payload)
+	if read <= 0 {
+		return nil, nil, nil, fmt.Errorf("invalid stored-field data length")
+	}
+	payload = payload[read:]
+	if metaLen > uint64(len(payload)) || dataLen > uint64(len(payload))-metaLen {
+		return nil, nil, nil, fmt.Errorf("stored-field lengths exceed chunk data")
+	}
+	return payload[:metaLen], payload[metaLen : metaLen+dataLen], payload[metaLen+dataLen:], nil
+}
+
+// copyStoredChunk copies one full compressed chunk when its decoded records
+// line up with the source document index. It reports false on a mismatch so
+// the caller re-encodes the chunk and rebuilds the index from the records.
 func (s *Segment) copyStoredChunk(sourceDoc, newDocNum uint64, offsets []uint64,
-	compressed []byte, coder *chunkedDocumentCoder) error {
+	compressed, uncompressed []byte, coder *chunkedDocumentCoder) (bool, error) {
 	const chunkSize = uint64(defaultDocumentChunkSize)
 	if newDocNum > uint64(len(offsets)) || chunkSize > uint64(len(offsets))-newDocNum {
-		return fmt.Errorf("stored-field document count exceeds output capacity")
+		return false, fmt.Errorf("stored-field document count exceeds output capacity")
 	}
 	if sourceDoc > (math.MaxUint64-s.footer.storedIndexOffset)/fileAddrWidth {
-		return fmt.Errorf("stored-field index offset overflow")
+		return false, fmt.Errorf("stored-field index offset overflow")
 	}
 	index, err := readDataAt(s.data, s.footer.storedIndexOffset+sourceDoc*fileAddrWidth, chunkSize*fileAddrWidth)
 	if err != nil {
-		return err
+		return false, err
 	}
 	// Offsets are relative to the uncompressed chunk, so need no rebasing.
+	payload := uncompressed
 	for j := uint64(0); j < chunkSize; j++ {
 		offset := binary.BigEndian.Uint64(index[j*fileAddrWidth:])
-		if (j == 0 && offset != 0) || (j > 0 && offset <= offsets[newDocNum+j-1]) {
-			return fmt.Errorf("invalid stored-field document offsets")
+		// #nosec G115 -- payload is a suffix of uncompressed, so the difference is nonnegative.
+		if offset != uint64(len(uncompressed)-len(payload)) {
+			return false, nil
+		}
+		if _, _, payload, err = nextStoredDoc(payload); err != nil {
+			return false, err
 		}
 		offsets[newDocNum+j] = offset
 	}
-	return coder.copyChunk(compressed)
+	if len(payload) != 0 {
+		return false, nil
+	}
+	return true, coder.copyChunk(compressed)
 }
 
 // mergeFields builds a unified list of fields used across all the

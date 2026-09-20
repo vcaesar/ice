@@ -147,12 +147,14 @@ func TestStoredCopyErrors(t *testing.T) {
 			// #nosec G115 -- fixture data has a small positive length.
 			s.footer.storedIndexOffset = uint64(s.data.Len())
 		}, 128},
-		{"offset-order", func(s *Segment) {
-			data, err := readDataAt(s.data, s.footer.storedIndexOffset+8, 8)
+		{"corrupt-chunk", func(s *Segment) {
+			data, err := readDataAt(s.data, 0, s.storedFieldChunkOffsets[1])
 			if err != nil {
 				t.Fatal(err)
 			}
-			clear(data)
+			for i := range data {
+				data[i] = 0xFF
+			}
 		}, 128},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -187,6 +189,46 @@ func TestStoredCopyErrors(t *testing.T) {
 	}
 	if err := coder.copyChunk([]byte("x")); err == nil {
 		t.Fatal("accepted unaligned chunk")
+	}
+}
+
+func TestStoredCopyIndexMismatchReencodes(t *testing.T) {
+	useCompression(t, compress.S2)
+	var want bytes.Buffer
+	wantOffsets := make([]uint64, 128)
+	if err := storedCopyFixture(t, 128).copyStoredDocs(0, wantOffsets, newChunkedDocumentCoder(128, &want)); err != nil {
+		t.Fatal(err)
+	}
+	for _, mutate := range []func(*Segment){
+		func(s *Segment) { // index offset does not match a record boundary
+			data, err := readDataAt(s.data, s.footer.storedIndexOffset+8, 8)
+			if err != nil {
+				t.Fatal(err)
+			}
+			clear(data)
+		},
+		func(s *Segment) { // index points past the decoded payload
+			data, err := readDataAt(s.data, s.footer.storedIndexOffset+127*8, 8)
+			if err != nil {
+				t.Fatal(err)
+			}
+			binary.BigEndian.PutUint64(data, 1<<40)
+		},
+	} {
+		s := storedCopyFixture(t, 128)
+		mutate(s)
+		var got bytes.Buffer
+		coder := newChunkedDocumentCoder(128, &got)
+		offsets := make([]uint64, 128)
+		if err := s.copyStoredDocs(0, offsets, coder); err != nil {
+			t.Fatal(err)
+		}
+		if coder.n != 128 || coder.compressed == nil {
+			t.Fatal("mismatched index was raw copied")
+		}
+		if !bytes.Equal(got.Bytes(), want.Bytes()) || !reflect.DeepEqual(offsets, wantOffsets) {
+			t.Fatal("re-encoded chunk differs from clean copy")
+		}
 	}
 }
 
