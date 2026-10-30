@@ -27,11 +27,23 @@ import (
 	segment "github.com/vcaesar/bluge_segment_api"
 )
 
-const Version uint32 = 4
+// Version 5 adds per-chunk freq/norm bounds (block max) to postings.
+const Version uint32 = 5
+
+// versionNumericDocValues is the last version without block max postings;
+// it is still readable, and merges rewrite it as Version.
+const versionNumericDocValues uint32 = 4
 
 // versionTermDocValues is the last version whose doc values are all term
 // encoded; it is still readable, and merges rewrite it as Version.
 const versionTermDocValues uint32 = 3
+
+// writeVersion is the version new and merged segments are written as; only
+// tests lower it, to produce older segments.
+var writeVersion = Version
+
+// MinReadableVersion is the oldest segment version this package loads.
+const MinReadableVersion = versionTermDocValues
 
 const Type string = "ice"
 
@@ -351,7 +363,7 @@ func (s *Segment) loadDvReaders() error {
 	for fieldID, field := range s.fieldsInv {
 		kind := dvKindTerms
 		var err error
-		if s.footer.version >= Version {
+		if s.footer.version >= versionNumericDocValues {
 			if kind, err = readDataUvarint(s.data, &pos); err != nil {
 				return err
 			}

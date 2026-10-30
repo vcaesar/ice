@@ -197,7 +197,8 @@ func (p *PostingsList) iterator(includeFreq, includeNorm, includeLocs bool,
 	// initialize freq chunk reader
 	if rv.includeFreqNorm {
 		var err error
-		rv.freqNormReader, err = newChunkedIntDecoder(p.sb.data, p.freqOffset, rv.freqNormReader)
+		rv.freqNormReader, err = newChunkedIntDecoder(p.sb.data, p.freqOffset, rv.freqNormReader,
+			p.sb.footer != nil && p.sb.footer.version >= Version)
 		if err != nil {
 			return nil, err
 		}
@@ -206,7 +207,7 @@ func (p *PostingsList) iterator(includeFreq, includeNorm, includeLocs bool,
 	// initialize the loc chunk reader
 	if rv.includeLocs {
 		var err error
-		rv.locReader, err = newChunkedIntDecoder(p.sb.data, p.locOffset, rv.locReader)
+		rv.locReader, err = newChunkedIntDecoder(p.sb.data, p.locOffset, rv.locReader, false)
 		if err != nil {
 			return nil, err
 		}
@@ -591,39 +592,18 @@ func (i *PostingsIterator) nextDocNumAtOrAfter(atOrAfter uint64) (docNum uint64,
 	}
 
 	n := i.Actual.Next()
-	allN := i.all.Next()
-
 	if i.postings.chunkSize == 0 {
 		return 0, false, fmt.Errorf("invalid zero postings chunk size")
 	}
-	// #nosec G115 -- dividing the uint32 document number by a positive size cannot increase it.
-	nChunk := uint32(uint64(n) / i.postings.chunkSize)
-
-	// when allN becomes >= to here, then allN is in the same chunk as nChunk.
-	allNReachesNChunk := uint64(nChunk) * i.postings.chunkSize
-
-	// n is the next actual hit (excluding some postings), and
-	// allN is the next hit in the full postings, and
-	// if they don't match, move 'all' forwards until they do
-	for allN != n {
-		// we've reached same chunk, so move the freq/norm/loc decoders forward
-		if i.includeFreqNorm && uint64(allN) >= allNReachesNChunk {
-			err := i.currChunkNext(nChunk)
-			if err != nil {
-				return 0, false, err
-			}
-		}
-
-		allN = i.all.Next()
+	if !i.includeFreqNorm {
+		return uint64(n), true, nil
 	}
-
-	if i.includeFreqNorm && (i.currChunk != nChunk || i.freqNormReader.isNil()) {
-		err := i.loadChunk(int(nChunk))
-		if err != nil {
-			return 0, false, fmt.Errorf("error loading chunk: %v", err)
-		}
+	// Actual is a subset of the full postings (minus deletions, or AND'ed
+	// by a conjunction), so the freq/norm entries to pass over are counted
+	// on the full postings rather than iterated
+	if err := i.seekFreqNorm(n, i.chunkOf(n)); err != nil {
+		return 0, false, err
 	}
-
 	return uint64(n), true, nil
 }
 
@@ -726,38 +706,84 @@ func (i *PostingsIterator) advanceByRank(atOrAfter uint32) (docNum uint64, exist
 		return 0, false, nil
 	}
 	n := i.Actual.Next()
-	nChunk := i.chunkOf(n)
+	if err := i.seekFreqNorm(n, i.chunkOf(n)); err != nil {
+		return 0, false, err
+	}
+	return uint64(n), true, nil
+}
+
+// freqNormVarints is the number of varints in a freq/norm entry.
+const freqNormVarints = 2
+
+// seekFreqNorm positions the freq/norm (and location) readers on the entry
+// of posting n, in chunk nChunk, skipping the entries of the full postings
+// between the last entry read and n, counted by bitmap range cardinality.
+func (i *PostingsIterator) seekFreqNorm(n, nChunk uint32) error {
 	bm := i.postings.postings
 	var skip uint64
-	if i.hasLast && i.currChunk == nChunk && !i.freqNormReader.isNil() {
+	if i.hasLast && i.currChunk == nChunk && !i.freqNormReader.isNil() && i.lastDoc < n {
 		// the reader sits just past lastDoc's entry in this chunk
-		skip = bm.Rank(n) - bm.Rank(i.lastDoc) - 1
+		skip = bm.CardinalityInRange(uint64(i.lastDoc)+1, uint64(n))
 	} else {
 		if err := i.loadChunk(int(nChunk)); err != nil {
-			return 0, false, fmt.Errorf("error loading chunk: %v", err)
+			return fmt.Errorf("error loading chunk: %v", err)
 		}
-		skip = bm.Rank(n) - 1
-		if start := uint64(nChunk) * i.postings.chunkSize; start > 0 {
-			// #nosec G115 -- start <= n, a uint32.
-			skip -= bm.Rank(uint32(start - 1))
+		skip = bm.CardinalityInRange(uint64(nChunk)*i.postings.chunkSize, uint64(n))
+	}
+	if !i.includeLocs {
+		// without locations an entry is just two varints, freq and norm
+		if err := i.freqNormReader.r.skipUvarints(freqNormVarints * skip); err != nil {
+			return err
 		}
+		skip = 0
 	}
 	for ; skip > 0; skip-- {
 		if err := i.currChunkNext(nChunk); err != nil {
-			return 0, false, fmt.Errorf("error rank currChunkNext: %v", err)
+			return fmt.Errorf("error rank currChunkNext: %v", err)
 		}
 	}
 	i.lastDoc, i.hasLast = n, true
-	return uint64(n), true, nil
+	return nil
+}
+
+// nextBatchSubset is NextBatch for an Actual bitmap that is a subset of
+// the postings (deletions, or a conjunction's ReplaceActual): the freq/norm
+// entries of the postings left out are skipped by range cardinality.
+func (i *PostingsIterator) nextBatchSubset(docs []uint64, freqs []int, norms []float64) (int, error) {
+	it := i.Actual
+	r := i.freqNormReader
+	n := 0
+	for n < len(docs) && it.HasNext() {
+		d := it.Next()
+		if err := i.seekFreqNorm(d, i.chunkOf(d)); err != nil {
+			return n, err
+		}
+		freqHasLocs, err := r.r.readUvarintFast()
+		if err != nil {
+			return n, fmt.Errorf("error reading frequency: %v", err)
+		}
+		normBits, err := r.r.ReadUvarint()
+		if err != nil {
+			return n, fmt.Errorf("error reading norm: %v", err)
+		}
+		if normBits > math.MaxUint32 {
+			return n, fmt.Errorf("norm bits exceed uint32")
+		}
+		docs[n] = uint64(d)
+		freqs[n] = int(freqHasLocs >> 1)
+		norms[n] = float64(math.Float32frombits(uint32(normBits)))
+		n++
+	}
+	return n, nil
 }
 
 // NextBatch reads up to len(docs) postings into docs, freqs and norms,
 // which must be the same length, and returns how many it read; 0 means
 // the end. It is Next in bulk for iterators without locations.
 func (i *PostingsIterator) NextBatch(docs []uint64, freqs []int, norms []float64) (int, error) {
-	clean := i.normBits1Hit == 0 && i.includeFreqNorm && !i.includeLocs &&
-		i.postings != nil && i.postings.postings == i.ActualBM && i.postings.chunkSize > 0
-	if !clean {
+	batchable := i.normBits1Hit == 0 && i.includeFreqNorm && !i.includeLocs &&
+		i.postings != nil && i.ActualBM != nil && i.postings.chunkSize > 0
+	if !batchable {
 		n := 0
 		for n < len(docs) {
 			p, err := i.nextAtOrAfter(0)
@@ -771,6 +797,9 @@ func (i *PostingsIterator) NextBatch(docs []uint64, freqs []int, norms []float64
 	}
 	if !i.started {
 		i.startIterators()
+	}
+	if i.postings.postings != i.ActualBM {
+		return i.nextBatchSubset(docs, freqs, norms)
 	}
 	it := i.Actual
 	r := i.freqNormReader
@@ -945,4 +974,59 @@ func (l *Location) End() int {
 // Pos returns the 1-based phrase position of this occurrence
 func (l *Location) Pos() int {
 	return l.pos
+}
+
+// BlockBound returns the largest freq and smallest norm of the freq/norm
+// chunk holding docNum, and the first docNum past that chunk. ok is false
+// when the segment stores no chunk bounds (before version 5) or the list
+// has no freq/norm chunks.
+func (i *PostingsIterator) BlockBound(docNum uint64) (maxFreq int, minNorm float64, end uint64, ok bool) {
+	if i.normBits1Hit != 0 || !i.includeFreqNorm || i.postings == nil || i.postings.chunkSize == 0 ||
+		i.freqNormReader == nil {
+		return 0, 0, 0, false
+	}
+	r, cs := i.freqNormReader, i.postings.chunkSize
+	c := docNum / cs
+	if c >= uint64(len(r.maxFreqs)) || r.minNorms[c] > math.MaxUint32 || r.maxFreqs[c] > math.MaxInt32 {
+		return 0, 0, 0, false
+	}
+	return int(r.maxFreqs[c]), float64(math.Float32frombits(uint32(r.minNorms[c]))), (c + 1) * cs, true
+}
+
+// SkipBlocks skips, from the next posting on, the rest of every freq/norm
+// chunk whose bounds competitive rejects, stopping at the first chunk it
+// accepts, and returns how many postings it skipped. competitive gets the
+// chunk's largest freq and smallest norm. Chunk bounds exist in version 5+
+// segments; elsewhere, and on lists with deletions, it skips nothing.
+func (i *PostingsIterator) SkipBlocks(competitive func(maxFreq int, minNorm float64) bool) (uint64, error) {
+	if i.normBits1Hit != 0 || !i.includeFreqNorm || i.includeLocs || i.postings == nil ||
+		i.postings.postings != i.ActualBM || i.postings.chunkSize == 0 ||
+		i.freqNormReader == nil || len(i.freqNormReader.maxFreqs) == 0 {
+		return 0, nil
+	}
+	if !i.started {
+		i.startIterators()
+	}
+	r, bm, cs := i.freqNormReader, i.postings.postings, i.postings.chunkSize
+	var skipped uint64
+	for i.Actual.HasNext() {
+		d := i.Actual.PeekNext()
+		c := uint64(d) / cs
+		end := (c + 1) * cs
+		if c >= uint64(len(r.maxFreqs)) || end > math.MaxUint32 || r.minNorms[c] > math.MaxUint32 ||
+			r.maxFreqs[c] > math.MaxInt32 {
+			break
+		}
+		if competitive(int(r.maxFreqs[c]), float64(math.Float32frombits(uint32(r.minNorms[c])))) {
+			break
+		}
+		n := bm.Rank(uint32(end - 1))
+		if d > 0 {
+			n -= bm.Rank(d - 1)
+		}
+		skipped += n
+		i.Actual.AdvanceIfNeeded(uint32(end))
+		i.hasLast = false
+	}
+	return skipped, nil
 }

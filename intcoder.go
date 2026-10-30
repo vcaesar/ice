@@ -40,6 +40,12 @@ type chunkedIntCoder struct {
 
 	buf        []byte
 	compressed []byte
+
+	// bounds, when set, records per chunk the max freq and min norm bits of
+	// (freqHasLocs, normBits) values and writes them after the offsets
+	bounds   bool
+	maxFreqs []uint64
+	minNorms []uint64
 }
 
 // newChunkedIntCoder returns a new chunk int coder which packs data into
@@ -65,6 +71,16 @@ func (c *chunkedIntCoder) Reset() {
 	for i := range c.chunkLens {
 		c.chunkLens[i] = 0
 	}
+	clear(c.maxFreqs)
+	clear(c.minNorms)
+}
+
+// trackBounds makes the coder record and write per-chunk freq/norm bounds;
+// every Add must then pass (freqHasLocs, normBits).
+func (c *chunkedIntCoder) trackBounds() {
+	c.bounds = true
+	c.maxFreqs = make([]uint64, len(c.chunkLens))
+	c.minNorms = make([]uint64, len(c.chunkLens))
 }
 
 // SetChunkSize changes the chunk size.  It is only valid to do so
@@ -81,6 +97,15 @@ func (c *chunkedIntCoder) SetChunkSize(chunkSize, maxDocNum uint64) {
 	} else {
 		c.chunkLens = c.chunkLens[:total]
 	}
+	if c.bounds {
+		if cap(c.maxFreqs) < total {
+			c.maxFreqs = make([]uint64, total)
+			c.minNorms = make([]uint64, total)
+		} else {
+			c.maxFreqs = c.maxFreqs[:total]
+			c.minNorms = c.minNorms[:total]
+		}
+	}
 }
 
 // Add encodes the provided integers into the correct chunk for the provided
@@ -94,6 +119,15 @@ func (c *chunkedIntCoder) Add(docNum uint64, vals ...uint64) error {
 		}
 		c.chunkBuf.Reset()
 		c.currChunk = chunk
+	}
+	if c.bounds && len(vals) >= 2 {
+		freq, norm := vals[0]>>1, vals[1]
+		if c.chunkBuf.Len() == 0 {
+			c.maxFreqs[chunk], c.minNorms[chunk] = freq, norm
+		} else {
+			c.maxFreqs[chunk] = max(c.maxFreqs[chunk], freq)
+			c.minNorms[chunk] = min(c.minNorms[chunk], norm)
+		}
 	}
 
 	// encode every value into buf first so the chunk buffer sees one write
@@ -125,7 +159,7 @@ func (c *chunkedIntCoder) Close() error {
 
 // Write commits all the encoded chunked integers to the provided writer.
 func (c *chunkedIntCoder) Write(w io.Writer) (int, error) {
-	bufNeeded := binary.MaxVarintLen64 * (1 + len(c.chunkLens))
+	bufNeeded := binary.MaxVarintLen64 * (1 + 3*len(c.chunkLens))
 	if len(c.buf) < bufNeeded {
 		c.buf = make([]byte, bufNeeded)
 	}
@@ -138,6 +172,12 @@ func (c *chunkedIntCoder) Write(w io.Writer) (int, error) {
 	n := binary.PutUvarint(buf, uint64(len(chunkOffsets)))
 	for _, chunkOffset := range chunkOffsets {
 		n += binary.PutUvarint(buf[n:], chunkOffset)
+	}
+	if c.bounds {
+		for k := range chunkOffsets {
+			n += binary.PutUvarint(buf[n:], c.maxFreqs[k])
+			n += binary.PutUvarint(buf[n:], c.minNorms[k])
+		}
 	}
 
 	tw, err := w.Write(buf[:n])

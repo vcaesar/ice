@@ -31,15 +31,23 @@ type chunkedIntDecoder struct {
 	uncompressed    []byte // temp buf for decompression
 	data            *segment.Data
 	r               *memUvarintReader
+	// maxFreqs and minNorms are the per-chunk freq/norm bounds of a
+	// version 5+ freq/norm stream, empty otherwise
+	maxFreqs []uint64
+	minNorms []uint64
 }
 
-func newChunkedIntDecoder(data *segment.Data, offset uint64, rv *chunkedIntDecoder) (*chunkedIntDecoder, error) {
+// newChunkedIntDecoder reads the chunk header at offset; withBounds says the
+// header carries per-chunk freq/norm bounds (version 5+ freq/norm streams).
+func newChunkedIntDecoder(data *segment.Data, offset uint64, rv *chunkedIntDecoder,
+	withBounds bool) (*chunkedIntDecoder, error) {
 	if rv == nil {
 		rv = &chunkedIntDecoder{startOffset: offset, data: data}
 	} else {
 		rv.startOffset = offset
 		rv.data = data
 	}
+	rv.maxFreqs, rv.minNorms = rv.maxFreqs[:0], rv.minNorms[:0]
 	if offset == termNotEncoded {
 		rv.chunkOffsets = rv.chunkOffsets[:0]
 		rv.dataStartOffset = 0
@@ -76,6 +84,20 @@ func newChunkedIntDecoder(data *segment.Data, offset uint64, rv *chunkedIntDecod
 		}
 		rv.chunkOffsets[i] = chunkOffset
 		previous = chunkOffset
+	}
+	if withBounds {
+		for range count {
+			maxFreq, readErr := readChunkHeaderUvarint(data, &pos)
+			if readErr != nil {
+				return nil, readErr
+			}
+			minNorm, readErr := readChunkHeaderUvarint(data, &pos)
+			if readErr != nil {
+				return nil, readErr
+			}
+			rv.maxFreqs = append(rv.maxFreqs, maxFreq)
+			rv.minNorms = append(rv.minNorms, minNorm)
+		}
 	}
 	if previous > uint64(dataLen-pos) {
 		return nil, fmt.Errorf("integer chunk offset exceeds data length")
@@ -153,6 +175,7 @@ func (d *chunkedIntDecoder) reset() {
 	// FIXME what?
 	// d.data = d.data[:0]
 	d.data = nil
+	d.maxFreqs, d.minNorms = d.maxFreqs[:0], d.minNorms[:0]
 	if d.r != nil {
 		d.r.Reset([]byte(nil))
 	}

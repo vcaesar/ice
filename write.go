@@ -245,7 +245,7 @@ func persistFooter(footer *footer, writerIn io.Writer) error {
 		return err
 	}
 	// write out 32-bit version
-	err = binary.Write(w, binary.BigEndian, Version)
+	err = binary.Write(w, binary.BigEndian, footer.version)
 	if err != nil {
 		return err
 	}

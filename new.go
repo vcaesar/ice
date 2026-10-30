@@ -389,7 +389,7 @@ func (s *interim) convert() (f *footer, dictOffsets, storedFieldChunkOffsets []u
 		storedIndexOffset: storedIndexOffset,
 		fieldsIndexOffset: fieldsIndexOffset,
 		docValueOffset:    fdvIndexOffset,
-		version:           Version,
+		version:           writeVersion,
 		docTimeMin:        uint64(docTimeMin), // #nosec G115 -- preserve signed timestamp bits in the uint64 wire format.
 		docTimeMax:        uint64(docTimeMax), // #nosec G115 -- preserve signed timestamp bits in the uint64 wire format.
 	}, dictOffsets, storedFieldChunkOffsets, nil
@@ -900,6 +900,9 @@ func (s *interim) writeDicts() (fdvIndexOffset uint64, dictOffsets []uint64, err
 	// while processing each individual field-term section
 	// #nosec G115 -- convert calls writeDicts only for nonempty results.
 	tfEncoder := newChunkedIntCoder(uint64(legacyChunkMode), uint64(len(s.results)-1))
+	if writeVersion >= Version {
+		tfEncoder.trackBounds()
+	}
 	// #nosec G115 -- convert calls writeDicts only for nonempty results.
 	locEncoder := newChunkedIntCoder(uint64(legacyChunkMode), uint64(len(s.results)-1))
 
