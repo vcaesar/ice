@@ -82,6 +82,16 @@ func (r *memUvarintReader) ReadUvarint() (uint64, error) {
 	}
 }
 
+// readUvarintFast is ReadUvarint with the one byte case inlined.
+func (r *memUvarintReader) readUvarintFast() (uint64, error) {
+	if r.C < len(r.S) && r.S[r.C] < lastByte {
+		b := r.S[r.C]
+		r.C++
+		return uint64(b), nil
+	}
+	return r.ReadUvarint()
+}
+
 // SkipUvarint skips ahead one encoded uint64.
 func (r *memUvarintReader) SkipUvarint() {
 	for {
