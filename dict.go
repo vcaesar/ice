@@ -177,3 +177,51 @@ func (d *DictEntry) Term() string {
 func (d *DictEntry) Count() uint64 {
 	return d.count
 }
+
+// TermsIterator is Iterator without reading each term's postings for its
+// count: entries report a Count of 0. Use it when only terms are needed.
+func (d *Dictionary) TermsIterator(a segment.Automaton,
+	startKeyInclusive, endKeyExclusive []byte) segment.DictionaryIterator {
+	rv := d.Iterator(a, startKeyInclusive, endKeyExclusive)
+	if it, ok := rv.(*DictionaryIterator); ok && it != emptyDictionaryIterator {
+		it.omitCount = true
+	}
+	return rv
+}
+
+// OrPostingsDense ORs the postings of every term the automaton accepts in
+// [startKeyInclusive, endKeyExclusive) into dense, a bitset of the
+// segment's documents, walking the dictionary once. It returns false,
+// leaving dense partly written, if a posting falls outside dense.
+func (d *Dictionary) OrPostingsDense(a segment.Automaton, startKeyInclusive, endKeyExclusive []byte,
+	dense []uint64) (bool, error) {
+	if d.fst == nil {
+		return true, nil
+	}
+	itr, err := d.fst.Search(a, startKeyInclusive, endKeyExclusive)
+	limit := uint64(len(dense)) * 64
+	var pl PostingsList
+	for err == nil {
+		_, offset := itr.Current()
+		if err = pl.read(offset, d); err != nil {
+			return false, err
+		}
+		if pl.normBits1Hit != 0 {
+			if pl.docNum1Hit >= limit {
+				return false, nil
+			}
+			dense[pl.docNum1Hit/64] |= 1 << (pl.docNum1Hit % 64)
+		} else if !pl.postings.IsEmpty() {
+			if uint64(pl.postings.Maximum()) >= limit {
+				return false, nil
+			}
+			pl.postings.WriteDenseTo(dense)
+		}
+		pl.normBits1Hit = 0
+		err = itr.Next()
+	}
+	if err != vellum.ErrIteratorDone {
+		return false, err
+	}
+	return true, nil
+}

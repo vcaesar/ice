@@ -326,6 +326,14 @@ type PostingsIterator struct {
 	includeFreqNorm bool
 	includeLocs     bool
 	started         bool // all/Actual iterators created
+
+	// chunkEnd is the first docNum past the loaded freq/norm chunk, so a
+	// clean iterator finds a hit's chunk with a compare, not a divide
+	chunkEnd uint64
+	// lastDoc is the last docNum a clean iterator returned; its freq/norm
+	// entry is the last one read when hasLast
+	lastDoc uint32
+	hasLast bool
 }
 
 var emptyPostingsIterator = &PostingsIterator{}
@@ -374,6 +382,9 @@ func (i *PostingsIterator) loadChunk(chunk int) error {
 	}
 
 	i.currChunk = uint32(chunk)
+	if i.postings != nil {
+		i.chunkEnd = (uint64(chunk) + 1) * i.postings.chunkSize
+	}
 	return nil
 }
 
@@ -382,7 +393,7 @@ func (i *PostingsIterator) readFreqNormHasLocs() (freq int, norm uint64, hasLocs
 		return 1, i.normBits1Hit, false, nil
 	}
 
-	freqHasLocs, err := i.freqNormReader.readUvarint()
+	freqHasLocs, err := i.freqNormReader.r.readUvarintFast()
 	if err != nil {
 		return 0, 0, false, fmt.Errorf("error reading frequency: %v", err)
 	}
@@ -631,6 +642,10 @@ func (i *PostingsIterator) nextDocNum1Hit(atOrAfter uint64) (docNum uint64, exis
 	return docNum, true
 }
 
+// rankSkipMinGap is the docNum gap past which a clean Advance skips the
+// passed postings by bitmap rank rather than iterating them.
+const rankSkipMinGap = 256
+
 // optimization when the postings list is "clean" (e.g., no updates &
 // no deletions) where the all bitmap is the same as the actual bitmap
 func (i *PostingsIterator) nextDocNumAtOrAfterClean(
@@ -644,22 +659,23 @@ func (i *PostingsIterator) nextDocNumAtOrAfterClean(
 
 		return uint64(i.Actual.Next()), true, nil
 	}
+	if i.postings.chunkSize == 0 {
+		return 0, false, fmt.Errorf("invalid zero postings chunk size")
+	}
+	if peek := i.Actual.PeekNext(); atOrAfter > peek && atOrAfter-peek > rankSkipMinGap {
+		return i.advanceByRank(atOrAfter)
+	}
 
 	// freq-norm's needed, so maintain freq-norm chunk reader
 	sameChunkNexts := 0 // # of times we called Next() in the same chunk
 	n := i.Actual.Next()
-	if i.postings.chunkSize == 0 {
-		return 0, false, fmt.Errorf("invalid zero postings chunk size")
-	}
-	// #nosec G115 -- a uint32 document number divided by a positive size still fits uint32.
-	nChunk := uint32(uint64(n) / i.postings.chunkSize)
+	nChunk := i.chunkOf(n)
 
 	for n < atOrAfter && i.Actual.HasNext() {
 		n = i.Actual.Next()
 
 		nChunkPrev := nChunk
-		// #nosec G115 -- a uint32 document number divided by a positive size still fits uint32.
-		nChunk = uint32(uint64(n) / i.postings.chunkSize)
+		nChunk = i.chunkOf(n)
 
 		if nChunk != nChunkPrev {
 			sameChunkNexts = 0
@@ -687,7 +703,104 @@ func (i *PostingsIterator) nextDocNumAtOrAfterClean(
 		}
 	}
 
+	i.lastDoc, i.hasLast = n, true
 	return uint64(n), true, nil
+}
+
+// chunkOf returns the freq/norm chunk holding docNum n.
+func (i *PostingsIterator) chunkOf(n uint32) uint32 {
+	cs := i.postings.chunkSize
+	if uint64(n) < i.chunkEnd && uint64(n)+cs >= i.chunkEnd {
+		return i.currChunk
+	}
+	// #nosec G115 -- a uint32 document number divided by a positive size still fits uint32.
+	return uint32(uint64(n) / cs)
+}
+
+// advanceByRank moves a clean iterator to the first posting at or after
+// atOrAfter, skipping the freq/norm entries of the postings passed over by
+// counting them with bitmap ranks instead of iterating them.
+func (i *PostingsIterator) advanceByRank(atOrAfter uint32) (uint64, bool, error) {
+	i.Actual.AdvanceIfNeeded(atOrAfter)
+	if !i.Actual.HasNext() {
+		return 0, false, nil
+	}
+	n := i.Actual.Next()
+	nChunk := i.chunkOf(n)
+	bm := i.postings.postings
+	var skip uint64
+	if i.hasLast && i.currChunk == nChunk && !i.freqNormReader.isNil() {
+		// the reader sits just past lastDoc's entry in this chunk
+		skip = bm.Rank(n) - bm.Rank(i.lastDoc) - 1
+	} else {
+		if err := i.loadChunk(int(nChunk)); err != nil {
+			return 0, false, fmt.Errorf("error loading chunk: %v", err)
+		}
+		skip = bm.Rank(n) - 1
+		if start := uint64(nChunk) * i.postings.chunkSize; start > 0 {
+			// #nosec G115 -- start <= n, a uint32.
+			skip -= bm.Rank(uint32(start - 1))
+		}
+	}
+	for ; skip > 0; skip-- {
+		if err := i.currChunkNext(nChunk); err != nil {
+			return 0, false, fmt.Errorf("error rank currChunkNext: %v", err)
+		}
+	}
+	i.lastDoc, i.hasLast = n, true
+	return uint64(n), true, nil
+}
+
+// NextBatch reads up to len(docs) postings into docs, freqs and norms,
+// which must be the same length, and returns how many it read; 0 means
+// the end. It is Next in bulk for iterators without locations.
+func (i *PostingsIterator) NextBatch(docs []uint64, freqs []int, norms []float64) (int, error) {
+	clean := i.normBits1Hit == 0 && i.includeFreqNorm && !i.includeLocs &&
+		i.postings != nil && i.postings.postings == i.ActualBM && i.postings.chunkSize > 0
+	if !clean {
+		n := 0
+		for n < len(docs) {
+			p, err := i.nextAtOrAfter(0)
+			if err != nil || p == nil {
+				return n, err
+			}
+			docs[n], freqs[n], norms[n] = i.next.docNum, i.next.freq, float64(i.next.norm)
+			n++
+		}
+		return n, nil
+	}
+	if !i.started {
+		i.startIterators()
+	}
+	it := i.Actual
+	r := i.freqNormReader
+	n := 0
+	for n < len(docs) && it.HasNext() {
+		d := it.Next()
+		if uint64(d) >= i.chunkEnd || r.isNil() {
+			// sequential reads enter a new chunk at its first entry
+			if err := i.loadChunk(int(uint64(d) / i.postings.chunkSize)); err != nil {
+				return n, fmt.Errorf("error loading chunk: %v", err)
+			}
+		}
+		freqHasLocs, err := r.r.readUvarintFast()
+		if err != nil {
+			return n, fmt.Errorf("error reading frequency: %v", err)
+		}
+		normBits, err := r.r.ReadUvarint()
+		if err != nil {
+			return n, fmt.Errorf("error reading norm: %v", err)
+		}
+		if normBits > math.MaxUint32 {
+			return n, fmt.Errorf("norm bits exceed uint32")
+		}
+		docs[n] = uint64(d)
+		freqs[n] = int(freqHasLocs >> 1)
+		norms[n] = float64(math.Float32frombits(uint32(normBits)))
+		n++
+		i.lastDoc, i.hasLast = d, true
+	}
+	return n, nil
 }
 
 func (i *PostingsIterator) currChunkNext(nChunk uint32) error {
