@@ -94,6 +94,26 @@ func TestVersion4SegmentsStillRead(t *testing.T) {
 	}
 }
 
+// chunkBounds computes the expected per-chunk max freq and min norm bits.
+func chunkBounds(t *testing.T, all []plainPosting, cs uint64, n int) (maxF, minN []uint64) {
+	t.Helper()
+	maxF = make([]uint64, n)
+	minN = make([]uint64, n)
+	for k := range minN {
+		minN[k] = math.MaxUint64
+	}
+	for _, p := range all {
+		if p.freq < 0 {
+			t.Fatalf("negative freq %d for doc %d", p.freq, p.doc)
+			return nil, nil
+		}
+		c := p.doc / cs
+		maxF[c] = max(maxF[c], uint64(p.freq))
+		minN[c] = min(minN[c], uint64(math.Float32bits(float32(p.norm))))
+	}
+	return maxF, minN
+}
+
 // TestBlockBoundsAndSkip checks the stored chunk bounds are exact and that
 // SkipBlocks skips exactly the rejected chunks.
 func TestBlockBoundsAndSkip(t *testing.T) {
@@ -104,16 +124,7 @@ func TestBlockBoundsAndSkip(t *testing.T) {
 	if len(r.maxFreqs) < 2 {
 		t.Fatalf("want several chunks, got %d", len(r.maxFreqs))
 	}
-	maxF := make([]uint64, len(r.maxFreqs))
-	minN := make([]uint64, len(r.maxFreqs))
-	for k := range minN {
-		minN[k] = math.MaxUint64
-	}
-	for _, p := range all {
-		c := p.doc / cs
-		maxF[c] = max(maxF[c], uint64(p.freq))
-		minN[c] = min(minN[c], uint64(math.Float32bits(float32(p.norm))))
-	}
+	maxF, minN := chunkBounds(t, all, cs, len(r.maxFreqs))
 	for c := range maxF {
 		if maxF[c] == 0 {
 			continue // empty chunk

@@ -153,6 +153,17 @@ func TestPostingsExcludedChunkSizeBounds(t *testing.T) {
 	}
 }
 
+func TestChunkedIntCoderBoundsShortVals(t *testing.T) {
+	coder := newChunkedIntCoder(1, 0)
+	coder.trackBounds()
+	if err := coder.Add(0, 7); err != nil {
+		t.Fatal(err)
+	}
+	if coder.maxFreqs[0] != 0 || coder.minNorms[0] != 0 {
+		t.Fatalf("bounds updated from short vals: (%d,%d)", coder.maxFreqs[0], coder.minNorms[0])
+	}
+}
+
 func TestPostingsNormBitsBounds(t *testing.T) {
 	for _, norm := range []uint64{math.MaxUint32, math.MaxUint32 + 1, math.MaxUint64} {
 		coder := newChunkedIntCoder(1, 0)

@@ -120,7 +120,7 @@ func (c *chunkedIntCoder) Add(docNum uint64, vals ...uint64) error {
 		c.chunkBuf.Reset()
 		c.currChunk = chunk
 	}
-	if c.bounds {
+	if c.bounds && len(vals) >= 2 {
 		freq, norm := vals[0]>>1, vals[1]
 		if c.chunkBuf.Len() == 0 {
 			c.maxFreqs[chunk], c.minNorms[chunk] = freq, norm
