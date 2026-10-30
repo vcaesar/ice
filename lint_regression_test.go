@@ -153,14 +153,16 @@ func TestPostingsExcludedChunkSizeBounds(t *testing.T) {
 	}
 }
 
-func TestChunkedIntCoderBoundsShortVals(t *testing.T) {
-	coder := newChunkedIntCoder(1, 0)
-	coder.trackBounds()
-	if err := coder.Add(0, 7); err != nil {
-		t.Fatal(err)
-	}
-	if coder.maxFreqs[0] != 0 || coder.minNorms[0] != 0 {
-		t.Fatalf("bounds updated from short vals: (%d,%d)", coder.maxFreqs[0], coder.minNorms[0])
+func TestChunkedIntCoderBoundsRejectsWrongArity(t *testing.T) {
+	for _, vals := range [][]uint64{nil, {7}, {7, 8, 9}} {
+		coder := newChunkedIntCoder(1, 0)
+		coder.trackBounds()
+		if err := coder.Add(0, vals...); err == nil {
+			t.Fatalf("Add with %d values: want error", len(vals))
+		}
+		if coder.chunkBuf.Len() != 0 {
+			t.Fatalf("Add with %d values wrote %d bytes", len(vals), coder.chunkBuf.Len())
+		}
 	}
 }
 

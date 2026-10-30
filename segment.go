@@ -30,6 +30,10 @@ import (
 // Version 5 adds per-chunk freq/norm bounds (block max) to postings.
 const Version uint32 = 5
 
+// versionBlockBounds is the first version whose freq/norm chunks store
+// per-chunk bounds.
+const versionBlockBounds uint32 = 5
+
 // versionNumericDocValues is the last version without block max postings;
 // it is still readable, and merges rewrite it as Version.
 const versionNumericDocValues uint32 = 4

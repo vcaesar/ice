@@ -240,7 +240,7 @@ func persistMergedRest(segments []*Segment, dropsIn []*roaring.Bitmap,
 	// however this will be reset to the correct chunk size
 	// while processing each individual field-term section
 	tfEncoder := newChunkedIntCoder(uint64(legacyChunkMode), newSegDocCount-1)
-	if writeVersion >= Version {
+	if writeVersion >= versionBlockBounds {
 		tfEncoder.trackBounds()
 	}
 	locEncoder := newChunkedIntCoder(uint64(legacyChunkMode), newSegDocCount-1)

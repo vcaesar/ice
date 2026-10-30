@@ -900,7 +900,7 @@ func (s *interim) writeDicts() (fdvIndexOffset uint64, dictOffsets []uint64, err
 	// while processing each individual field-term section
 	// #nosec G115 -- convert calls writeDicts only for nonempty results.
 	tfEncoder := newChunkedIntCoder(uint64(legacyChunkMode), uint64(len(s.results)-1))
-	if writeVersion >= Version {
+	if writeVersion >= versionBlockBounds {
 		tfEncoder.trackBounds()
 	}
 	// #nosec G115 -- convert calls writeDicts only for nonempty results.
