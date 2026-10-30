@@ -203,8 +203,8 @@ func (d *Dictionary) OrPostingsDense(a segment.Automaton, startKeyInclusive, end
 	var pl PostingsList
 	for err == nil {
 		_, offset := itr.Current()
-		if err = pl.read(offset, d); err != nil {
-			return false, err
+		if rerr := pl.read(offset, d); rerr != nil {
+			return false, rerr
 		}
 		if pl.normBits1Hit != 0 {
 			if pl.docNum1Hit >= limit {

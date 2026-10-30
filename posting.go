@@ -720,7 +720,7 @@ func (i *PostingsIterator) chunkOf(n uint32) uint32 {
 // advanceByRank moves a clean iterator to the first posting at or after
 // atOrAfter, skipping the freq/norm entries of the postings passed over by
 // counting them with bitmap ranks instead of iterating them.
-func (i *PostingsIterator) advanceByRank(atOrAfter uint32) (uint64, bool, error) {
+func (i *PostingsIterator) advanceByRank(atOrAfter uint32) (docNum uint64, exists bool, err error) {
 	i.Actual.AdvanceIfNeeded(atOrAfter)
 	if !i.Actual.HasNext() {
 		return 0, false, nil
@@ -779,6 +779,7 @@ func (i *PostingsIterator) NextBatch(docs []uint64, freqs []int, norms []float64
 		d := it.Next()
 		if uint64(d) >= i.chunkEnd || r.isNil() {
 			// sequential reads enter a new chunk at its first entry
+			// #nosec G115 -- a uint32 document number divided by a positive size fits int.
 			if err := i.loadChunk(int(uint64(d) / i.postings.chunkSize)); err != nil {
 				return n, fmt.Errorf("error loading chunk: %v", err)
 			}
