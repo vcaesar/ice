@@ -17,6 +17,7 @@ package ice
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"math"
 
@@ -30,6 +31,10 @@ import (
 const termNotEncoded = 0
 
 const initialIntCoderCapacity = 64
+
+// freqNormVals is the number of values, (freqHasLocs, normBits), each Add
+// of a bounds-tracking coder takes.
+const freqNormVals = 2
 
 type chunkedIntCoder struct {
 	final     []byte
@@ -120,7 +125,10 @@ func (c *chunkedIntCoder) Add(docNum uint64, vals ...uint64) error {
 		c.chunkBuf.Reset()
 		c.currChunk = chunk
 	}
-	if c.bounds && len(vals) >= 2 {
+	if c.bounds {
+		if len(vals) != freqNormVals {
+			return fmt.Errorf("bounds tracking needs (freqHasLocs, normBits), got %d values", len(vals))
+		}
 		freq, norm := vals[0]>>1, vals[1]
 		if c.chunkBuf.Len() == 0 {
 			c.maxFreqs[chunk], c.minNorms[chunk] = freq, norm

@@ -198,7 +198,7 @@ func (p *PostingsList) iterator(includeFreq, includeNorm, includeLocs bool,
 	if rv.includeFreqNorm {
 		var err error
 		rv.freqNormReader, err = newChunkedIntDecoder(p.sb.data, p.freqOffset, rv.freqNormReader,
-			p.sb.footer != nil && p.sb.footer.version >= Version)
+			p.sb.footer != nil && p.sb.footer.version >= versionBlockBounds)
 		if err != nil {
 			return nil, err
 		}
@@ -777,6 +777,21 @@ func (i *PostingsIterator) nextBatchSubset(docs []uint64, freqs []int, norms []f
 	return n, nil
 }
 
+// nextBatchSlow is NextBatch one Next at a time, for iterators the batch
+// paths do not handle.
+func (i *PostingsIterator) nextBatchSlow(docs []uint64, freqs []int, norms []float64) (int, error) {
+	n := 0
+	for n < len(docs) {
+		p, err := i.nextAtOrAfter(0)
+		if err != nil || p == nil {
+			return n, err
+		}
+		docs[n], freqs[n], norms[n] = i.next.docNum, i.next.freq, float64(i.next.norm)
+		n++
+	}
+	return n, nil
+}
+
 // NextBatch reads up to len(docs) postings into docs, freqs and norms,
 // which must be the same length, and returns how many it read; 0 means
 // the end. It is Next in bulk for iterators without locations.
@@ -784,19 +799,13 @@ func (i *PostingsIterator) NextBatch(docs []uint64, freqs []int, norms []float64
 	batchable := i.normBits1Hit == 0 && i.includeFreqNorm && !i.includeLocs &&
 		i.postings != nil && i.ActualBM != nil && i.postings.chunkSize > 0
 	if !batchable {
-		n := 0
-		for n < len(docs) {
-			p, err := i.nextAtOrAfter(0)
-			if err != nil || p == nil {
-				return n, err
-			}
-			docs[n], freqs[n], norms[n] = i.next.docNum, i.next.freq, float64(i.next.norm)
-			n++
-		}
-		return n, nil
+		return i.nextBatchSlow(docs, freqs, norms)
 	}
 	if !i.started {
 		i.startIterators()
+	}
+	if i.Actual == nil {
+		return 0, nil
 	}
 	if i.postings.postings != i.ActualBM {
 		return i.nextBatchSubset(docs, freqs, norms)
@@ -1006,6 +1015,9 @@ func (i *PostingsIterator) SkipBlocks(competitive func(maxFreq int, minNorm floa
 	}
 	if !i.started {
 		i.startIterators()
+	}
+	if i.Actual == nil {
+		return 0, nil
 	}
 	r, bm, cs := i.freqNormReader, i.postings.postings, i.postings.chunkSize
 	var skipped uint64

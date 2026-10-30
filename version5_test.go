@@ -18,6 +18,7 @@ import (
 	"math"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"testing"
 
 	"github.com/RoaringBitmap/roaring/v2"
@@ -81,7 +82,7 @@ func TestVersion4SegmentsStillRead(t *testing.T) {
 	if merged.Version() != Version {
 		t.Fatalf("merged version %d, want %d", merged.Version(), Version)
 	}
-	got := allPostings(t, skipIterator(t, merged))
+	got, _ := checkBounds(t, merged)
 	if len(got) != 2*len(want) {
 		t.Fatalf("merged %d postings, want %d", len(got), 2*len(want))
 	}
@@ -94,78 +95,114 @@ func TestVersion4SegmentsStillRead(t *testing.T) {
 	}
 }
 
-// chunkBounds computes the expected per-chunk max freq and min norm bits.
-func chunkBounds(t *testing.T, all []plainPosting, cs uint64, n int) (maxF, minN []uint64) {
+// checkBounds checks the stored chunk bounds of seg's "t" postings are the
+// exact max freq and min norm bits of each chunk, and (0,0) for empty
+// chunks. It returns the postings and the chunk size.
+func checkBounds(t *testing.T, seg *Segment) (all []plainPosting, cs uint64) {
 	t.Helper()
-	maxF = make([]uint64, n)
-	minN = make([]uint64, n)
-	for k := range minN {
-		minN[k] = math.MaxUint64
-	}
-	for _, p := range all {
-		if p.freq < 0 {
-			t.Fatalf("negative freq %d for doc %d", p.freq, p.doc)
-			return nil, nil
-		}
-		c := p.doc / cs
-		maxF[c] = max(maxF[c], uint64(p.freq))
-		minN[c] = min(minN[c], uint64(math.Float32bits(float32(p.norm))))
-	}
-	return maxF, minN
-}
-
-// TestBlockBoundsAndSkip checks the stored chunk bounds are exact and that
-// SkipBlocks skips exactly the rejected chunks.
-func TestBlockBoundsAndSkip(t *testing.T) {
-	seg := persistedSkipSegment(t, Version, 20000)
-	all := allPostings(t, skipIterator(t, seg))
+	all = allPostings(t, skipIterator(t, seg))
 	it := skipIterator(t, seg)
-	r, cs := it.freqNormReader, it.postings.chunkSize
-	if len(r.maxFreqs) < 2 {
-		t.Fatalf("want several chunks, got %d", len(r.maxFreqs))
+	r := it.freqNormReader
+	cs = it.postings.chunkSize
+	if len(r.maxFreqs) != len(r.chunkOffsets) || len(r.minNorms) != len(r.chunkOffsets) {
+		t.Fatalf("%d/%d bounds for %d chunks", len(r.maxFreqs), len(r.minNorms), len(r.chunkOffsets))
 	}
-	maxF, minN := chunkBounds(t, all, cs, len(r.maxFreqs))
-	for c := range maxF {
-		if maxF[c] == 0 {
-			continue // empty chunk
+	maxF, minN := make([]uint64, len(r.maxFreqs)), make([]uint64, len(r.maxFreqs))
+	seen := make([]bool, len(r.maxFreqs))
+	for _, p := range all {
+		c := p.doc / cs
+		if c >= uint64(len(seen)) {
+			t.Fatalf("doc %d past the %d chunks", p.doc, len(seen))
 		}
+		f := uint64(p.freq) // #nosec G115 -- fixture freqs are 1..4.
+		n := uint64(math.Float32bits(float32(p.norm)))
+		if !seen[c] {
+			maxF[c], minN[c], seen[c] = f, n, true
+		}
+		maxF[c], minN[c] = max(maxF[c], f), min(minN[c], n)
+	}
+	for c := range maxF {
 		if r.maxFreqs[c] != maxF[c] || r.minNorms[c] != minN[c] {
 			t.Fatalf("chunk %d bounds (%d,%d), want (%d,%d)", c, r.maxFreqs[c], r.minNorms[c], maxF[c], minN[c])
 		}
 	}
+	return all, cs
+}
 
-	// reject chunks without a freq-4 posting: the next posting must be the
-	// first one in an accepted chunk, and the skip count everything before
-	n, err := it.SkipBlocks(func(maxFreq int, _ float64) bool { return maxFreq >= 4 })
-	if err != nil {
-		t.Fatal(err)
-	}
-	first := 0
-	for first < len(all) && maxF[all[first].doc/cs] < 4 {
-		first++
-	}
-	if n != uint64(first) {
-		t.Fatalf("skipped %d postings, want %d", n, first)
-	}
-	p, err := it.Next()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if first == len(all) {
-		if p != nil {
-			t.Fatalf("got %d after skipping everything", p.Number())
+// expectSkip returns the index in all of the next posting after reading
+// pre postings and then skipping the rest of rejects chunks.
+func expectSkip(all []plainPosting, cs uint64, pre, rejects int) int {
+	pos := pre
+	for range rejects {
+		if pos == len(all) {
+			break
 		}
-		return
+		c := all[pos].doc / cs
+		for pos < len(all) && all[pos].doc/cs == c {
+			pos++
+		}
 	}
-	if p == nil || (plainPosting{p.Number(), p.Frequency(), p.Norm()}) != all[first] {
-		t.Fatalf("after skip got %v, want %+v", p, all[first])
-	}
+	return pos
+}
 
-	it = skipIterator(t, seg)
-	if n, err := it.SkipBlocks(func(int, float64) bool { return false }); err != nil || n != uint64(len(all)) {
-		t.Fatalf("reject-all skipped %d, %v; want %d", n, err, len(all))
+// TestBlockBoundsAndSkip checks the stored chunk bounds are exact and that
+// SkipBlocks skips exactly the rejected chunks, from a chunk start or mid
+// chunk, leaving the iterator in sync for the postings after.
+func TestBlockBoundsAndSkip(t *testing.T) {
+	seg := persistedSkipSegment(t, Version, 20000)
+	all, cs := checkBounds(t, seg)
+	if all[len(all)-1].doc/cs < 3 {
+		t.Fatalf("want several chunks, got %d", all[len(all)-1].doc/cs+1)
 	}
-	if p, err := it.Next(); err != nil || p != nil {
-		t.Fatalf("Next after reject-all = %v, %v", p, err)
+	for _, tc := range []struct {
+		name         string
+		pre, rejects int
+	}{
+		{"none", 0, 0},
+		{"first two", 0, 2},
+		{"mid chunk", 3, 1},
+		{"mid chunk then two", 3, 3},
+		{"all", 0, len(all)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			it := skipIterator(t, seg)
+			for range tc.pre {
+				if p, err := it.Next(); err != nil || p == nil {
+					t.Fatalf("Next = %v, %v", p, err)
+				}
+			}
+			calls := 0
+			n, err := it.SkipBlocks(func(int, float64) bool {
+				calls++
+				return calls > tc.rejects
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			pos := expectSkip(all, cs, tc.pre, tc.rejects)
+			if n != uint64(pos-tc.pre) { // #nosec G115 -- expectSkip never moves pos before pre.
+				t.Fatalf("skipped %d postings, want %d", n, pos-tc.pre)
+			}
+			if rest := allPostings(t, it); !slices.Equal(rest, all[pos:]) {
+				t.Fatalf("after skip read %d postings, want %d, or they differ", len(rest), len(all)-pos)
+			}
+		})
+	}
+}
+
+// TestSkipBlocksAndNextBatchAfterAdvancePastEnd checks an iterator advanced
+// past the uint32 doc range reports the end instead of panicking.
+func TestSkipBlocksAndNextBatchAfterAdvancePastEnd(t *testing.T) {
+	seg := persistedSkipSegment(t, Version, 3000)
+	it := skipIterator(t, seg)
+	if p, err := it.Advance(math.MaxUint32 + 1); err != nil || p != nil {
+		t.Fatalf("Advance past end = %v, %v", p, err)
+	}
+	if n, err := it.SkipBlocks(func(int, float64) bool { return false }); err != nil || n != 0 {
+		t.Fatalf("SkipBlocks = %d, %v", n, err)
+	}
+	docs, freqs, norms := make([]uint64, 8), make([]int, 8), make([]float64, 8)
+	if n, err := it.NextBatch(docs, freqs, norms); err != nil || n != 0 {
+		t.Fatalf("NextBatch = %d, %v", n, err)
 	}
 }
