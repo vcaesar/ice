@@ -33,7 +33,7 @@ func TestIntDecoderHeaderBounds(t *testing.T) {
 		{"missing second offset", []byte{0, 2, 0x80, 1}, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := newChunkedIntDecoder(segment.NewDataBytes(tc.data), tc.offset, nil); err == nil {
+			if _, err := newChunkedIntDecoder(segment.NewDataBytes(tc.data), tc.offset, nil, false); err == nil {
 				t.Fatal("accepted invalid integer chunk header")
 			}
 		})
@@ -45,7 +45,7 @@ func TestIntDecoderShortHeaderAndReuse(t *testing.T) {
 	for _, offsets := range [][]byte{{0, 0}, {0}, {}, {0, 0, 0}} {
 		data := append(binary.AppendUvarint([]byte{0}, uint64(len(offsets))), offsets...)
 		var err error
-		decoder, err = newChunkedIntDecoder(segment.NewDataBytes(data), 1, decoder)
+		decoder, err = newChunkedIntDecoder(segment.NewDataBytes(data), 1, decoder, false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -53,7 +53,7 @@ func TestIntDecoderShortHeaderAndReuse(t *testing.T) {
 			t.Fatalf("incorrect decoded header: %+v", decoder)
 		}
 	}
-	decoder, err := newChunkedIntDecoder(nil, termNotEncoded, decoder)
+	decoder, err := newChunkedIntDecoder(nil, termNotEncoded, decoder, false)
 	if err != nil || len(decoder.chunkOffsets) != 0 || decoder.dataStartOffset != 0 {
 		t.Fatalf("incorrect absent header: %+v, %v", decoder, err)
 	}

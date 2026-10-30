@@ -104,6 +104,25 @@ func (r *memUvarintReader) SkipUvarint() {
 	}
 }
 
+// skipUvarints skips count encoded uint64s.
+func (r *memUvarintReader) skipUvarints(count uint64) error {
+	S, C := r.S, r.C
+	for ; count > 0; count-- {
+		for {
+			if C >= len(S) {
+				return fmt.Errorf("memUvarintReader: skip past end")
+			}
+			b := S[C]
+			C++
+			if b < lastByte {
+				break
+			}
+		}
+	}
+	r.C = C
+	return nil
+}
+
 // SkipBytes skips a count number of bytes.
 func (r *memUvarintReader) SkipBytes(count int) {
 	r.C += count

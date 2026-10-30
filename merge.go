@@ -180,6 +180,7 @@ func mergeToWriter(segments []*Segment, drops []*roaring.Bitmap,
 		storedIndexOffset: storedIndexOffset,
 		fieldsIndexOffset: fieldsIndexOffset,
 		docValueOffset:    docValueOffset,
+		version:           writeVersion,
 		docTimeMin:        uint64(docTimeMin), // #nosec G115 -- preserve signed timestamp bits in the uint64 wire format.
 		docTimeMax:        uint64(docTimeMax), // #nosec G115 -- preserve signed timestamp bits in the uint64 wire format.
 	}, nil
@@ -239,6 +240,9 @@ func persistMergedRest(segments []*Segment, dropsIn []*roaring.Bitmap,
 	// however this will be reset to the correct chunk size
 	// while processing each individual field-term section
 	tfEncoder := newChunkedIntCoder(uint64(legacyChunkMode), newSegDocCount-1)
+	if writeVersion >= Version {
+		tfEncoder.trackBounds()
+	}
 	locEncoder := newChunkedIntCoder(uint64(legacyChunkMode), newSegDocCount-1)
 
 	var vellumBuf bytes.Buffer
