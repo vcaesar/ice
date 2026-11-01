@@ -223,8 +223,9 @@ func (d *Dictionary) OrPostingsDense(a segment.Automaton, startKeyInclusive, end
 			}
 			// WriteDenseTo copies bitmap containers over their words rather
 			// than ORing them, so write into zeroed scratch and OR from there.
-			// Array and run containers are ORed; a bitmap container holds
-			// more than maxArrayContainer values, so smaller postings can go in
+			// Array containers and run edges are ORed and run interiors set to
+			// all ones, so neither erases hits; a bitmap container holds more
+			// than maxArrayContainer values, so smaller postings can go in
 			// directly.
 			if pl.postings.GetCardinality() <= maxArrayContainer {
 				pl.postings.WriteDenseTo(dense)
@@ -251,8 +252,9 @@ const (
 )
 
 // orDenseVia ORs bm, whose maximum is hi, into dense through the zeroed
-// scratch, leaving scratch zeroed. It merges only the words of populated
-// containers, skipping the gaps between them.
+// scratch, leaving scratch zeroed: WriteDenseTo touches no word before a
+// container's first hit, and each container is cleared from that word on.
+// It merges only populated containers, skipping the gaps between them.
 func orDenseVia(dense, scratch []uint64, bm *roaring.Bitmap, hi uint64) {
 	bm.WriteDenseTo(scratch)
 	last := hi / wordBits

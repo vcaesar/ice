@@ -347,3 +347,94 @@ func BenchmarkOrDenseViaSparseContainers(b *testing.B) {
 		orDenseVia(dense, scratch, bm, hi)
 	}
 }
+
+// TestOrPostingsDenseRunContainer checks that a <=4096-hit posting stored
+// as a run container (RunOptimize before write) goes straight into dense
+// without erasing hits of terms that share its words.
+func TestOrPostingsDenseRunContainer(t *testing.T) {
+	const numDocs = 6000
+	docs := make([]segment.Document, numDocs)
+	for i := range docs {
+		words := []string{"_"}
+		if i%7 == 0 {
+			words = append(words, "a")
+		}
+		if i >= 100 && i < 3100 {
+			words = append(words, "r")
+		}
+		if i%11 == 0 {
+			words = append(words, "z")
+		}
+		docs[i] = &FakeDocument{
+			NewFakeField("_id", strconv.Itoa(i), true, false, false),
+			NewFakeField("body", strings.Join(words, " "), false, true, false),
+		}
+	}
+	seg, _, err := newWithChunkMode(docs, encodeNorm, chunkModeV1, DefaultOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := seg.(*Segment).dictionary("body")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pl, err := d.postingsList([]byte("r"), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s := pl.postings.Stats(); s.RunContainers != 1 || s.Cardinality > maxArrayContainer {
+		t.Fatalf("r postings stats %+v, want one run container", s)
+	}
+	start, end := []byte("a"), []byte("zz")
+	want := make([]uint64, (numDocs+63)/64)
+	if terms := termUnion(t, d, start, end, want); len(terms) != 3 {
+		t.Fatalf("got terms %v, want a r z", terms)
+	}
+	got := make([]uint64, len(want))
+	ok, err := d.OrPostingsDense(nil, start, end, got)
+	if err != nil || !ok {
+		t.Fatalf("OrPostingsDense: %v %v", ok, err)
+	}
+	for k := range want {
+		if got[k] != want[k] {
+			t.Fatalf("word %d = %x, want %x", k, got[k], want[k])
+		}
+	}
+}
+
+// TestOrDenseViaReusedScratch reuses one scratch across postings whose
+// containers start mid-container, mixing bitmap and array containers, and
+// checks no stale scratch bits leak into later unions.
+func TestOrDenseViaReusedScratch(t *testing.T) {
+	addRange := func(bm *roaring.Bitmap, from, n, step uint32) {
+		for i := range n {
+			bm.Add(from + i*step)
+		}
+	}
+	a, b, c := roaring.New(), roaring.New(), roaring.New()
+	addRange(a, 1000, 5000, 3)       // bitmap container, block 0
+	addRange(a, 2<<16+777, 100, 5)   // array container, block 2
+	addRange(b, 5, 50, 1)            // array container, block 0
+	addRange(b, 2<<16+9000, 5000, 7) // bitmap container, block 2
+	addRange(c, 1<<16+3, 4097, 1)    // run container, block 1
+	words := 3 << 16 / 64
+	dense := make([]uint64, words)
+	want := make([]uint64, words)
+	scratch := make([]uint64, words)
+	for n, bm := range []*roaring.Bitmap{a, b, c, a} {
+		bm.RunOptimize()
+		orDenseVia(dense, scratch, bm, uint64(bm.Maximum()))
+		for it := bm.Iterator(); it.HasNext(); {
+			x := it.Next()
+			want[x/64] |= 1 << (x % 64)
+		}
+		for k := range want {
+			if dense[k] != want[k] {
+				t.Fatalf("bitmap %d: word %d = %x, want %x", n, k, dense[k], want[k])
+			}
+			if scratch[k] != 0 {
+				t.Fatalf("bitmap %d: scratch word %d = %x, want 0", n, k, scratch[k])
+			}
+		}
+	}
+}
