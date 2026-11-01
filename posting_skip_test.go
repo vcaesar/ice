@@ -20,6 +20,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/RoaringBitmap/roaring/v2"
 	segment "github.com/vcaesar/bluge_segment_api"
 )
 
@@ -301,5 +302,48 @@ func TestOrPostingsDenseKeepsSharedDenseBlocks(t *testing.T) {
 		if got[k] != want[k] {
 			t.Fatalf("word %d = %x, want %x", k, got[k], want[k])
 		}
+	}
+}
+
+// TestOrDenseViaSkipsContainerGaps ORs postings whose bitmap containers
+// sit far apart (blocks 0 and 151, as in the PR #12 review) into a bitset
+// with existing hits, including in the gap, and checks scratch ends zeroed.
+func TestOrDenseViaSkipsContainerGaps(t *testing.T) {
+	bm := roaring.New()
+	for i := range uint32(5000) {
+		bm.Add(2 * i)
+		bm.Add(151<<16 + 2*i + 1)
+	}
+	words := (151<<16 + 2*5000 + 64) / 64
+	dense := make([]uint64, words)
+	want := make([]uint64, words)
+	bm.WriteDenseTo(want)
+	for _, x := range []uint64{1, 3 << 16, 151<<16 + 2} {
+		dense[x/64] |= 1 << (x % 64)
+		want[x/64] |= 1 << (x % 64)
+	}
+	scratch := make([]uint64, words)
+	orDenseVia(dense, scratch, bm, uint64(bm.Maximum()))
+	for k := range want {
+		if dense[k] != want[k] {
+			t.Fatalf("word %d = %x, want %x", k, dense[k], want[k])
+		}
+		if scratch[k] != 0 {
+			t.Fatalf("scratch word %d = %x, want 0", k, scratch[k])
+		}
+	}
+}
+
+func BenchmarkOrDenseViaSparseContainers(b *testing.B) {
+	bm := roaring.New()
+	for i := range uint32(5000) {
+		bm.Add(2 * i)
+		bm.Add(151<<16 + 2*i + 1)
+	}
+	hi := uint64(bm.Maximum())
+	dense := make([]uint64, hi/64+1)
+	scratch := make([]uint64, len(dense))
+	for b.Loop() {
+		orDenseVia(dense, scratch, bm, hi)
 	}
 }
