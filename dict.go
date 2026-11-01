@@ -189,6 +189,10 @@ func (d *Dictionary) TermsIterator(a segment.Automaton,
 	return rv
 }
 
+// maxArrayContainer is the most values roaring keeps in an array container;
+// a bitmap container always holds more.
+const maxArrayContainer = 4096
+
 // OrPostingsDense ORs the postings of every term the automaton accepts in
 // [startKeyInclusive, endKeyExclusive) into dense, a bitset of the
 // segment's documents, walking the dictionary once. It returns false,
@@ -201,6 +205,7 @@ func (d *Dictionary) OrPostingsDense(a segment.Automaton, startKeyInclusive, end
 	itr, err := d.fst.Search(a, startKeyInclusive, endKeyExclusive)
 	limit := uint64(len(dense)) * 64
 	var pl PostingsList
+	var scratch []uint64
 	for err == nil {
 		_, offset := itr.Current()
 		if rerr := pl.read(offset, d); rerr != nil {
@@ -212,10 +217,27 @@ func (d *Dictionary) OrPostingsDense(a segment.Automaton, startKeyInclusive, end
 			}
 			dense[pl.docNum1Hit/64] |= 1 << (pl.docNum1Hit % 64)
 		} else if !pl.postings.IsEmpty() {
-			if uint64(pl.postings.Maximum()) >= limit {
+			hi := uint64(pl.postings.Maximum())
+			if hi >= limit {
 				return false, nil
 			}
-			pl.postings.WriteDenseTo(dense)
+			// WriteDenseTo copies bitmap containers over their words rather
+			// than ORing them, so write into zeroed scratch and OR from there.
+			// Array and run containers are ORed; a bitmap container holds
+			// more than maxArrayContainer values, so smaller postings can go in
+			// directly.
+			if pl.postings.GetCardinality() <= maxArrayContainer {
+				pl.postings.WriteDenseTo(dense)
+			} else {
+				if scratch == nil {
+					scratch = make([]uint64, len(dense))
+				}
+				pl.postings.WriteDenseTo(scratch)
+				for k := uint64(pl.postings.Minimum()) / 64; k <= hi/64; k++ {
+					dense[k] |= scratch[k]
+					scratch[k] = 0
+				}
+			}
 		}
 		pl.normBits1Hit = 0
 		err = itr.Next()

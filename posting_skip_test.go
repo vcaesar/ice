@@ -252,3 +252,54 @@ func TestOrPostingsDenseMatchesTermUnion(t *testing.T) {
 		}
 	}
 }
+
+// TestOrPostingsDenseKeepsSharedDenseBlocks ORs terms whose postings are
+// dense in the same 65,536-doc block, so roaring stores them as bitmap
+// containers; each term must add to, not overwrite, the earlier ones.
+// Sparse terms (array containers) sort both before (a*) and after (c*)
+// the dense ones (b0, b1) in the same block.
+func TestOrPostingsDenseKeepsSharedDenseBlocks(t *testing.T) {
+	const numDocs = 20000
+	docs := make([]segment.Document, numDocs)
+	for i := range docs {
+		body := "b" + strconv.Itoa(i%4)
+		switch i % 4 {
+		case 2:
+			body = "a" + strconv.Itoa(i%50)
+		case 3:
+			body = "c" + strconv.Itoa(i%50)
+		}
+		docs[i] = &FakeDocument{
+			NewFakeField("_id", strconv.Itoa(i), true, false, false),
+			NewFakeField("body", body, false, true, false),
+		}
+	}
+	seg, _, err := newWithChunkMode(docs, encodeNorm, chunkModeV1, DefaultOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := seg.(*Segment).dictionary("body")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start, end := []byte("a"), []byte("d")
+	want := make([]uint64, (numDocs+63)/64)
+	if terms := termUnion(t, d, start, end, want); len(terms) != 52 {
+		t.Fatalf("got %d terms, want 52", len(terms))
+	}
+	for k := range want {
+		if want[k] != ^uint64(0) && k < numDocs/64 {
+			t.Fatalf("word %d = %x, want every doc", k, want[k])
+		}
+	}
+	got := make([]uint64, len(want))
+	ok, err := d.OrPostingsDense(nil, start, end, got)
+	if err != nil || !ok {
+		t.Fatalf("OrPostingsDense: %v %v", ok, err)
+	}
+	for k := range want {
+		if got[k] != want[k] {
+			t.Fatalf("word %d = %x, want %x", k, got[k], want[k])
+		}
+	}
+}
