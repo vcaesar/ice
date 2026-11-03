@@ -1,11 +1,7 @@
 github.com/RoaringBitmap/roaring/v2 v2.30.0 h1:1sD4xsCenNd9n/gOWaExCWanP9WTyiNuqLAvaDQ5jkY=
 github.com/RoaringBitmap/roaring/v2 v2.30.0/go.mod h1:BZufmFbox589n3j5eOmyTaLSGXbRLc2LmQvjKjzSEGU=
-github.com/bits-and-blooms/bitset v1.28.0 h1:EIL1nHzJM+iry0hVzkOBWmoTKoSZJIlOYFGs/OyZnQ0=
-github.com/bits-and-blooms/bitset v1.28.0/go.mod h1:7hO7Gc7Pp1vODcmWvKMRA9BNmbv6a/7QIWpPxHddWR8=
-github.com/blevesearch/mmap-go v1.2.0 h1:l33nNKPFcBjJUMwem6sAYJPUzhUCABoK9FxZDGiFNBI=
-github.com/blevesearch/mmap-go v1.2.0/go.mod h1:Vd6+20GBhEdwJnU1Xohgt88XCD/CTWcqbCNxkZpyBo0=
-github.com/blevesearch/vellum v1.2.0 h1:xkDiOEsHc2t3Cp0NsNZZ36pvc130sCzcGKOPMzXe+e0=
-github.com/blevesearch/vellum v1.2.0/go.mod h1:uEcfBJz7mAOf0Kvq6qoEKQQkLODBF46SINYNkZNae4k=
+github.com/bits-and-blooms/bitset v1.29.0 h1:xq4g46l2NlweICLMDJ8LiyrZJQJTeC2Q0b3CCnLCAbg=
+github.com/bits-and-blooms/bitset v1.29.0/go.mod h1:7hO7Gc7Pp1vODcmWvKMRA9BNmbv6a/7QIWpPxHddWR8=
 github.com/cpuguy83/go-md2man/v2 v2.0.6/go.mod h1:oOW0eioCTA6cOiMLiUPZOpcVxMig6NIQQ7OS05n1F4g=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
@@ -27,6 +23,10 @@ github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu
 github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
 github.com/vcaesar/bluge_segment_api v1.2.2 h1:8nCzQvlyUQLqerP6zRiB4YUc2NYrdRX+9unlBNFMaRs=
 github.com/vcaesar/bluge_segment_api v1.2.2/go.mod h1:KO7cpxXvohHHktHmWOaJcsYwt/I9a8fuhTUrVGUPPYk=
+github.com/zedsearch/mmap-go v1.3.0 h1:9Gg3el4gRU9abx9RJakLv26opAPGZxUn1GD1MaA9Vnk=
+github.com/zedsearch/mmap-go v1.3.0/go.mod h1:rjdfAeAtgyVMiERtXATnv6FByHUddjoU3gTAYqtxxFM=
+github.com/zedsearch/vellum v1.2.2 h1:svIzYouSxFPc9m9JbcOI/F93OnMKM9rioui39Q9U/8g=
+github.com/zedsearch/vellum v1.2.2/go.mod h1:589H9BuuJCwEuu2MgzAdt5xr/NmTN3hbr81D4tHp3xc=
 go.yaml.in/yaml/v3 v3.0.4/go.mod h1:DhzuOOF2ATzADvBadXxruRBLzYTpT36CKvDb3+aBEFg=
 golang.org/x/sys v0.49.0 h1:XbzkgYJHdqh/8m2Uu0W/dQv8nktxx4BFHp1M0gROTXA=
 golang.org/x/sys v0.49.0/go.mod h1:hNLxWAXmnKAxqDtdwIYC4bM9oQPEecfsnNMuSxOs3og=

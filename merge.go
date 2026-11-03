@@ -244,9 +244,21 @@ func persistMergedRest(segments []*Segment, dropsIn []*roaring.Bitmap,
 		tfEncoder.trackBounds()
 	}
 	locEncoder := newChunkedIntCoder(uint64(legacyChunkMode), newSegDocCount-1)
+	tfEncoder.compact = writeVersion >= versionCompactPostings
+	locEncoder.compact = tfEncoder.compact
+	var offEncoder *chunkedIntCoder // location offsets, version 7+
+	if writeVersion >= versionSplitOffsets {
+		offEncoder = newChunkedIntCoder(uint64(legacyChunkMode), newSegDocCount-1)
+		offEncoder.compact = true
+	}
 
 	var vellumBuf bytes.Buffer
-	newVellum, err := vellum.New(&vellumBuf, nil)
+	fstOpts := (*vellum.BuilderOpts)(nil)
+	if newSegDocCount <= smallSegmentTerms {
+		// few documents, few terms: see smallFSTOpts
+		fstOpts = smallFSTOpts
+	}
+	newVellum, err := vellum.New(&vellumBuf, fstOpts)
 	if err != nil {
 		return nil, nil, nil, 0, err
 	}
@@ -260,7 +272,7 @@ func persistMergedRest(segments []*Segment, dropsIn []*roaring.Bitmap,
 	// for each field
 	for fieldID, fieldName := range fieldsInv {
 		err = persistMergedRestField(segments, dropsIn, fieldsMap, newDocNumsIn, newSegDocCount, chunkMode, w,
-			closeCh, fieldName, newRoaring, fieldDocTracking, tfEncoder, locEncoder, newVellum, &vellumBuf,
+			closeCh, fieldName, newRoaring, fieldDocTracking, tfEncoder, locEncoder, offEncoder, newVellum, &vellumBuf,
 			bufMaxVarintLen64, fieldFreqs, fieldID, dictLocs, fieldDvLocsStart, fieldDvLocsEnd, fieldDvNumeric)
 		if err != nil {
 			return nil, nil, nil, 0, err
@@ -287,12 +299,11 @@ func persistMergedRest(segments []*Segment, dropsIn []*roaring.Bitmap,
 
 func persistMergedRestField(segments []*Segment, dropsIn []*roaring.Bitmap, fieldsMap map[string]uint16,
 	newDocNumsIn [][]uint64, newSegDocCount uint64, chunkMode uint32, w *countHashWriter, closeCh chan struct{},
-	fieldName string, newRoaring, fieldDocTracking *roaring.Bitmap, tfEncoder, locEncoder *chunkedIntCoder,
+	fieldName string, newRoaring, fieldDocTracking *roaring.Bitmap, tfEncoder, locEncoder, offEncoder *chunkedIntCoder,
 	newVellum *vellum.Builder, vellumBuf *bytes.Buffer, bufMaxVarintLen64 []byte, fieldFreqs map[uint16]uint64,
 	fieldID int, dictLocs, fieldDvLocsStart, fieldDvLocsEnd []uint64, fieldDvNumeric []bool) error {
 	var postings *PostingsList
 	var postItr *PostingsIterator
-	var bufLoc []uint64
 
 	// collect FST iterators from all active segments for this field
 	newDocNums, drops, dicts, itrs, segmentsInFocus, err :=
@@ -321,16 +332,16 @@ func persistMergedRestField(segments []*Segment, dropsIn []*roaring.Bitmap, fiel
 			}
 
 			// if the term changed, write out the info collected for the previous term
-			err = finishTerm(w, newRoaring, tfEncoder, locEncoder, newVellum, bufMaxVarintLen64, prevTerm, &lastDocNum,
-				&lastFreq, &lastNorm)
+			err = finishTerm(w, newRoaring, tfEncoder, locEncoder, offEncoder, newVellum, bufMaxVarintLen64, prevTerm,
+				&lastDocNum, &lastFreq, &lastNorm)
 			if err != nil {
 				return err
 			}
 		}
 
 		if !bytes.Equal(prevTerm, term) || prevTerm == nil {
-			err = prepareNewTerm(newSegDocCount, chunkMode, tfEncoder, locEncoder, fieldFreqs, fieldID, enumerator,
-				dicts, drops)
+			err = prepareNewTerm(newSegDocCount, chunkMode, tfEncoder, locEncoder, offEncoder, fieldFreqs, fieldID,
+				enumerator, dicts, drops)
 			if err != nil {
 				return err
 			}
@@ -348,9 +359,9 @@ func persistMergedRestField(segments []*Segment, dropsIn []*roaring.Bitmap, fiel
 		}
 
 		// can no longer optimize by copying, since chunk factor could have changed
-		lastDocNum, lastFreq, lastNorm, bufLoc, err = mergeTermFreqNormLocs(
+		lastDocNum, lastFreq, lastNorm, err = mergeTermFreqNormLocs(
 			fieldsMap, postItr, newDocNums[itrI], newRoaring,
-			tfEncoder, locEncoder, bufLoc, fieldDocTracking)
+			tfEncoder, locEncoder, offEncoder, fieldDocTracking)
 
 		if err != nil {
 			return err
@@ -365,8 +376,8 @@ func persistMergedRestField(segments []*Segment, dropsIn []*roaring.Bitmap, fiel
 		return err
 	}
 
-	err = finishTerm(w, newRoaring, tfEncoder, locEncoder, newVellum, bufMaxVarintLen64, prevTerm, &lastDocNum,
-		&lastFreq, &lastNorm)
+	err = finishTerm(w, newRoaring, tfEncoder, locEncoder, offEncoder, newVellum, bufMaxVarintLen64, prevTerm,
+		&lastDocNum, &lastFreq, &lastNorm)
 	if err != nil {
 		return err
 	}
@@ -571,7 +582,7 @@ func mergeNumericAsTerms(seg *Segment, col *numericColumn, mapping []uint64, enc
 	return flush()
 }
 
-func prepareNewTerm(newSegDocCount uint64, chunkMode uint32, tfEncoder, locEncoder *chunkedIntCoder,
+func prepareNewTerm(newSegDocCount uint64, chunkMode uint32, tfEncoder, locEncoder, offEncoder *chunkedIntCoder,
 	fieldFreqs map[uint16]uint64, fieldID int, enumerator *enumerator, dicts []*Dictionary,
 	drops []*roaring.Bitmap) error {
 	var err error
@@ -598,16 +609,24 @@ func prepareNewTerm(newSegDocCount uint64, chunkMode uint32, tfEncoder, locEncod
 	// update encoders chunk
 	tfEncoder.SetChunkSize(chunkSize, newSegDocCount-1)
 	locEncoder.SetChunkSize(chunkSize, newSegDocCount-1)
+	if offEncoder != nil {
+		offEncoder.SetChunkSize(chunkSize, newSegDocCount-1)
+	}
 	return nil
 }
 
-func finishTerm(w *countHashWriter, newRoaring *roaring.Bitmap, tfEncoder, locEncoder *chunkedIntCoder,
+func finishTerm(w *countHashWriter, newRoaring *roaring.Bitmap, tfEncoder, locEncoder, offEncoder *chunkedIntCoder,
 	newVellum *vellum.Builder, bufMaxVarintLen64, term []byte, lastDocNum, lastFreq, lastNorm *uint64) error {
 	if err := tfEncoder.Close(); err != nil {
 		return err
 	}
 	if err := locEncoder.Close(); err != nil {
 		return err
+	}
+	if offEncoder != nil {
+		if err := offEncoder.Close(); err != nil {
+			return err
+		}
 	}
 
 	// determines whether to use "1-hit" encoding optimization
@@ -624,7 +643,7 @@ func finishTerm(w *countHashWriter, newRoaring *roaring.Bitmap, tfEncoder, locEn
 	}
 
 	postingsOffset, err := writePostings(newRoaring,
-		tfEncoder, locEncoder, use1HitEncoding, w, bufMaxVarintLen64)
+		tfEncoder, locEncoder, offEncoder, use1HitEncoding, w, bufMaxVarintLen64)
 	if err != nil {
 		return err
 	}
@@ -640,6 +659,9 @@ func finishTerm(w *countHashWriter, newRoaring *roaring.Bitmap, tfEncoder, locEn
 
 	tfEncoder.Reset()
 	locEncoder.Reset()
+	if offEncoder != nil {
+		offEncoder.Reset()
+	}
 
 	*lastDocNum = 0
 	*lastFreq = 0
@@ -714,28 +736,26 @@ func setupActiveForField(segments []*Segment, dropsIn []*roaring.Bitmap, newDocN
 	return newDocNums, drops, dicts, itrs, segmentsInFocus, nil
 }
 
-const numUintsLocation = 4
-
 func mergeTermFreqNormLocs(fieldsMap map[string]uint16, postItr *PostingsIterator,
 	newDocNums []uint64, newRoaring *roaring.Bitmap,
-	tfEncoder, locEncoder *chunkedIntCoder, bufLoc []uint64, docTracking *roaring.Bitmap) (
-	lastDocNum, lastFreq, lastNorm uint64, bufLocOut []uint64, err error) {
+	tfEncoder, locEncoder, offEncoder *chunkedIntCoder, docTracking *roaring.Bitmap) (
+	lastDocNum, lastFreq, lastNorm uint64, err error) {
 	next, err := postItr.Next()
 	for next != nil && err == nil {
 		hitNewDocNum := newDocNums[next.Number()]
 		if hitNewDocNum == docDropped {
-			return 0, 0, 0, nil, fmt.Errorf("see hit with dropped docNum")
+			return 0, 0, 0, fmt.Errorf("see hit with dropped docNum")
 		}
 
 		if hitNewDocNum > math.MaxUint32 {
-			return 0, 0, 0, nil, fmt.Errorf("merged document number exceeds uint32")
+			return 0, 0, 0, fmt.Errorf("merged document number exceeds uint32")
 		}
 		newRoaring.Add(uint32(hitNewDocNum))
 		docTracking.Add(uint32(hitNewDocNum))
 
 		nextFreq := next.Frequency()
 		if nextFreq < 0 {
-			return 0, 0, 0, nil, fmt.Errorf("negative posting frequency")
+			return 0, 0, 0, fmt.Errorf("negative posting frequency")
 		}
 		nextNorm := uint64(math.Float32bits(float32(next.Norm())))
 
@@ -744,35 +764,21 @@ func mergeTermFreqNormLocs(fieldsMap map[string]uint16, postItr *PostingsIterato
 		err = tfEncoder.Add(hitNewDocNum,
 			encodeFreqHasLocs(uint64(nextFreq), len(locs) > 0), nextNorm)
 		if err != nil {
-			return 0, 0, 0, nil, err
+			return 0, 0, 0, err
 		}
 
 		if len(locs) > 0 {
-			// encode every location's 4 ints once into bufLoc, size them, then
-			// hand the whole run to the encoder in a single call
-			need := numUintsLocation * len(locs)
-			if cap(bufLoc) < need {
-				bufLoc = make([]uint64, need)
+			var prevPos, prevStart uint64
+			for _, loc := range locs {
+				pos := uint64(loc.Pos())     // #nosec G115 -- readLocation validates nonnegative int-sized locations.
+				start := uint64(loc.Start()) // #nosec G115 -- readLocation validates nonnegative int-sized locations.
+				end := uint64(loc.End())     // #nosec G115 -- readLocation validates nonnegative int-sized locations.
+				recordLocation(locEncoder, offEncoder,
+					uint64(fieldsMap[loc.Field()]-1), pos, start, end, prevPos, prevStart)
+				prevPos, prevStart = pos, start
 			}
-			args := bufLoc[:need]
-			numBytesLocs := 0
-			for li, loc := range locs {
-				a := args[li*numUintsLocation : (li+1)*numUintsLocation]
-				a[0] = uint64(fieldsMap[loc.Field()] - 1)
-				a[1] = uint64(loc.Pos())   // #nosec G115 -- readLocation validates nonnegative int-sized locations.
-				a[2] = uint64(loc.Start()) // #nosec G115 -- readLocation validates nonnegative int-sized locations.
-				a[3] = uint64(loc.End())   // #nosec G115 -- readLocation validates nonnegative int-sized locations.
-				numBytesLocs += totalUvarintBytes(a[0], a[1], a[2], a[3])
-			}
-
-			err = locEncoder.Add(hitNewDocNum, uint64(numBytesLocs))
-			if err != nil {
-				return 0, 0, 0, nil, err
-			}
-
-			err = locEncoder.Add(hitNewDocNum, args...)
-			if err != nil {
-				return 0, 0, 0, nil, err
+			if err = addLocationRecords(hitNewDocNum, locEncoder, offEncoder); err != nil {
+				return 0, 0, 0, err
 			}
 		}
 
@@ -783,7 +789,7 @@ func mergeTermFreqNormLocs(fieldsMap map[string]uint16, postItr *PostingsIterato
 		next, err = postItr.Next()
 	}
 
-	return lastDocNum, lastFreq, lastNorm, bufLoc, err
+	return lastDocNum, lastFreq, lastNorm, err
 }
 
 func mergeStoredAndRemap(segments []*Segment, drops []*roaring.Bitmap,

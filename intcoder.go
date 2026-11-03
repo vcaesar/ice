@@ -45,13 +45,25 @@ type chunkedIntCoder struct {
 
 	buf        []byte
 	compressed []byte
+	rec        []byte // pending record, see recordVals
 
 	// bounds, when set, records per chunk the max freq and min norm bits of
 	// (freqHasLocs, normBits) values and writes them after the offsets
 	bounds   bool
 	maxFreqs []uint64
 	minNorms []uint64
+
+	// compact (version 6+) prefixes each chunk with chunkRaw or chunkS2
+	// and keeps it raw unless s2 saves at least a quarter; empty chunks
+	// take no bytes
+	compact bool
 }
+
+// chunk flag bytes of compact (version 6+) int coder chunks
+const (
+	chunkRaw byte = 0
+	chunkS2  byte = 1
+)
 
 // newChunkedIntCoder returns a new chunk int coder which packs data into
 // chunks based on the provided chunkSize and supports up to the specified
@@ -72,6 +84,7 @@ func newChunkedIntCoder(chunkSize, maxDocNum uint64) *chunkedIntCoder {
 func (c *chunkedIntCoder) Reset() {
 	c.final = c.final[:0]
 	c.chunkBuf.Reset()
+	c.rec = c.rec[:0]
 	c.currChunk = 0
 	for i := range c.chunkLens {
 		c.chunkLens[i] = 0
@@ -116,14 +129,9 @@ func (c *chunkedIntCoder) SetChunkSize(chunkSize, maxDocNum uint64) {
 // Add encodes the provided integers into the correct chunk for the provided
 // doc num.  You MUST call Add() with increasing docNums.
 func (c *chunkedIntCoder) Add(docNum uint64, vals ...uint64) error {
-	chunk := docNum / c.chunkSize
-	if chunk != c.currChunk {
-		// starting a new chunk
-		if err := c.Close(); err != nil {
-			return err
-		}
-		c.chunkBuf.Reset()
-		c.currChunk = chunk
+	chunk, err := c.enterChunk(docNum)
+	if err != nil {
+		return err
 	}
 	if c.bounds {
 		if len(vals) != freqNormVals {
@@ -147,13 +155,53 @@ func (c *chunkedIntCoder) Add(docNum uint64, vals ...uint64) error {
 	for _, val := range vals {
 		n += binary.PutUvarint(c.buf[n:], val)
 	}
-	_, err := c.chunkBuf.Write(c.buf[:n])
+	_, err = c.chunkBuf.Write(c.buf[:n])
+	return err
+}
+
+// enterChunk closes the current chunk when docNum is in another one and
+// returns the chunk of docNum.
+func (c *chunkedIntCoder) enterChunk(docNum uint64) (uint64, error) {
+	chunk := docNum / c.chunkSize
+	if chunk != c.currChunk {
+		// starting a new chunk
+		if err := c.Close(); err != nil {
+			return 0, err
+		}
+		c.chunkBuf.Reset()
+		c.currChunk = chunk
+	}
+	return chunk, nil
+}
+
+// recordVals appends vals to the pending record, which addRecord adds.
+func (c *chunkedIntCoder) recordVals(vals ...uint64) {
+	for _, v := range vals {
+		c.rec = binary.AppendUvarint(c.rec, v)
+	}
+}
+
+// addRecord adds the pending record, prefixed by its uvarint byte count,
+// for docNum, as Add, and clears it.
+func (c *chunkedIntCoder) addRecord(docNum uint64) error {
+	if _, err := c.enterChunk(docNum); err != nil {
+		return err
+	}
+	var n [binary.MaxVarintLen64]byte
+	if _, err := c.chunkBuf.Write(binary.AppendUvarint(n[:0], uint64(len(c.rec)))); err != nil {
+		return err
+	}
+	_, err := c.chunkBuf.Write(c.rec)
+	c.rec = c.rec[:0]
 	return err
 }
 
 // Close indicates you are done calling Add() this allows the final chunk
 // to be encoded.
 func (c *chunkedIntCoder) Close() error {
+	if c.compact {
+		return c.closeCompact()
+	}
 	var err error
 	c.compressed, err = compress.Compress(c.compressed[:cap(c.compressed)], c.chunkBuf.Bytes())
 	if err != nil {
@@ -161,6 +209,28 @@ func (c *chunkedIntCoder) Close() error {
 	}
 	c.chunkLens[c.currChunk] = uint64(len(c.compressed))
 	c.final = append(c.final, c.compressed...)
+	c.currChunk = uint64(cap(c.chunkLens)) // sentinel to detect double close
+	return nil
+}
+
+// closeCompact is Close for compact (version 6+) chunks: a flag byte, then
+// the s2 block when it saves at least a quarter, else the raw varints.
+func (c *chunkedIntCoder) closeCompact() error {
+	raw := c.chunkBuf.Bytes()
+	start := len(c.final)
+	if len(raw) > 0 {
+		var err error
+		c.compressed, err = compress.Compress(c.compressed[:cap(c.compressed)], raw)
+		if err != nil {
+			return err
+		}
+		if len(c.compressed)*4 <= len(raw)*3 {
+			c.final = append(append(c.final, chunkS2), c.compressed...)
+		} else {
+			c.final = append(append(c.final, chunkRaw), raw...)
+		}
+	}
+	c.chunkLens[c.currChunk] = uint64(len(c.final) - start)
 	c.currChunk = uint64(cap(c.chunkLens)) // sentinel to detect double close
 	return nil
 }

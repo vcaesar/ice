@@ -33,7 +33,7 @@ func TestIntDecoderHeaderBounds(t *testing.T) {
 		{"missing second offset", []byte{0, 2, 0x80, 1}, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := newChunkedIntDecoder(segment.NewDataBytes(tc.data), tc.offset, nil, false); err == nil {
+			if _, err := newChunkedIntDecoder(segment.NewDataBytes(tc.data), tc.offset, nil, false, false); err == nil {
 				t.Fatal("accepted invalid integer chunk header")
 			}
 		})
@@ -45,7 +45,7 @@ func TestIntDecoderShortHeaderAndReuse(t *testing.T) {
 	for _, offsets := range [][]byte{{0, 0}, {0}, {}, {0, 0, 0}} {
 		data := append(binary.AppendUvarint([]byte{0}, uint64(len(offsets))), offsets...)
 		var err error
-		decoder, err = newChunkedIntDecoder(segment.NewDataBytes(data), 1, decoder, false)
+		decoder, err = newChunkedIntDecoder(segment.NewDataBytes(data), 1, decoder, false, false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -53,7 +53,7 @@ func TestIntDecoderShortHeaderAndReuse(t *testing.T) {
 			t.Fatalf("incorrect decoded header: %+v", decoder)
 		}
 	}
-	decoder, err := newChunkedIntDecoder(nil, termNotEncoded, decoder, false)
+	decoder, err := newChunkedIntDecoder(nil, termNotEncoded, decoder, false, false)
 	if err != nil || len(decoder.chunkOffsets) != 0 || decoder.dataStartOffset != 0 {
 		t.Fatalf("incorrect absent header: %+v, %v", decoder, err)
 	}
@@ -292,15 +292,15 @@ func TestMergeDocumentNumberBounds(t *testing.T) {
 	for _, docNum := range []uint64{math.MaxUint32, math.MaxUint32 + 1} {
 		itr := &PostingsIterator{normBits1Hit: 1, includeFreqNorm: true}
 		bitmap := roaring.New()
-		lastDoc, freq, norm, locs, err := mergeTermFreqNormLocs(nil, itr, []uint64{docNum}, bitmap,
+		lastDoc, freq, norm, err := mergeTermFreqNormLocs(nil, itr, []uint64{docNum}, bitmap,
 			newChunkedIntCoder(uint64(math.MaxUint32), docNum),
 			newChunkedIntCoder(uint64(math.MaxUint32), docNum), nil, roaring.New())
 		if docNum == math.MaxUint32 {
 			if err != nil || !bitmap.Contains(math.MaxUint32) {
 				t.Fatalf("maximum document number rejected: %v", err)
 			}
-			if lastDoc != docNum || freq != 1 || norm != 1 || len(locs) != 0 {
-				t.Fatalf("incorrect merged posting: %d, %d, %d, %v", lastDoc, freq, norm, locs)
+			if lastDoc != docNum || freq != 1 || norm != 1 {
+				t.Fatalf("incorrect merged posting: %d, %d, %d", lastDoc, freq, norm)
 			}
 		} else if err == nil || !bitmap.IsEmpty() {
 			t.Fatalf("overflowing document number accepted: %v", err)

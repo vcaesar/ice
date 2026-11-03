@@ -27,8 +27,25 @@ import (
 	segment "github.com/vcaesar/bluge_segment_api"
 )
 
-// Version 5 adds per-chunk freq/norm bounds (block max) to postings.
-const Version uint32 = 5
+// Version 7 stores location start/end offsets apart from field and pos
+// (see versionSplitOffsets).
+// Version 6 stores freq/norm and location chunks raw unless s2 shrinks
+// them enough, and delta codes locations (see versionCompactPostings).
+// Version 5 added per-chunk freq/norm bounds (block max) to postings.
+const Version uint32 = 7
+
+// versionSplitOffsets is the first version whose location records hold
+// only (field, zigzag pos delta) per location, its (zigzag start delta,
+// end-start) going to a third chunk stream, the offsets, whose offset
+// follows the location offset in the postings header. A posting with
+// locations has one record in each stream: a uvarint byte count, then
+// the values.
+const versionSplitOffsets uint32 = 7
+
+// versionCompactPostings is the first version whose freq/norm and location
+// chunks start with a raw/s2 flag byte and whose locations store pos and
+// start as zigzag deltas from the previous location of the same posting.
+const versionCompactPostings uint32 = 6
 
 // versionBlockBounds is the first version whose freq/norm chunks store
 // per-chunk bounds.

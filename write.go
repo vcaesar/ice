@@ -61,7 +61,9 @@ func encodeStoredFieldValues(fieldID int,
 	return curr, data, nil
 }
 
-func writePostings(postings *roaring.Bitmap, tfEncoder, locEncoder *chunkedIntCoder,
+// writePostings writes the chunks of tfEncoder, locEncoder and, when not
+// nil (version 7+), offEncoder, then the postings header and bitmap.
+func writePostings(postings *roaring.Bitmap, tfEncoder, locEncoder, offEncoder *chunkedIntCoder,
 	use1HitEncoding func(uint64) (bool, uint64, uint64),
 	w *countHashWriter, bufMaxVarintLen64 []byte) (
 	offset uint64, err error) {
@@ -89,21 +91,17 @@ func writePostings(postings *roaring.Bitmap, tfEncoder, locEncoder *chunkedIntCo
 		return 0, err
 	}
 
+	var offOffset uint64
+	if offEncoder != nil {
+		if offOffset, err = offEncoder.writeAt(w); err != nil {
+			return 0, err
+		}
+	}
+
 	postingsOffset := uint64(w.Count()) // #nosec G115 -- countHashWriter checks overflow and counts nonnegative writes.
 
-	n := binary.PutUvarint(bufMaxVarintLen64, tfOffset)
-	_, err = w.Write(bufMaxVarintLen64[:n])
-	if err != nil {
-		return 0, err
-	}
-
-	if locOffset > 0 && tfOffset > 0 {
-		n = binary.PutUvarint(bufMaxVarintLen64, locOffset-tfOffset)
-	} else {
-		n = binary.PutUvarint(bufMaxVarintLen64, locOffset)
-	}
-	_, err = w.Write(bufMaxVarintLen64[:n])
-	if err != nil {
+	var header [3 * binary.MaxVarintLen64]byte
+	if _, err = w.Write(appendPostingsHeader(header[:0], tfOffset, locOffset, offOffset, offEncoder != nil)); err != nil {
 		return 0, err
 	}
 
@@ -115,23 +113,70 @@ func writePostings(postings *roaring.Bitmap, tfEncoder, locEncoder *chunkedIntCo
 	return postingsOffset, nil
 }
 
-// returns the total # of bytes needed to encode the given uint64's
-// into binary.PutUVarint() encoding
-func totalUvarintBytes(a, b, c, d uint64) (n int) {
-	n = numUvarintBytes(a)
-	n += numUvarintBytes(b)
-	n += numUvarintBytes(c)
-	n += numUvarintBytes(d)
-	return n
+// appendPostingsHeader appends the chunk offsets of a postings header:
+// tfOffset, then locOffset and, when split (version 7+), offOffset, each
+// relative to the one before when both are set.
+func appendPostingsHeader(h []byte, tfOffset, locOffset, offOffset uint64, split bool) []byte {
+	h = binary.AppendUvarint(h, tfOffset)
+	h = binary.AppendUvarint(h, relOffset(locOffset, tfOffset))
+	if split {
+		h = binary.AppendUvarint(h, relOffset(offOffset, locOffset))
+	}
+	return h
 }
 
-// returns # of bytes needed to encode x in binary.PutUvarint() encoding
-func numUvarintBytes(x uint64) (n int) {
-	for x >= 0x80 {
-		x >>= 7
-		n++
+// relOffset is offset relative to prev when both are set, else offset.
+func relOffset(offset, prev uint64) uint64 {
+	if offset > 0 && prev > 0 {
+		return offset - prev
 	}
-	return n + 1
+	return offset
+}
+
+// recordLocation appends the locationVals of a location to the pending
+// record of locEncoder, or, when offEncoder is not nil (version 7+), its
+// field and pos to locEncoder's and its start and end to offEncoder's.
+func recordLocation(locEncoder, offEncoder *chunkedIntCoder, fieldID, pos, start, end, prevPos, prevStart uint64) {
+	a, b, c, d := locationVals(locEncoder.compact, fieldID, pos, start, end, prevPos, prevStart)
+	if offEncoder == nil {
+		locEncoder.recordVals(a, b, c, d)
+		return
+	}
+	locEncoder.recordVals(a, b)
+	offEncoder.recordVals(c, d)
+}
+
+// addLocationRecords adds the records recordLocation built for docNum.
+func addLocationRecords(docNum uint64, locEncoder, offEncoder *chunkedIntCoder) error {
+	if err := locEncoder.addRecord(docNum); err != nil {
+		return err
+	}
+	if offEncoder != nil {
+		return offEncoder.addRecord(docNum)
+	}
+	return nil
+}
+
+// locationVals returns the four values stored for a location. Compact
+// (version 6+) segments store pos and start as zigzag deltas from the
+// previous location of the same posting (prevPos, prevStart; 0 for the
+// first) and end as the length end-start.
+func locationVals(compact bool, fieldID, pos, start, end, prevPos, prevStart uint64) (a, b, c, d uint64) {
+	if !compact {
+		return fieldID, pos, start, end
+	}
+	// #nosec G115 -- two's-complement deltas, inverted exactly by unzigzag.
+	return fieldID, zigzag(int64(pos - prevPos)), zigzag(int64(start - prevStart)), end - start
+}
+
+func zigzag(v int64) uint64 {
+	// #nosec G115 -- zigzag maps the full int64 range onto uint64.
+	return uint64((v << 1) ^ (v >> 63))
+}
+
+func unzigzag(v uint64) int64 {
+	// #nosec G115 -- inverse of zigzag.
+	return int64(v>>1) ^ -int64(v&1)
 }
 
 // writes out the length of the roaring bitmap in bytes as varint
