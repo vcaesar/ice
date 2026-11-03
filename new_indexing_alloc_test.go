@@ -140,9 +140,7 @@ func TestIndexingSingletonsMatchBitmapBuild(t *testing.T) {
 				if _, _, err := s.writeDicts(); err != nil {
 					t.Fatal(err)
 				}
-				if err := s.reset(); err != nil {
-					t.Fatal(err)
-				}
+				s.reset()
 				return buf.Bytes()
 			}
 			if lazy, eager := build(false), build(true); !bytes.Equal(lazy, eager) {
@@ -186,16 +184,16 @@ func TestIndexingDocValuesIsolation(t *testing.T) {
 		{"_id", [][]string{nil, nil, nil}},
 	} {
 		t.Run(tc.field, func(t *testing.T) {
-			r, err := s.DocumentValueReader([]string{tc.field})
-			if err != nil {
-				t.Fatal(err)
+			r, rErr := s.DocumentValueReader([]string{tc.field})
+			if rErr != nil {
+				t.Fatal(rErr)
 			}
 			for docNum, want := range tc.want {
 				var got []string
-				if err := r.VisitDocumentValues(uint64(docNum), func(_ string, term []byte) {
+				if visitErr := r.VisitDocumentValues(uint64(docNum), func(_ string, term []byte) {
 					got = append(got, string(term))
-				}); err != nil {
-					t.Fatal(err)
+				}); visitErr != nil {
+					t.Fatal(visitErr)
 				}
 				if !reflect.DeepEqual(got, want) {
 					t.Fatalf("doc %d values %v, want %v", docNum, got, want)
@@ -262,16 +260,14 @@ func TestIndexingSingletonBitmapReuse(t *testing.T) {
 			if bitmap := s.Postings[pid]; bitmap != nil {
 				want := uint64(1)
 				if step == 1 {
-					want = uint64(count)
+					want = uint64(count) // #nosec G115 -- count is a small test document count.
 				}
 				if bitmap.GetCardinality() != want || !bitmap.Contains(uint32(i)) {
 					t.Fatalf("step %d term %q stale bitmap %v", step, term, bitmap)
 				}
 			}
 		}
-		if err := s.reset(); err != nil {
-			t.Fatal(err)
-		}
+		s.reset()
 	}
 }
 
@@ -376,5 +372,55 @@ func BenchmarkIndexingSingletonPostings(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+// The postings coders a pooled interim reuses must keep nothing of the
+// segments built before: whatever was built first, documents encode to the
+// bytes a fresh interim writes for them, at every version.
+func TestNewReusedCodersEncodeAlike(t *testing.T) {
+	docs := func(n int) []segment.Document {
+		rv := make([]segment.Document, n)
+		for i := range rv {
+			rv[i] = &FakeDocument{
+				NewFakeField("_id", strconv.Itoa(i), true, false, false),
+				NewFakeField("body", "common search w"+strconv.Itoa(i%13)+" engine", false, true, false),
+			}
+		}
+		return rv
+	}
+	encode := func(ver uint32, n int) []byte {
+		prev := writeVersion
+		writeVersion = ver
+		defer func() { writeVersion = prev }()
+		seg, _, err := newWithChunkMode(docs(n), encodeNorm, chunkModeV1, DefaultOptions())
+		if err != nil {
+			t.Fatal(err)
+		}
+		var buf bytes.Buffer
+		if _, err := seg.(*Segment).WriteTo(&buf, nil); err != nil {
+			t.Fatal(err)
+		}
+		return buf.Bytes()
+	}
+	type build struct {
+		ver uint32
+		n   int // 5000 docs take several dict workers
+	}
+	builds := []build{{Version, 300}, {Version, 5000}, {Version, 3}, {versionNumericDocValues, 5000},
+		{versionCompactPostings, 300}, {Version, 5000}, {Version, 300}, {versionNumericDocValues, 300}}
+	want := map[build][]byte{}
+	for _, b := range builds {
+		if want[b] == nil {
+			for range 16 { // drain the pool: the next build gets a fresh interim
+				interimPool.Get()
+			}
+			want[b] = encode(b.ver, b.n)
+		}
+	}
+	for _, b := range builds {
+		if got := encode(b.ver, b.n); !bytes.Equal(got, want[b]) {
+			t.Fatalf("v%d, %d docs: reused interim wrote %d bytes unlike a fresh one's %d", b.ver, b.n, len(got), len(want[b]))
+		}
 	}
 }

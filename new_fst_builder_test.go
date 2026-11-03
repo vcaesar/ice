@@ -67,7 +67,7 @@ func checkTerms(t *testing.T, seg segment.Segment, n int) {
 		}
 		if field == "body" {
 			pl, err := dict.PostingsList([]byte("shared"), nil, nil)
-			if err != nil || pl.Count() != uint64(n) {
+			if err != nil || pl.Count() != uint64(n) { // #nosec G115 -- n is a document count.
 				t.Fatalf("shared: count %v err %v", pl, err)
 			}
 		}
@@ -108,7 +108,7 @@ func TestFSTBuilderSmallAndBulk(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := t.TempDir() + "/merged.ice"
-	if _, err := mergeSegments([]segment.Segment{a, b}, []*roaring.Bitmap{nil, nil}, path); err != nil {
+	if _, err = mergeSegments([]segment.Segment{a, b}, []*roaring.Bitmap{nil, nil}, path); err != nil {
 		t.Fatal(err)
 	}
 	merged, closeF, err := openFromFile(path)
@@ -116,8 +116,8 @@ func TestFSTBuilderSmallAndBulk(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() {
-		if err := closeF(); err != nil {
-			t.Error(err)
+		if closeErr := closeF(); closeErr != nil {
+			t.Error(closeErr)
 		}
 	}()
 	dict, err := merged.Dictionary("body")

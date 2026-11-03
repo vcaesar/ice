@@ -777,7 +777,8 @@ func mergeTermFreqNormLocs(fieldsMap map[string]uint16, postItr *PostingsIterato
 					uint64(fieldsMap[loc.Field()]-1), pos, start, end, prevPos, prevStart)
 				prevPos, prevStart = pos, start
 			}
-			if err = addLocationRecords(hitNewDocNum, locEncoder, offEncoder); err != nil {
+			err = addLocationRecords(hitNewDocNum, locEncoder, offEncoder)
+			if err != nil {
 				return 0, 0, 0, err
 			}
 		}

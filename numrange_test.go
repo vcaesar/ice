@@ -6,6 +6,8 @@ import (
 	"slices"
 	"strconv"
 	"testing"
+
+	segment "github.com/vcaesar/bluge_segment_api"
 )
 
 // NumericRange must match a value-by-value filter over dense (one value per
@@ -81,13 +83,13 @@ func TestVisitNumericColumn(t *testing.T) {
 		if n != wantN || sum != wantSum {
 			t.Fatalf("multi=%v: n=%d sum=%d want %d %d", multi, n, sum, wantN, wantSum)
 		}
-		if ok, _ := seg.VisitNumericColumn("_id", nil); ok {
+		if colOK, _ := seg.VisitNumericColumn("_id", nil); colOK {
 			t.Fatal("non-numeric field reported a column")
 		}
 		// the block scan yields the same (doc, value) sequence
 		var perValue, perBlock [][2]int64
-		if _, err := seg.VisitNumericColumn("price", func(doc uint64, v int64) error {
-			perValue = append(perValue, [2]int64{int64(doc), v})
+		if _, err = seg.VisitNumericColumn("price", func(doc uint64, v int64) error {
+			perValue = append(perValue, [2]int64{int64(doc), v}) // #nosec G115 -- test doc numbers are small.
 			return nil
 		}); err != nil {
 			t.Fatal(err)
@@ -101,7 +103,7 @@ func TestVisitNumericColumn(t *testing.T) {
 				if docs != nil {
 					doc = docs[i]
 				}
-				perBlock = append(perBlock, [2]int64{int64(doc), v})
+				perBlock = append(perBlock, [2]int64{int64(doc), v}) // #nosec G115 -- test doc numbers are small.
 			}
 			return nil
 		})
@@ -126,12 +128,26 @@ func TestDecodeNumericBlockWidths(t *testing.T) {
 		want := []int64{tc.minVal, tc.maxVal, tc.minVal + (tc.maxVal-tc.minVal)/3}
 		var data []byte
 		for _, v := range want {
+			// #nosec G115 -- two's-complement offset from minVal, as the encoder writes it.
 			data = binary.LittleEndian.AppendUint64(data, uint64(v)-uint64(tc.minVal))[:len(data)+int(tc.width)]
 		}
 		got := make([]int64, len(want))
 		decodeNumericBlock(got, data, tc.width, tc.minVal)
 		if !slices.Equal(got, want) {
 			t.Fatalf("width %d: got %v want %v", tc.width, got, want)
+		}
+	}
+}
+
+// A block that fails to load must fail again on the next visit, not pass
+// from the cursor's cache as a block without values.
+func TestNumericCursorLoadErrorNotCached(t *testing.T) {
+	s := &Segment{data: segment.NewDataBytes(make([]byte, 4))}
+	col := &numericColumn{field: "n", dataEnd: 64, blocks: []numericBlockMeta{{count: 2, width: widthByte, max: 1}}}
+	cur := newNumericColumnCursor(col)
+	for range 2 {
+		if err := cur.visit(s, 0, func(string, int64) { t.Fatal("value from a failed block") }); err == nil {
+			t.Fatal("visit of an out of range block succeeded")
 		}
 	}
 }

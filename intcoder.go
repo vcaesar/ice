@@ -230,8 +230,8 @@ func (c *chunkedIntCoder) closeCompact() error {
 			c.final = append(append(c.final, chunkRaw), raw...)
 		}
 	}
-	c.chunkLens[c.currChunk] = uint64(len(c.final) - start)
-	c.currChunk = uint64(cap(c.chunkLens)) // sentinel to detect double close
+	c.chunkLens[c.currChunk] = uint64(len(c.final) - start) // #nosec G115 -- final only grows past start.
+	c.currChunk = uint64(cap(c.chunkLens))                  // sentinel to detect double close
 	return nil
 }
 

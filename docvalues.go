@@ -290,6 +290,8 @@ func (di *docValueReader) getDocValueLocs(docNum uint64) (start, end uint64) {
 
 // VisitDocumentFieldTerms is an implementation of the
 // DocumentFieldTermVisitable interface
+//
+//nolint:gocyclo // hot doc values path, kept inline for speed.
 func (s *Segment) visitDocumentFieldTerms(localDocNum uint64, fields []string,
 	visitor segment.DocumentValueVisitor, numVisitor NumericValueVisitor, dvs *docVisitState) (
 	*docVisitState, error) {

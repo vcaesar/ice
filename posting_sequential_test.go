@@ -24,6 +24,7 @@ import (
 	segment "github.com/vcaesar/bluge_segment_api"
 )
 
+//nolint:gocyclo,funlen // one table of read paths compared side by side.
 func TestSequentialLocations(t *testing.T) {
 	const count = 160
 	docs := make([]segment.Document, count)

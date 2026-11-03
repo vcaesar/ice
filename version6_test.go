@@ -50,7 +50,7 @@ func buildLocSegment(t *testing.T, numDocs int, ver uint32) *Segment {
 		t.Fatal(err)
 	}
 	path := filepath.Join(t.TempDir(), "seg.ice")
-	if err := persistToFile(mem.(*Segment), path); err != nil {
+	if err = persistToFile(mem.(*Segment), path); err != nil {
 		t.Fatal(err)
 	}
 	seg, closeF, err := openFromFile(path)

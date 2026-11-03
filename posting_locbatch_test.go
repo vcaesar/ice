@@ -90,7 +90,7 @@ func TestNextLocBatchMatchesNext(t *testing.T) {
 			var wantSub []locPosting
 			for k, p := range want {
 				if k%3 != 1 {
-					keep.Add(uint32(p.doc))
+					keep.Add(uint32(p.doc)) // #nosec G115 -- test doc numbers are small.
 					wantSub = append(wantSub, p)
 				}
 			}

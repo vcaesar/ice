@@ -35,7 +35,9 @@ var newSegmentBufferNumResultsFactor = 1.0
 var newSegmentBufferAvgBytesPerDocFactor = 1.0
 
 // New creates an in-memory implementation
-// of a segment for the source documents
+// of a segment for the source documents. Large batches are converted by
+// several goroutines at once, so the documents must be safe to visit, and
+// normCalc to call, concurrently.
 func New(results []segment.Document, normCalc func(string, int) float32) (
 	segment.Segment, uint64, error) {
 	return DefaultOptions().New(results, normCalc)
@@ -87,7 +89,8 @@ func newWithChunkMode(results []segment.Document, normCalc func(string, int) flo
 		s.FieldDocs, s.FieldFreqs,
 		dictOffsets, storedFieldChunkOffsets, opts)
 
-	if err == nil && s.reset() == nil {
+	if err == nil {
+		s.reset()
 		s.lastNumDocs = len(results)
 		s.lastOutSize = len(br.Bytes())
 		interimPool.Put(s)
@@ -216,7 +219,7 @@ type interim struct {
 	countLoc    func(segment.Location)
 }
 
-func (s *interim) reset() (err error) {
+func (s *interim) reset() {
 	s.results = nil
 	s.chunkMode = 0
 	s.w = nil
@@ -273,8 +276,6 @@ func (s *interim) reset() (err error) {
 
 	s.docTimeMin = 0
 	s.docTimeMax = 0
-
-	return err
 }
 
 func (s *interim) grabBuf(size int) []byte {
@@ -383,8 +384,8 @@ func (s *interim) convert() (f *footer, dictOffsets, storedFieldChunkOffsets []u
 		}()
 		processErr := s.processFieldsParallel(min(runtime.GOMAXPROCS(0), len(s.FieldsInv)))
 		<-done
-		if err = errors.Join(processErr, storedErr); err != nil {
-			return nil, nil, nil, err
+		if joinErr := errors.Join(processErr, storedErr); joinErr != nil {
+			return nil, nil, nil, joinErr
 		}
 	} else {
 		if processErr := s.processDocumentsSerial(); processErr != nil {
@@ -1206,10 +1207,23 @@ type dictWorker struct {
 	small, bulk *vellum.Builder // reused FST builders, see buildFST
 }
 
+// reuseIntCoder returns c reset, keeping its buffers, or a new coder when
+// c is nil, for doc numbers up to maxDocNum.
+func reuseIntCoder(c *chunkedIntCoder, maxDocNum uint64) *chunkedIntCoder {
+	if c == nil {
+		return newChunkedIntCoder(uint64(legacyChunkMode), maxDocNum)
+	}
+	c.Reset()
+	c.SetChunkSize(uint64(legacyChunkMode), maxDocNum)
+	return c
+}
+
 // writeDicts writes all fields' postings, then each field's FST and doc
 // values. Encoding the postings and building the FSTs are independent per
 // field and run one field per goroutine for large batches; only placing
 // the bytes, which fixes the absolute offsets, is serial.
+//
+//nolint:gocyclo,funlen // linear setup and write steps; splitting adds no clarity.
 func (s *interim) writeDicts() (fdvIndexOffset uint64, dictOffsets []uint64, err error) {
 	numFields := len(s.FieldsInv)
 	dictOffsets = make([]uint64, numFields)
@@ -1231,37 +1245,46 @@ func (s *interim) writeDicts() (fdvIndexOffset uint64, dictOffsets []uint64, err
 	for _, w := range s.dictWorkers[:workers] {
 		// #nosec G115 -- convert calls writeDicts only for nonempty results.
 		maxDocNum := uint64(len(s.results) - 1)
-		w.tf = newChunkedIntCoder(uint64(legacyChunkMode), maxDocNum)
-		if writeVersion >= versionBlockBounds {
-			w.tf.trackBounds()
+		// the coders of a pooled interim are reused with their buffers
+		if bounds := writeVersion >= versionBlockBounds; w.tf == nil || w.tf.bounds != bounds {
+			w.tf = newChunkedIntCoder(uint64(legacyChunkMode), maxDocNum)
+			if bounds {
+				w.tf.trackBounds()
+			}
+		} else {
+			w.tf = reuseIntCoder(w.tf, maxDocNum)
 		}
-		w.loc = newChunkedIntCoder(uint64(legacyChunkMode), maxDocNum)
+		w.loc = reuseIntCoder(w.loc, maxDocNum)
 		w.tf.compact = writeVersion >= versionCompactPostings
 		w.loc.compact = w.tf.compact
-		w.off = nil
 		if writeVersion >= versionSplitOffsets {
-			w.off = newChunkedIntCoder(uint64(legacyChunkMode), maxDocNum)
+			w.off = reuseIntCoder(w.off, maxDocNum)
 			w.off.compact = true
+		} else {
+			w.off = nil
 		}
 	}
 
-	if err = s.eachField(workers, s.encodeField); err != nil {
+	err = s.eachField(workers, s.encodeField)
+	if err != nil {
 		return 0, nil, err
 	}
 	for f := range s.fieldDicts {
-		if err = s.placePostings(&s.fieldDicts[f]); err != nil {
+		err = s.placePostings(&s.fieldDicts[f])
+		if err != nil {
 			return 0, nil, err
 		}
 	}
-	if err = s.eachField(workers, s.buildFST); err != nil {
+	err = s.eachField(workers, s.buildFST)
+	if err != nil {
 		return 0, nil, err
 	}
 
 	buf := s.grabBuf(binary.MaxVarintLen64)
 	for f := range s.fieldDicts {
 		fd := &s.fieldDicts[f]
-		dictOffsets[f] = uint64(s.w.Count()) // #nosec G115 -- countHashWriter checks overflow and counts nonnegative writes.
-		n := binary.PutUvarint(buf, uint64(fd.fst.Len()))
+		dictOffsets[f] = uint64(s.w.Count())              // #nosec G115 -- countHashWriter checks overflow and counts nonnegative writes.
+		n := binary.PutUvarint(buf, uint64(fd.fst.Len())) // #nosec G115 -- buffer length is nonnegative.
 		if _, err = s.w.Write(buf[:n]); err != nil {
 			return 0, nil, err
 		}
@@ -1477,7 +1500,8 @@ func (s *interim) buildFST(w *dictWorker, fieldID int) error {
 		return err
 	}
 	for i, term := range s.DictKeys[fieldID] {
-		if err = (*b).Insert([]byte(term), fd.terms[i].val); err != nil {
+		err = (*b).Insert([]byte(term), fd.terms[i].val)
+		if err != nil {
 			return err
 		}
 	}
@@ -1499,12 +1523,13 @@ func (s *interim) writeFieldDocValues(w *countHashWriter, fieldID int, docTermMa
 		}
 		nw := *numericWriter
 		for _, nv := range s.NumericValues[fieldID] {
-			if err := nw.Add(nv.docNum, nv.val); err != nil {
+			err = nw.Add(nv.docNum, nv.val)
+			if err != nil {
 				return 0, 0, err
 			}
 		}
 		start = uint64(w.Count()) // #nosec G115 -- countHashWriter checks overflow and counts nonnegative writes.
-		if _, err := nw.Write(w); err != nil {
+		if _, err = nw.Write(w); err != nil {
 			return 0, 0, err
 		}
 		return start, uint64(w.Count()), nil // #nosec G115 -- see above.
@@ -1521,12 +1546,14 @@ func (s *interim) writeFieldDocValues(w *countHashWriter, fieldID int, docTermMa
 	fdvEncoder := newChunkedContentCoder(chunkSize, uint64(len(s.results)-1), w, false)
 	for docNum, docTerms := range docTermMap {
 		if len(docTerms) > 0 {
-			if err = fdvEncoder.Add(uint64(docNum), docTerms); err != nil {
+			err = fdvEncoder.Add(uint64(docNum), docTerms)
+			if err != nil {
 				return 0, 0, err
 			}
 		}
 	}
-	if err = fdvEncoder.Close(); err != nil {
+	err = fdvEncoder.Close()
+	if err != nil {
 		return 0, 0, err
 	}
 	start = uint64(w.Count()) // #nosec G115 -- countHashWriter checks overflow and counts nonnegative writes.
@@ -1540,6 +1567,8 @@ func (s *interim) writeFieldDocValues(w *countHashWriter, fieldID int, docTermMa
 // tfEncoder, locEncoder and offEncoder (nil before version 7) and returns
 // its bitmap, or, when oneHit, its "1-hit" dictionary value with the
 // coders untouched.
+//
+//nolint:gocyclo,funlen // hot encode path, kept inline for speed.
 func (s *interim) encodeTermPostings(docTermMap [][]byte, dict map[string]uint64, term string,
 	tfEncoder, locEncoder, offEncoder *chunkedIntCoder) (val uint64, oneHit bool, postingsBS *roaring.Bitmap, err error) {
 	pid := dict[term] - 1
@@ -1609,7 +1638,8 @@ func (s *interim) encodeTermPostings(docTermMap [][]byte, dict map[string]uint64
 					uint64(loc.fieldID), loc.pos, loc.start, loc.end, prevPos, prevStart)
 				prevPos, prevStart = loc.pos, loc.start
 			}
-			if err = addLocationRecords(docNum, locEncoder, offEncoder); err != nil {
+			err = addLocationRecords(docNum, locEncoder, offEncoder)
+			if err != nil {
 				return 0, false, nil, err
 			}
 

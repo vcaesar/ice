@@ -35,9 +35,9 @@ func TestNew1HitEncoding(t *testing.T) {
 		{"shared", false, []uint64{0, 1}, 0, false},
 		{"pos", false, []uint64{2}, 1, true},
 	} {
-		pl, err := dict.postingsList([]byte(tc.term), nil, nil)
-		if err != nil {
-			t.Fatal(err)
+		pl, plErr := dict.postingsList([]byte(tc.term), nil, nil)
+		if plErr != nil {
+			t.Fatal(plErr)
 		}
 		if got := pl.normBits1Hit != 0; got != tc.oneHit {
 			t.Fatalf("%s: 1-hit=%v want %v", tc.term, got, tc.oneHit)
@@ -45,14 +45,14 @@ func TestNew1HitEncoding(t *testing.T) {
 		if pl.Count() != uint64(len(tc.docs)) {
 			t.Fatalf("%s: count %d", tc.term, pl.Count())
 		}
-		it, err := pl.Iterator(true, true, true, nil)
-		if err != nil {
-			t.Fatal(err)
+		it, itErr := pl.Iterator(true, true, true, nil)
+		if itErr != nil {
+			t.Fatal(itErr)
 		}
 		var got []uint64
-		for p, err := it.Next(); p != nil || err != nil; p, err = it.Next() {
-			if err != nil {
-				t.Fatal(err)
+		for p, nextErr := it.Next(); p != nil || nextErr != nil; p, nextErr = it.Next() {
+			if nextErr != nil {
+				t.Fatal(nextErr)
 			}
 			got = append(got, p.Number())
 			if p.Frequency() != 1 {

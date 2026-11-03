@@ -581,6 +581,7 @@ func (i *PostingsIterator) nextAtOrAfter(atOrAfter uint64) (segment.Posting, err
 	return i.readPosting(docNum)
 }
 
+//nolint:gocyclo,funlen // hot decode path, kept inline for speed.
 func (i *PostingsIterator) readPosting(docNum uint64) (segment.Posting, error) {
 	i.next = Posting{} // clear the struct
 	rv := &i.next
@@ -621,6 +622,7 @@ func (i *PostingsIterator) readPosting(docNum uint64) (segment.Posting, error) {
 				}
 				pos, start, end := int(b[1]), int(b[2]), int(b[3])
 				if i.postings.compact() {
+					// #nosec G115 -- pos and start are one-byte values.
 					pos, start = int(unzigzag(uint64(pos))), int(unzigzag(uint64(start)))
 					end += start
 				}
@@ -990,7 +992,8 @@ func (i *PostingsIterator) NextLocBatch(docs []uint64, freqs []int, norms []floa
 		return n, fields, locs, err
 	}
 	for k := range n {
-		if err = i.LoadOffsets(offs[k], locs[3*lo:3*ends[k]]); err != nil {
+		err = i.LoadOffsets(offs[k], locs[3*lo:3*ends[k]])
+		if err != nil {
 			return n, fields, locs, err
 		}
 		lo = ends[k]
@@ -1003,6 +1006,8 @@ func (i *PostingsIterator) NextLocBatch(docs []uint64, freqs []int, norms []floa
 // that LoadOffsets fills them in with, until the iterator is reused. offs
 // must be as long as docs. Version 7+ segments, which keep the offsets
 // apart, read them only when asked.
+//
+//nolint:gocyclo // hot decode path, kept inline for speed.
 func (i *PostingsIterator) NextPosBatch(docs []uint64, freqs []int, norms []float64, ends []int, offs []uint64,
 	fields []string, locs []int) (n int, fieldsOut []string, locsOut []int, err error) {
 	fast := i.includeFreqNorm && i.includeLocs && i.normBits1Hit == 0 && i.postings != nil
@@ -1014,7 +1019,8 @@ func (i *PostingsIterator) NextPosBatch(docs []uint64, freqs []int, norms []floa
 	for n < len(docs) {
 		if !fast || !i.hasLast || i.Actual == nil {
 			// first posting, or a list the sequential path does not handle
-			p, err := i.Next()
+			var p segment.Posting
+			p, err = i.Next()
 			if err != nil || p == nil {
 				return n, fields, locs, err
 			}
@@ -1034,7 +1040,8 @@ func (i *PostingsIterator) NextPosBatch(docs []uint64, freqs []int, norms []floa
 		// same sequential-read test as Next
 		if d <= i.lastDoc || uint64(d) >= i.chunkEnd ||
 			(i.postings.postings != i.ActualBM && d != i.lastDoc+1) {
-			if err := i.seekFreqNorm(d, i.chunkOf(d)); err != nil {
+			err = i.seekFreqNorm(d, i.chunkOf(d))
+			if err != nil {
 				return n, fields, locs, err
 			}
 		} else {
@@ -1064,6 +1071,7 @@ func (i *PostingsIterator) NextPosBatch(docs []uint64, freqs []int, norms []floa
 				// one location of four one-byte varints, as readPosting
 				f, p, st, e := int(S[c+1]), int(S[c+2]), int(S[c+3]), int(S[c+4])
 				if compact {
+					// #nosec G115 -- p and st are one-byte values.
 					p, st = int(unzigzag(uint64(p))), int(unzigzag(uint64(st)))
 					e += st
 				}
@@ -1094,7 +1102,7 @@ func (i *PostingsIterator) NextPosBatch(docs []uint64, freqs []int, norms []floa
 // byte, at a posting with other than one location, and, on a subset list
 // (deletions or a conjunction's ReplaceActual), at a skipped posting.
 func (i *PostingsIterator) nextLocRun(n int, docs []uint64, freqs []int, norms []float64, ends []int, offs []uint64,
-	fields []string, locs []int, fieldsInv []string, compact bool) (int, []string, []int) {
+	fields []string, locs []int, fieldsInv []string, compact bool) (nOut int, fieldsOut []string, locsOut []int) {
 	it, ok := i.Actual.(*roaring.IntIterator) // concrete calls in the loop below
 	if !ok {
 		return n, fields, locs
@@ -1116,6 +1124,7 @@ func (i *PostingsIterator) nextLocRun(n int, docs []uint64, freqs []int, norms [
 		}
 		f, p, st, e := int(lS[lc+1]), int(lS[lc+2]), int(lS[lc+3]), int(lS[lc+4])
 		if compact {
+			// #nosec G115 -- p and st are one-byte values.
 			p, st = int(unzigzag(uint64(p))), int(unzigzag(uint64(st)))
 			e += st
 		}
@@ -1138,7 +1147,7 @@ func (i *PostingsIterator) nextLocRun(n int, docs []uint64, freqs []int, norms [
 // nextPosRun is nextLocRun for version 7+ records, stopping at a posting
 // with other than one location of a one-byte field and pos: record 2, f, p.
 func (i *PostingsIterator) nextPosRun(n int, docs []uint64, freqs []int, norms []float64, ends []int, offs []uint64,
-	fields []string, locs []int, fieldsInv []string) (int, []string, []int) {
+	fields []string, locs []int, fieldsInv []string) (nOut int, fieldsOut []string, locsOut []int) {
 	it, ok := i.Actual.(*roaring.IntIterator) // concrete calls in the loop below
 	if !ok {
 		return n, fields, locs
@@ -1176,14 +1185,19 @@ func (i *PostingsIterator) nextPosRun(n int, docs []uint64, freqs []int, norms [
 	return n, fields, locs
 }
 
+// handleChunkShift places the chunk number in the high half of an offsets
+// handle, above the record number.
+const handleChunkShift = 32
+
 // recHandle is the offsets handle of the next location record.
 func (i *PostingsIterator) recHandle() uint64 {
-	return uint64(i.currChunk)<<32 | uint64(i.locRec)
+	return uint64(i.currChunk)<<handleChunkShift | uint64(i.locRec)
 }
 
 // appendSplitLocs is appendLocs for a version 7+ record, which holds the
 // field and pos of each location: start and end are left zero.
-func (i *PostingsIterator) appendSplitLocs(freq int, fields []string, locs []int) ([]string, []int, error) {
+func (i *PostingsIterator) appendSplitLocs(freq int, fields []string, locs []int) (
+	fieldsOut []string, locsOut []int, err error) {
 	r := i.locReader.r
 	numLocsBytes, c, ok := uvarintAt(r.S, r.C)
 	if !ok {
@@ -1235,7 +1249,8 @@ func (i *PostingsIterator) readSplitLocs(rv *Posting) error {
 	if i.splitFields, i.splitLocs, err = i.appendSplitLocs(rv.freq, i.splitFields[:0], i.splitLocs[:0]); err != nil {
 		return err
 	}
-	if err = i.LoadOffsets(h, i.splitLocs); err != nil {
+	err = i.LoadOffsets(h, i.splitLocs)
+	if err != nil {
 		return err
 	}
 	n := len(i.splitFields)
@@ -1310,7 +1325,7 @@ func (i *PostingsIterator) seekOffsets(h uint64) (end int, err error) {
 		}
 		i.offInit = true
 	}
-	chunk, rec := uint32(h>>32), uint32(h) // #nosec G115 -- a handle packs two uint32 halves.
+	chunk, rec := uint32(h>>handleChunkShift), uint32(h) // #nosec G115 -- a handle packs two uint32 halves.
 	if !i.offLoaded || i.offChunk != chunk || i.offRec > rec {
 		if err = i.offReader.loadChunk(int(chunk)); err != nil {
 			return 0, fmt.Errorf("error loading offsets chunk: %v", err)
@@ -1338,20 +1353,21 @@ func (i *PostingsIterator) seekOffsets(h uint64) (end int, err error) {
 
 // uvarintAt decodes the varint at S[c:] and returns it with the offset
 // past it; ok is false when it is truncated or overflows.
-func uvarintAt(S []byte, c int) (v uint64, next int, ok bool) {
-	if c < len(S) && S[c] < lastByte {
-		return uint64(S[c]), c + 1, true
+func uvarintAt(b []byte, c int) (v uint64, next int, ok bool) {
+	if c < len(b) && b[c] < lastByte {
+		return uint64(b[c]), c + 1, true
 	}
-	if c >= len(S) {
+	if c >= len(b) {
 		return 0, c, false
 	}
-	v, k := binary.Uvarint(S[c:])
+	v, k := binary.Uvarint(b[c:])
 	return v, c + k, k > 0
 }
 
 // appendLocs reads the location record of a posting with frequency freq
 // and appends its locations to fields and locs, as NextLocBatch.
-func (i *PostingsIterator) appendLocs(freq int, fields []string, locs []int) ([]string, []int, error) {
+func (i *PostingsIterator) appendLocs(freq int, fields []string, locs []int) (
+	fieldsOut []string, locsOut []int, err error) {
 	r := i.locReader.r
 	S, c := r.S, r.C
 	var numLocsBytes uint64

@@ -77,7 +77,7 @@ func buildSegment(t *testing.T, docs []segment.Document, ver uint32) *Segment {
 		t.Fatal(err)
 	}
 	path := filepath.Join(t.TempDir(), "seg.ice")
-	if err := persistToFile(mem.(*Segment), path); err != nil {
+	if err = persistToFile(mem.(*Segment), path); err != nil {
 		t.Fatal(err)
 	}
 	seg, closeF, err := openFromFile(path)
@@ -149,6 +149,8 @@ func posBatchPostings(t *testing.T, it *PostingsIterator, size int) (rv []locPos
 
 // Version 7 must read back exactly what version 6 stores, through Next,
 // NextLocBatch and NextPosBatch with lazily loaded offsets.
+//
+//nolint:gocyclo // one table of read paths compared side by side.
 func TestVersion7MatchesVersion6(t *testing.T) {
 	docs := splitDocs(2500)
 	v6 := buildSegment(t, docs, versionCompactPostings)
@@ -183,7 +185,7 @@ func TestVersion7MatchesVersion6(t *testing.T) {
 		var wantSub []locPosting
 		for k, p := range want {
 			if k%3 != 1 {
-				keep.Add(uint32(p.doc))
+				keep.Add(uint32(p.doc)) // #nosec G115 -- test doc numbers are small.
 				wantSub = append(wantSub, p)
 			}
 		}
@@ -336,7 +338,7 @@ func offsetsChunk(t *testing.T) (data []byte, flagAt int) {
 		t.Fatal(err)
 	}
 	var buf bytes.Buffer
-	if _, err := mem.(*Segment).WriteTo(&buf, nil); err != nil {
+	if _, err = mem.(*Segment).WriteTo(&buf, nil); err != nil {
 		t.Fatal(err)
 	}
 	seg, err := load(segment.NewDataBytes(buf.Bytes()), DefaultOptions())
@@ -481,6 +483,7 @@ func TestVersion7SplitsLocationBytes(t *testing.T) {
 	}
 }
 
+//nolint:unparam // field names the dictionary; callers happen to share one.
 func postingsList(tb testing.TB, seg *Segment, field, term string) *PostingsList {
 	tb.Helper()
 	dict, err := seg.Dictionary(field)
