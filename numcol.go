@@ -36,7 +36,7 @@ type NumericField = segment.NumericField
 //	               [docDelta uvarint]*count (omitted when dense)
 //	               [count * width bytes little-endian of uint64(v)-uint64(min)]
 //	block index  – per block: [count uvarint] and, when count > 0,
-//	               [dense byte][min zigzag][max zigzag][width byte][dataOffset uvarint]
+//	               [dataOffset uvarint][dense byte][min zigzag][max zigzag][width byte]
 //	trailer      – [blockIndexOffset u64][numBlocks u64], both big endian
 //
 // Doc numbers repeat for multi-valued fields; "dense" means the block holds
@@ -333,8 +333,14 @@ func newNumericColumnCursor(col *numericColumn) *numericColumnCursor {
 	return &numericColumnCursor{col: col, block: math.MaxUint64}
 }
 
-func (c *numericColumnCursor) loadBlock(s *Segment, block uint64) error {
+func (c *numericColumnCursor) loadBlock(s *Segment, block uint64) (err error) {
 	c.block = block
+	defer func() {
+		if err != nil {
+			// a failed block must not pass, from the cache, as empty
+			c.block = math.MaxUint64
+		}
+	}()
 	c.pos = 0
 	c.docs = c.docs[:0]
 	c.vals = c.vals[:0]
