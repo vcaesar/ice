@@ -49,7 +49,7 @@ func builderBytes(t *testing.T, docs []segment.Document) []byte {
 		t.Fatal(err)
 	}
 	out := segmentBytes(t, seg)
-	if n == 0 || int(n) > len(out) {
+	if n == 0 || n > uint64(len(out)) {
 		t.Fatalf("size %d for %d bytes", n, len(out))
 	}
 	return out
@@ -237,7 +237,8 @@ func sortAllocs(t *testing.T) int64 {
 		n, ok = runtime.MemProfile(recs, true)
 	}
 	var sum int64
-	for _, r := range recs[:n] {
+	for i := range recs[:n] {
+		r := &recs[i]
 		frames := runtime.CallersFrames(r.Stack())
 		for {
 			f, more := frames.Next()
@@ -309,7 +310,7 @@ func TestBuilderSegmentSizeWithLargeStored(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.Size() > int(n)+64<<10 {
+	if uint64(s.Size()) > n+64<<10 { // #nosec G115 -- a nonnegative size.
 		t.Fatalf("segment Size %d B for %d serialized bytes", s.Size(), n)
 	}
 }

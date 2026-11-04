@@ -32,7 +32,7 @@ func TestTermArena(t *testing.T) {
 			t.Fatal("arena full")
 		}
 	}
-	rng := rand.New(rand.NewPCG(3, 4))
+	rng := rand.New(rand.NewPCG(3, 4)) // #nosec G404 -- deterministic test data.
 	var buf []byte
 	for range 200000 {
 		i := rng.IntN(len(streams))

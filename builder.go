@@ -108,6 +108,9 @@ type builderField struct {
 // smallNorms bounds the field lengths whose norms a slice holds.
 const smallNorms = 1024
 
+// minNorms is the least number of norms a field's slice grows to.
+const minNorms = 16
+
 type storedRec struct {
 	field uint16
 	n     uint32
@@ -177,7 +180,7 @@ func (b *Builder) fieldID(name string) (uint16, error) {
 }
 
 func (b *Builder) add(doc segment.Document) {
-	if uint64(b.numDocs) > math.MaxUint32 {
+	if over32(b.numDocs) {
 		b.err = fmt.Errorf("too many documents for uint32 document numbers")
 		return
 	}
@@ -253,7 +256,7 @@ func (b *Builder) addField(f segment.Field) {
 			return
 		}
 		b.stored.append(v)
-		b.storedRec.append(storedRec{field: id, n: uint32(len(v))})
+		b.storedRec.append(storedRec{field: id, n: uint32(len(v))}) // #nosec G115 -- bounded above.
 	}
 	if f.IndexDocValues() {
 		fb.dv = true
@@ -284,7 +287,7 @@ func termFreq(t segment.FieldTerm) (uint32, error) {
 	if over32(freq) {
 		return 0, errInterimRange
 	}
-	return uint32(freq), nil
+	return uint32(freq), nil // #nosec G115 -- bounded above.
 }
 
 func (b *Builder) term(t segment.FieldTerm) {
@@ -352,7 +355,8 @@ func (b *Builder) cacheNorm(fb *builderField, length int) {
 			return
 		}
 		if length >= len(fb.norms) {
-			n := min(max(2*len(fb.norms), length+1, 16), smallNorms)
+			n := 2 * len(fb.norms)
+			n = min(max(n, length+1, minNorms), smallNorms)
 			fb.norms, fb.normSet = slices.Grow(fb.norms, n-len(fb.norms))[:n], slices.Grow(fb.normSet, n-len(fb.normSet))[:n]
 		}
 		fb.norms[length], fb.normSet[length] = b.normCalc(fb.name, length), true
@@ -412,6 +416,7 @@ func (b *Builder) location(l segment.Location) (interimLoc, bool) {
 			return interimLoc{}, false
 		}
 	}
+	// #nosec G115 -- bounded above.
 	return interimLoc{fieldID: f, pos: uint32(pos), start: uint32(start), end: uint32(end)}, true
 }
 
@@ -469,7 +474,7 @@ func (b *Builder) flushRolls() {
 			return
 		}
 		b.cacheNorm(fb, b.length[r.key.field])
-		b.addPosting(fb, tid, uint32(r.freq), b.length[r.key.field], r.locs)
+		b.addPosting(fb, tid, uint32(r.freq), b.length[r.key.field], r.locs) // #nosec G115 -- bounded above.
 		if b.err != nil {
 			return
 		}
@@ -489,52 +494,18 @@ func (b *Builder) Build() (_ segment.Segment, _ uint64, err error) {
 	}
 	b.err = fmt.Errorf("ice: Builder already built")
 
-	// global field ids as New: _id, the fields by name, then the fields
-	// only locations name, in order of definition
 	n := len(b.fields)
-	order := make([]int, 1, n)
-	var located []int
-	for i := 1; i < n; i++ {
-		if b.fields[i].seen {
-			order = append(order, i)
-		} else {
-			located = append(located, i)
-		}
-	}
-	slices.SortFunc(order[1:], func(x, y int) int { return strings.Compare(b.fields[x].name, b.fields[y].name) })
-	order = append(order, located...)
-	gid := make([]uint16, n)
-	for g, l := range order {
-		gid[l] = uint16(g) // #nosec G115 -- at most MaxUint16 fields.
-	}
-
-	s := &interim{}
-	s.initVisitors()
-	s.chunkMode, s.normCalc, s.numDocs = defaultChunkMode, b.normCalc, b.numDocs
+	order, gid := b.fieldOrder()
 	var br bytes.Buffer
-	br.Grow(b.stored.cap + 4*b.numDocs)
-	s.w = newCountHashWriter(&br)
-	s.FieldsMap, s.FieldsInv = make(map[string]uint16, n), make([]string, n)
-	s.FieldDocs, s.FieldFreqs = map[uint16]uint64{}, map[uint16]uint64{}
-	s.Dicts, s.DictKeys = make([]map[string]uint64, n), make([][]string, n)
-	s.IncludeDocValues, s.NumericOnly = make([]bool, n), make([]bool, n)
-	s.NumericValues = make([][]interimNumeric, n)
-	for g, l := range order {
-		fb := b.fields[l]
-		s.FieldsInv[g], s.FieldsMap[fb.name] = fb.name, uint16(g+1) // #nosec G115 -- see gid.
-		if fb.docs > 0 {
-			s.FieldDocs[uint16(g)], s.FieldFreqs[uint16(g)] = fb.docs, fb.freq // #nosec G115 -- see gid.
-		}
-		s.IncludeDocValues[g], s.NumericOnly[g], s.NumericValues[g] = fb.dv, fb.numericOnly, fb.numeric
-	}
+	s := b.newInterim(order, &br)
 
 	var storedIndexOffset uint64
 	var storedChunkOffsets []uint64
 	stored := make(chan error, 1)
 	go func() {
-		var err error
-		storedIndexOffset, storedChunkOffsets, err = b.writeStored(s, gid)
-		stored <- err
+		var werr error
+		storedIndexOffset, storedChunkOffsets, werr = b.writeStored(s, gid)
+		stored <- werr
 	}()
 	waitStored := sync.OnceValue(func() error { return <-stored })
 	defer func() {
@@ -568,7 +539,8 @@ func (b *Builder) Build() (_ segment.Segment, _ uint64, err error) {
 		dictOffsets = make([]uint64, n)
 	}
 	b.arena.release() // gather is done with the postings
-	if err = waitStored(); err != nil {
+	err = waitStored()
+	if err != nil {
 		return nil, 0, err
 	}
 	b.fields, b.global = nil, nil
@@ -576,21 +548,7 @@ func (b *Builder) Build() (_ segment.Segment, _ uint64, err error) {
 	if err != nil {
 		return nil, 0, err
 	}
-	tMin, tMax := b.timeMin, b.timeMax
-	if b.untimed || b.numDocs == 0 {
-		tMin, tMax = 0, 0
-	}
-	f := &footer{
-		storedIndexOffset: storedIndexOffset,
-		fieldsIndexOffset: fieldsIndexOffset,
-		docValueOffset:    fdvIndexOffset,
-		version:           writeVersion,
-		docTimeMin:        uint64(tMin), // #nosec G115 -- signed timestamp bits, as New.
-		docTimeMax:        uint64(tMax), // #nosec G115 -- see above.
-		crc:               s.w.Sum32(),
-		chunkMode:         defaultChunkMode,
-		numDocs:           uint64(b.numDocs), // #nosec G115 -- a nonnegative count.
-	}
+	f := b.footer(s, storedIndexOffset, fieldsIndexOffset, fdvIndexOffset)
 	// the segment keeps its bytes: the stored fields compress, so the buffer
 	// grown for them uncompressed may hold far more than it holds
 	data := br.Bytes()
@@ -605,6 +563,72 @@ func (b *Builder) Build() (_ segment.Segment, _ uint64, err error) {
 	return sb, uint64(br.Len()), nil // #nosec G115 -- a nonnegative length.
 }
 
+// fieldOrder returns the fields in global field id order, as New: _id, the
+// fields by name, then the fields only locations name, in order of
+// definition; and the global id of each field.
+func (b *Builder) fieldOrder() (order []int, gid []uint16) {
+	n := len(b.fields)
+	order = make([]int, 1, n)
+	var located []int
+	for i := 1; i < n; i++ {
+		if b.fields[i].seen {
+			order = append(order, i)
+		} else {
+			located = append(located, i)
+		}
+	}
+	slices.SortFunc(order[1:], func(x, y int) int { return strings.Compare(b.fields[x].name, b.fields[y].name) })
+	order = append(order, located...)
+	gid = make([]uint16, n)
+	for g, l := range order {
+		gid[l] = uint16(g) // #nosec G115 -- at most MaxUint16 fields.
+	}
+	return order, gid
+}
+
+// newInterim returns the interim writing to br with the fields in order.
+func (b *Builder) newInterim(order []int, br *bytes.Buffer) *interim {
+	n := len(order)
+	s := &interim{}
+	s.initVisitors()
+	s.chunkMode, s.normCalc, s.numDocs = defaultChunkMode, b.normCalc, b.numDocs
+	br.Grow(b.stored.cap + 4*b.numDocs)
+	s.w = newCountHashWriter(br)
+	s.FieldsMap, s.FieldsInv = make(map[string]uint16, n), make([]string, n)
+	s.FieldDocs, s.FieldFreqs = map[uint16]uint64{}, map[uint16]uint64{}
+	s.Dicts, s.DictKeys = make([]map[string]uint64, n), make([][]string, n)
+	s.IncludeDocValues, s.NumericOnly = make([]bool, n), make([]bool, n)
+	s.NumericValues = make([][]interimNumeric, n)
+	for g, l := range order {
+		fb := b.fields[l]
+		s.FieldsInv[g], s.FieldsMap[fb.name] = fb.name, uint16(g+1) // #nosec G115 -- see fieldOrder.
+		if fb.docs > 0 {
+			s.FieldDocs[uint16(g)], s.FieldFreqs[uint16(g)] = fb.docs, fb.freq // #nosec G115 -- see fieldOrder.
+		}
+		s.IncludeDocValues[g], s.NumericOnly[g], s.NumericValues[g] = fb.dv, fb.numericOnly, fb.numeric
+	}
+	return s
+}
+
+// footer returns the footer of the segment s holds.
+func (b *Builder) footer(s *interim, storedIndexOffset, fieldsIndexOffset, fdvIndexOffset uint64) *footer {
+	tMin, tMax := b.timeMin, b.timeMax
+	if b.untimed || b.numDocs == 0 {
+		tMin, tMax = 0, 0
+	}
+	return &footer{
+		storedIndexOffset: storedIndexOffset,
+		fieldsIndexOffset: fieldsIndexOffset,
+		docValueOffset:    fdvIndexOffset,
+		version:           writeVersion,
+		docTimeMin:        uint64(tMin), // #nosec G115 -- signed timestamp bits, as New.
+		docTimeMax:        uint64(tMax), // #nosec G115 -- see above.
+		crc:               s.w.Sum32(),
+		chunkMode:         defaultChunkMode,
+		numDocs:           uint64(b.numDocs), // #nosec G115 -- a nonnegative count.
+	}
+}
+
 // writeStored writes the stored fields as New's writeStoredFields does.
 func (b *Builder) writeStored(s *interim, gid []uint16) (indexOffset uint64, chunkOffsets []uint64, err error) {
 	var varBuf [binary.MaxVarintLen64]byte
@@ -612,7 +636,7 @@ func (b *Builder) writeStored(s *interim, gid []uint16) (indexOffset uint64, chu
 		return s.metaBuf.Write(varBuf[:binary.PutUvarint(varBuf[:], v)])
 	}
 	vals := make([][][]byte, len(gid))
-	offsets := make([]byte, 0, 8*b.numDocs)
+	offsets := make([]byte, 0, fileAddrWidth*b.numDocs)
 	coder := newChunkedDocumentCoder(uint64(defaultDocumentChunkSize), s.w)
 	var data []byte
 	rec, stored := 0, byteReader{l: &b.stored}
@@ -641,7 +665,8 @@ func (b *Builder) writeStored(s *interim, gid []uint16) (indexOffset uint64, chu
 		}
 	}
 	b.stored, b.storedRec, b.docStored = byteBlocks{}, blocks[storedRec]{}, blocks[int]{}
-	if err = coder.Write(); err != nil {
+	err = coder.Write()
+	if err != nil {
 		return 0, nil, err
 	}
 	indexOffset = uint64(s.w.Count()) // #nosec G115 -- countHashWriter counts nonnegative writes.
@@ -681,6 +706,7 @@ func (b *Builder) gather(pid uint64, w *dictWorker) termIn {
 	for !r.at(t.tail) {
 		// #nosec G115 -- addPosting wrote these from uint32s.
 		doc += uint32(r.uvarint())
+		// #nosec G115 -- see doc.
 		freq, norm, nlocs := uint32(r.uvarint()), fb.norm(int(r.uvarint())), uint32(r.uvarint())
 		w.fns = append(w.fns, interimFreqNorm{freq: freq, norm: norm, docNum: doc, numLocs: nlocs})
 		// doubled, as append grows large slices by only a quarter
@@ -696,6 +722,7 @@ func (b *Builder) gather(pid uint64, w *dictWorker) termIn {
 			pos += unzigzag(d >> 1)
 			start += r.varint()
 			end := start + r.varint()
+			// #nosec G115 -- location decoded from checked uint32s.
 			w.locs = append(w.locs, interimLoc{fieldID: field, pos: uint32(pos), start: uint32(start), end: uint32(end)})
 		}
 	}

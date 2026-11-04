@@ -140,29 +140,6 @@ var interimPool = sync.Pool{New: func() interface{} { return &interim{} }}
 // still be returned to interimPool.
 var maxPooledInterimBytes = 16 << 20
 
-// retainedBytes approximates the capacity of the interim's per-posting and
-// per-location buffers, the ones that scale with the batch.
-func (s *interim) retainedBytes() int {
-	n := cap(s.freqNormsBacking)*int(unsafe.Sizeof(interimFreqNorm{})) +
-		cap(s.locsBacking)*int(unsafe.Sizeof(interimLoc{})) +
-		(cap(s.FreqNorms)+cap(s.Locs))*int(unsafe.Sizeof([]byte(nil))) +
-		cap(s.Postings)*int(unsafe.Sizeof((*roaring.Bitmap)(nil))) +
-		(cap(s.numTermsPerPostingsList)+cap(s.numLocsPerPostingsList))*int(unsafe.Sizeof(0)) +
-		cap(s.tmp0) + cap(s.tmp1) + s.metaBuf.Cap()
-	for _, k := range s.DictKeys[:cap(s.DictKeys)] {
-		n += cap(k) * int(unsafe.Sizeof(""))
-	}
-	for _, v := range s.NumericValues[:cap(s.NumericValues)] {
-		n += cap(v) * int(unsafe.Sizeof(interimNumeric{}))
-	}
-	fieldDicts := s.fieldDicts[:cap(s.fieldDicts)]
-	for i := range fieldDicts {
-		fd := &fieldDicts[i]
-		n += fd.post.Cap() + fd.fst.Cap() + fd.dv.Cap() + cap(fd.terms)*int(unsafe.Sizeof(termPostings{}))
-	}
-	return n
-}
-
 // interim holds temporary working data used while converting from
 // the source operations to an encoded segment
 type interim struct {
@@ -266,6 +243,29 @@ type interim struct {
 	countLoc    func(segment.Location)
 }
 
+// retainedBytes approximates the capacity of the interim's per-posting and
+// per-location buffers, the ones that scale with the batch.
+func (s *interim) retainedBytes() int {
+	n := cap(s.freqNormsBacking)*int(unsafe.Sizeof(interimFreqNorm{})) +
+		cap(s.locsBacking)*int(unsafe.Sizeof(interimLoc{})) +
+		(cap(s.FreqNorms)+cap(s.Locs))*int(unsafe.Sizeof([]byte(nil))) +
+		cap(s.Postings)*int(unsafe.Sizeof((*roaring.Bitmap)(nil))) +
+		(cap(s.numTermsPerPostingsList)+cap(s.numLocsPerPostingsList))*int(unsafe.Sizeof(0)) +
+		cap(s.tmp0) + cap(s.tmp1) + s.metaBuf.Cap()
+	for _, k := range s.DictKeys[:cap(s.DictKeys)] {
+		n += cap(k) * int(unsafe.Sizeof(""))
+	}
+	for _, v := range s.NumericValues[:cap(s.NumericValues)] {
+		n += cap(v) * int(unsafe.Sizeof(interimNumeric{}))
+	}
+	fieldDicts := s.fieldDicts[:cap(s.fieldDicts)]
+	for i := range fieldDicts {
+		fd := &fieldDicts[i]
+		n += fd.post.Cap() + fd.fst.Cap() + fd.dv.Cap() + cap(fd.terms)*int(unsafe.Sizeof(termPostings{}))
+	}
+	return n
+}
+
 func (s *interim) reset() {
 	s.results = nil
 	s.numDocs, s.numPostingsLists = 0, 0
@@ -363,7 +363,7 @@ type interimLoc struct {
 var errInterimRange = errors.New("term frequency or location exceeds uint32")
 
 // over32 reports whether a nonnegative v does not fit the interim uint32s.
-func over32(v int) bool { return uint64(v) > math.MaxUint32 }
+func over32(v int) bool { return uint64(v) > math.MaxUint32 } // #nosec G115 -- negative v wraps above MaxUint32.
 
 func (s *interim) convert() (f *footer, dictOffsets, storedFieldChunkOffsets []uint64, err error) {
 	if uint64(len(s.results)) > uint64(math.MaxUint32)+1 {
@@ -402,27 +402,9 @@ func (s *interim) convert() (f *footer, dictOffsets, storedFieldChunkOffsets []u
 		return nil, nil, nil, prepareErr
 	}
 	s.numPostingsLists = s.dictPrep.pidNext
-
 	// sized after prepareDicts, which defines the fields only named by
 	// composite locations
-	if cap(s.IncludeDocValues) >= len(s.FieldsInv) {
-		s.IncludeDocValues = s.IncludeDocValues[:len(s.FieldsInv)]
-	} else {
-		s.IncludeDocValues = make([]bool, len(s.FieldsInv))
-	}
-	if cap(s.NumericOnly) >= len(s.FieldsInv) {
-		s.NumericOnly = s.NumericOnly[:len(s.FieldsInv)]
-	} else {
-		s.NumericOnly = make([]bool, len(s.FieldsInv))
-	}
-	for i := range s.NumericOnly {
-		s.NumericOnly[i] = true
-	}
-	if cap(s.NumericValues) >= len(s.FieldsInv) {
-		s.NumericValues = s.NumericValues[:len(s.FieldsInv)]
-	} else {
-		s.NumericValues = make([][]interimNumeric, len(s.FieldsInv))
-	}
+	s.sizeFieldValues()
 
 	for _, dict := range s.DictKeys {
 		sort.Strings(dict)
@@ -480,6 +462,28 @@ func (s *interim) convert() (f *footer, dictOffsets, storedFieldChunkOffsets []u
 		docTimeMin:        uint64(docTimeMin), // #nosec G115 -- preserve signed timestamp bits in the uint64 wire format.
 		docTimeMax:        uint64(docTimeMax), // #nosec G115 -- preserve signed timestamp bits in the uint64 wire format.
 	}, dictOffsets, storedFieldChunkOffsets, nil
+}
+
+// sizeFieldValues sizes the per-field doc value state to FieldsInv.
+func (s *interim) sizeFieldValues() {
+	if cap(s.IncludeDocValues) >= len(s.FieldsInv) {
+		s.IncludeDocValues = s.IncludeDocValues[:len(s.FieldsInv)]
+	} else {
+		s.IncludeDocValues = make([]bool, len(s.FieldsInv))
+	}
+	if cap(s.NumericOnly) >= len(s.FieldsInv) {
+		s.NumericOnly = s.NumericOnly[:len(s.FieldsInv)]
+	} else {
+		s.NumericOnly = make([]bool, len(s.FieldsInv))
+	}
+	for i := range s.NumericOnly {
+		s.NumericOnly[i] = true
+	}
+	if cap(s.NumericValues) >= len(s.FieldsInv) {
+		s.NumericValues = s.NumericValues[:len(s.FieldsInv)]
+	} else {
+		s.NumericValues = make([][]interimNumeric, len(s.FieldsInv))
+	}
 }
 
 func (s *interim) getOrDefineField(fieldName string) (uint16, error) {
@@ -668,10 +672,11 @@ func (p *dictPrep) term(term segment.FieldTerm) {
 // growDouble makes room for one more element by doubling a full slice:
 // append grows large slices by about 1.25x, copying them several times.
 func growDouble[S ~[]E, E any](v S) S {
+	const minGrowDouble = 64
 	if len(v) < cap(v) {
 		return v
 	}
-	return slices.Grow(v, max(cap(v), 64))
+	return slices.Grow(v, max(cap(v), minGrowDouble))
 }
 
 // fieldCount is one field's share of countTermsParallel; the dictionary
@@ -1005,44 +1010,52 @@ func (s *interim) processDocumentRollup(docNum uint64,
 			}
 			s.FreqNorms[pid] = append(s.FreqNorms[pid],
 				interimFreqNorm{
-					freq: uint32(frequency),
+					freq: uint32(frequency), // #nosec G115 -- bounded above.
 					norm: norm,
 					// #nosec G115 -- convert bounds results to MaxUint32+1; docNum is a results index.
 					docNum:  uint32(docNum),
-					numLocs: uint32(len(tf.Locations)),
+					numLocs: uint32(len(tf.Locations)), // #nosec G115 -- bounded above.
 				})
 
-			if len(tf.Locations) > 0 {
-				locs := s.Locs[pid]
-
-				for _, loc := range tf.Locations {
-					if loc.PositionVal < 0 || loc.StartVal < 0 || loc.EndVal < 0 {
-						return fmt.Errorf("negative term location")
-					}
-					if over32(loc.PositionVal) || over32(loc.StartVal) || over32(loc.EndVal) {
-						return errInterimRange
-					}
-					// #nosec G115 -- fieldTFs has one entry per field; getOrDefineField caps fields at MaxUint16.
-					locf := uint16(fieldID)
-					if loc.FieldVal != "" {
-						var err error
-						locf, err = s.getOrDefineField(loc.FieldVal)
-						if err != nil {
-							return err
-						}
-					}
-					locs = append(locs, interimLoc{
-						fieldID: locf,
-						pos:     uint32(loc.PositionVal),
-						start:   uint32(loc.StartVal),
-						end:     uint32(loc.EndVal),
-					})
-				}
-
-				s.Locs[pid] = locs
+			if err := s.appendRollupLocs(pid, fieldID, tf.Locations); err != nil {
+				return err
 			}
 		}
 	}
+	return nil
+}
+
+// appendRollupLocs appends a rolled up term's locations in field fieldID
+// to postings list pid.
+func (s *interim) appendRollupLocs(pid uint64, fieldID int, tlocs []*tokenLocation) error {
+	if len(tlocs) == 0 {
+		return nil
+	}
+	locs := s.Locs[pid]
+	for _, loc := range tlocs {
+		if loc.PositionVal < 0 || loc.StartVal < 0 || loc.EndVal < 0 {
+			return fmt.Errorf("negative term location")
+		}
+		if over32(loc.PositionVal) || over32(loc.StartVal) || over32(loc.EndVal) {
+			return errInterimRange
+		}
+		// #nosec G115 -- fieldTFs has one entry per field; getOrDefineField caps fields at MaxUint16.
+		locf := uint16(fieldID)
+		if loc.FieldVal != "" {
+			var err error
+			locf, err = s.getOrDefineField(loc.FieldVal)
+			if err != nil {
+				return err
+			}
+		}
+		locs = append(locs, interimLoc{
+			fieldID: locf,
+			pos:     uint32(loc.PositionVal), // #nosec G115 -- bounded above.
+			start:   uint32(loc.StartVal),    // #nosec G115 -- bounded above.
+			end:     uint32(loc.EndVal),      // #nosec G115 -- bounded above.
+		})
+	}
+	s.Locs[pid] = locs
 	return nil
 }
 
@@ -1141,9 +1154,9 @@ func (v *termVisitor) visitLoc(loc segment.Location) {
 	}
 	v.locs = append(v.locs, interimLoc{
 		fieldID: locf,
-		pos:     uint32(pos),
-		start:   uint32(start),
-		end:     uint32(end),
+		pos:     uint32(pos),   // #nosec G115 -- bounded above.
+		start:   uint32(start), // #nosec G115 -- bounded above.
+		end:     uint32(end),   // #nosec G115 -- bounded above.
 	})
 	v.numLocs++
 }
@@ -1174,11 +1187,11 @@ func (v *termVisitor) addPosting(pid uint64, term segment.FieldTerm) error {
 		return errInterimRange
 	}
 	s.FreqNorms[pid] = append(s.FreqNorms[pid], interimFreqNorm{
-		freq: uint32(frequency),
+		freq: uint32(frequency), // #nosec G115 -- bounded above.
 		norm: v.norm,
 		// #nosec G115 -- convert bounds results to MaxUint32+1; docNum is a results index.
 		docNum:  uint32(v.docNum),
-		numLocs: uint32(v.numLocs),
+		numLocs: uint32(v.numLocs), // #nosec G115 -- bounded above.
 	})
 	return nil
 }
@@ -1378,7 +1391,8 @@ func (s *interim) writeDicts() (fdvIndexOffset uint64, dictOffsets []uint64, err
 		return 0, nil, err
 	}
 	if s.beforePlace != nil {
-		if err = s.beforePlace(); err != nil {
+		err = s.beforePlace()
+		if err != nil {
 			return 0, nil, err
 		}
 	}
@@ -1728,7 +1742,7 @@ func (s *interim) encodeTermPostings(docTermMap [][]byte, term string, pid uint6
 		}
 	}
 
-	chunkSize, err := getChunkSize(s.chunkMode, card, uint64(s.numDocs))
+	chunkSize, err := getChunkSize(s.chunkMode, card, uint64(s.numDocs)) // #nosec G115 -- a nonnegative count.
 	if err != nil {
 		return 0, false, nil, err
 	}

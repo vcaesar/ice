@@ -22,11 +22,17 @@ import "hash/maphash"
 // It holds no pointers but the term strings, so growing it copies and the
 // GC scans a word per slot, not a map's buckets.
 type termTable struct {
-	slots []uint64 // hash<<32 | id+1; 0 when empty
+	slots []uint64 // hash<<hashShift | id+1; 0 when empty
 	terms []string // local term id -> its bytes
 }
 
 var termSeed = maphash.MakeSeed()
+
+// hashShift places a term's hash above its id+1 in a slot.
+const hashShift = 32
+
+// minTermSlots is the least number of slots a table grows to.
+const minTermSlots = 64
 
 func termHash(term []byte) uint32 {
 	return uint32(maphash.Bytes(termSeed, term)) // #nosec G115 -- the low hash bits.
@@ -45,7 +51,7 @@ func (t *termTable) find(h uint32, term []byte) (uint32, bool) {
 		if s == 0 {
 			return 0, false
 		}
-		if id := uint32(s) - 1; uint32(s>>32) == h && t.terms[id] == string(term) { // #nosec G115 -- the words put packed.
+		if id := uint32(s) - 1; s>>hashShift == uint64(h) && t.terms[id] == string(term) { // #nosec G115 -- the low word is id+1.
 			return id, true
 		}
 	}
@@ -56,10 +62,11 @@ func (t *termTable) find(h uint32, term []byte) (uint32, bool) {
 func (t *termTable) add(h uint32, term string) uint32 {
 	if 4*(len(t.terms)+1) > 3*len(t.slots) {
 		old := t.slots
-		t.slots = make([]uint64, max(2*len(old), 64))
+		n := 2 * len(old)
+		t.slots = make([]uint64, max(n, minTermSlots))
 		for _, s := range old {
 			if s != 0 {
-				t.put(uint32(s>>32), uint32(s)-1) // #nosec G115 -- see find.
+				t.put(uint32(s>>hashShift), uint32(s)-1) // #nosec G115 -- see find.
 			}
 		}
 	}
@@ -75,7 +82,7 @@ func (t *termTable) put(h, id uint32) {
 	for t.slots[i] != 0 {
 		i = (i + 1) & mask
 	}
-	t.slots[i] = uint64(h)<<32 | uint64(id+1)
+	t.slots[i] = uint64(h)<<hashShift | uint64(id+1)
 }
 
 // size approximates the heap the table takes.

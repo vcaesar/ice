@@ -33,6 +33,7 @@ const (
 	tagCopy2   = 0x02
 	tagCopy4   = 0x03
 	tagMask    = 0x03
+	tagBits    = 2 // the element bits start above the tag
 )
 
 // s2 block element layout.
@@ -93,7 +94,7 @@ func decodeRepeats(dst, src []byte) ([]byte, error) {
 // readLiteral reads the literal element tagged at src[s]: its bytes are
 // src[next:next+length]. ok is false when src ends first.
 func readLiteral(src []byte, s int) (next, length int, ok bool) {
-	x := int(src[s] >> 2)
+	x := int(src[s] >> tagBits)
 	s++
 	if x >= literalInline {
 		n := x - lenByteBias
@@ -116,7 +117,7 @@ func readCopy(src []byte, s, lastOffset int) (next, length, offset int, ok bool)
 		if len(src)-s < copy1Size {
 			return 0, 0, 0, false
 		}
-		length, offset = int(tag>>2&copy1LenMask), int(tag&copy1OffHigh)<<3|int(src[s+1])
+		length, offset = int(tag>>tagBits&copy1LenMask), int(tag&copy1OffHigh)<<3|int(src[s+1])
 		s += copy1Size
 		if offset == 0 {
 			offset = lastOffset
@@ -135,12 +136,12 @@ func readCopy(src []byte, s, lastOffset int) (next, length, offset int, ok bool)
 		if len(src)-s < copy2Size {
 			return 0, 0, 0, false
 		}
-		return s + copy2Size, 1 + int(tag>>2), int(binary.LittleEndian.Uint16(src[s+1:])), true
+		return s + copy2Size, 1 + int(tag>>tagBits), int(binary.LittleEndian.Uint16(src[s+1:])), true
 	default: // tagCopy4
 		if len(src)-s < copy4Size {
 			return 0, 0, 0, false
 		}
-		return s + copy4Size, 1 + int(tag>>2), int(binary.LittleEndian.Uint32(src[s+1:])), true
+		return s + copy4Size, 1 + int(tag>>tagBits), int(binary.LittleEndian.Uint32(src[s+1:])), true
 	}
 }
 

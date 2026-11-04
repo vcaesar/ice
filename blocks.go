@@ -71,9 +71,9 @@ func (l *byteBlocks) append(v []byte) []byte {
 	if n == 0 || cap(l.b[n-1])-len(l.b[n-1]) < len(v) {
 		c := 256
 		if n > 0 {
-			c = min(2*cap(l.b[n-1]), byteBlockLen)
+			c = 2 * cap(l.b[n-1])
 		}
-		l.b = append(l.b, make([]byte, 0, max(c, len(v))))
+		l.b = append(l.b, make([]byte, 0, max(min(c, byteBlockLen), len(v))))
 		l.cap += cap(l.b[n])
 		n++
 	}

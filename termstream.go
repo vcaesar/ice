@@ -40,7 +40,10 @@ type termArena struct {
 	size  int // bytes the pages take
 }
 
-var arenaPages = sync.Pool{New: func() any { return make([]byte, 0, 1<<arenaPageBits) }}
+var arenaPages = sync.Pool{New: func() any {
+	p := make([]byte, 0, 1<<arenaPageBits)
+	return &p
+}}
 
 // alloc returns the address of n zero bytes, n at most 1<<maxTermBlockShift,
 // and false when the arena is full.
@@ -52,11 +55,12 @@ func (a *termArena) alloc(n int) (uint32, bool) {
 		}
 		c := firstArenaPage
 		if p >= 0 {
-			c = min(2*cap(a.pages[p]), 1<<arenaPageBits)
+			c = 2 * cap(a.pages[p])
 		}
+		c = min(c, 1<<arenaPageBits)
 		var page []byte
 		if c == 1<<arenaPageBits {
-			page = arenaPages.Get().([]byte)
+			page = *arenaPages.Get().(*[]byte)
 			clear(page[:cap(page)])
 		} else {
 			page = make([]byte, 0, c)
@@ -75,7 +79,8 @@ func (a *termArena) alloc(n int) (uint32, bool) {
 func (a *termArena) release() {
 	for _, p := range a.pages {
 		if cap(p) == 1<<arenaPageBits {
-			arenaPages.Put(p[:0])
+			p = p[:0]
+			arenaPages.Put(&p)
 		}
 	}
 	a.pages, a.size = nil, 0
@@ -155,10 +160,10 @@ func (r *termReader) uvarint() uint64 {
 	var v uint64
 	for s := uint(0); ; s += 7 {
 		b := r.byte()
-		if b < 0x80 {
+		if b < lastByte {
 			return v | uint64(b)<<s
 		}
-		v |= uint64(b&0x7f) << s
+		v |= uint64(b&significantBits) << s
 	}
 }
 
