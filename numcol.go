@@ -21,6 +21,7 @@ import (
 	"io"
 	"math"
 	"sort"
+	"sync/atomic"
 
 	"github.com/RoaringBitmap/roaring/v2"
 	segment "github.com/vcaesar/bluge_segment_api"
@@ -226,7 +227,15 @@ type numericColumn struct {
 	dataLoc uint64
 	dataEnd uint64 // end of block data relative to dataLoc
 	blocks  []numericBlockMeta
+	// indexed caches columnIndexed: indexedUnknown, indexedYes or indexedNo
+	indexed atomic.Uint32
 }
+
+const (
+	indexedUnknown uint32 = iota
+	indexedYes
+	indexedNo
+)
 
 func (c *numericColumn) size() int {
 	return len(c.field) + sizeOfString + len(c.blocks)*reflectStaticSizeNumericBlockMeta
@@ -527,7 +536,9 @@ func (s *Segment) VisitNumericBlocks(field string, visitor func(base uint64, doc
 // NumericRange returns the documents of field with a value in [lo, hi].
 // Blocks outside the range are skipped by their bounds and dense blocks
 // fully inside it are added without decoding. ok is false when field has
-// no numeric column in this segment.
+// no numeric column in this segment, or when the column does not hold
+// exactly the documents indexed in field, so it would match otherwise
+// than the field's terms.
 func (s *Segment) NumericRange(field string, lo, hi int64) (bm *roaring.Bitmap, ok bool, err error) {
 	fieldIDPlus1, exists := s.fieldsMap[field]
 	if !exists {
@@ -536,6 +547,9 @@ func (s *Segment) NumericRange(field string, lo, hi int64) (bm *roaring.Bitmap, 
 	col, exists := s.fieldNumCols[fieldIDPlus1-1]
 	if !exists {
 		return nil, false, nil
+	}
+	if indexed, err := s.columnIndexed(col); err != nil || !indexed {
+		return nil, false, err
 	}
 	bm = roaring.New()
 	if lo > hi {
@@ -568,6 +582,55 @@ func (s *Segment) NumericRange(field string, lo, hi int64) (bm *roaring.Bitmap, 
 		}
 	}
 	return bm, true, nil
+}
+
+// columnIndexed reports whether col holds exactly the documents with a
+// term in its field's dictionary, computing it once per column.
+func (s *Segment) columnIndexed(col *numericColumn) (bool, error) {
+	switch col.indexed.Load() {
+	case indexedYes:
+		return true, nil
+	case indexedNo:
+		return false, nil
+	}
+	docs := roaring.New()
+	cur := newNumericColumnCursor(col)
+	for block := range col.blocks {
+		m := &col.blocks[block]
+		if m.count == 0 {
+			continue
+		}
+		start := uint64(block) * numericBlockSize
+		if m.dense {
+			docs.AddRange(start, start+uint64(m.count))
+			continue
+		}
+		if err := cur.loadBlock(s, uint64(block)); err != nil {
+			return false, err
+		}
+		for _, doc := range cur.docs {
+			// #nosec G115 -- doc numbers are bounded by the segment's uint32 doc count.
+			docs.Add(uint32(doc))
+		}
+	}
+	dict, err := s.dictionary(col.field)
+	if err != nil {
+		return false, err
+	}
+	dense := make([]uint64, (s.footer.numDocs+wordBits-1)/wordBits)
+	ok := dict == nil || dict.fst == nil
+	if !ok {
+		if ok, err = dict.OrPostingsDense(nil, nil, nil, dense); err != nil {
+			return false, err
+		}
+	}
+	indexed := ok && roaring.FromDense(dense, false).Equals(docs)
+	state := indexedNo
+	if indexed {
+		state = indexedYes
+	}
+	col.indexed.Store(state)
+	return indexed, nil
 }
 
 // prefixCodedInt64 encodes v like bluge's numeric.NewPrefixCodedInt64 with

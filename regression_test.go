@@ -75,13 +75,12 @@ func TestTermFinalizationCompressionError(t *testing.T) {
 		} else {
 			s := &interim{
 				results:   []segment.Document{&FakeDocument{}},
+				numDocs:   1,
 				chunkMode: defaultChunkMode, w: writer,
-				Postings:  []*roaring.Bitmap{postings},
-				FreqNorms: [][]interimFreqNorm{{{freq: 1}}},
-				Locs:      [][]interimLoc{nil},
 			}
 			var post bytes.Buffer
-			_, err = s.appendTermPostings(&post, make([][]byte, 1), map[string]uint64{"term": 1}, "term", tf, loc, nil)
+			in := termIn{bm: postings, fns: []interimFreqNorm{{freq: 1}}}
+			_, err = s.appendTermPostings(&post, make([][]byte, 1), "term", 0, in, tf, loc, nil)
 			if post.Len() != 0 {
 				t.Error("appended postings after failed compression")
 			}

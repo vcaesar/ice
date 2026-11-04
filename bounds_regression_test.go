@@ -3,9 +3,12 @@ package ice
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"io"
 	"math"
+	"strconv"
 	"testing"
+	"unsafe"
 
 	segment "github.com/vcaesar/bluge_segment_api"
 )
@@ -192,5 +195,59 @@ func TestSegmentReaderMetadataBounds(t *testing.T) {
 	w := newCountHashWriter(failingChunkWriter{})
 	if _, err := w.Write([]byte{0}); err != io.ErrClosedPipe || w.Count() != 0 {
 		t.Fatalf("writer error propagation: %v", err)
+	}
+}
+
+// The interim posting state is packed into uint32s; values at the limit
+// round-trip and larger ones are rejected, on the direct and rollup paths.
+func TestNewInterimUint32Range(t *testing.T) {
+	if unsafe.Sizeof(interimLoc{}) != 16 || unsafe.Sizeof(interimFreqNorm{}) != 16 {
+		t.Fatalf("interim sizes %d/%d, want 16/16", unsafe.Sizeof(interimLoc{}), unsafe.Sizeof(interimFreqNorm{}))
+	}
+	if strconv.IntSize == 32 {
+		t.Skip("int cannot exceed uint32")
+	}
+	const top = math.MaxUint32
+	doc := func(repeat bool, loc *FakeLocation, freq int) segment.Document {
+		d := FakeDocument{&FakeField{N: "field", T: []*FakeTerm{{T: "term", F: freq, L: []*FakeLocation{loc}}}}}
+		if repeat {
+			d = append(d, NewFakeField("field", "other", false, true, false))
+		}
+		return &d
+	}
+	for _, repeat := range []bool{false, true} {
+		seg, _, err := New([]segment.Document{doc(repeat, &FakeLocation{P: top, S: top - 1, E: top}, 1)}, encodeNorm)
+		if err != nil {
+			t.Fatalf("repeat=%v: %v", repeat, err)
+		}
+		dict, err := seg.Dictionary("field")
+		if err != nil {
+			t.Fatal(err)
+		}
+		pl, err := dict.PostingsList([]byte("term"), nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		it, err := pl.Iterator(true, true, true, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p, err := it.Next()
+		if err != nil || p == nil || len(p.Locations()) != 1 {
+			t.Fatalf("repeat=%v: posting %v err %v", repeat, p, err)
+		}
+		if l := p.Locations()[0]; l.Pos() != top || l.Start() != top-1 || l.End() != top {
+			t.Fatalf("repeat=%v: location %d/%d/%d", repeat, l.Pos(), l.Start(), l.End())
+		}
+		for _, bad := range []segment.Document{
+			doc(repeat, &FakeLocation{P: top + 1}, 1),
+			doc(repeat, &FakeLocation{S: top + 1}, 1),
+			doc(repeat, &FakeLocation{E: top + 1}, 1),
+			doc(repeat, &FakeLocation{}, top+1),
+		} {
+			if _, _, err := New([]segment.Document{bad}, encodeNorm); !errors.Is(err, errInterimRange) {
+				t.Fatalf("repeat=%v: err %v, want errInterimRange", repeat, err)
+			}
+		}
 	}
 }

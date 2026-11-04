@@ -151,3 +151,33 @@ func TestNumericCursorLoadErrorNotCached(t *testing.T) {
 		}
 	}
 }
+
+// NumericRange declines a column whose documents differ from the field's
+// indexed ones, so a range matches as the field's terms do.
+func TestNumericRangeColumnMustMatchIndex(t *testing.T) {
+	notIndexed := NewFakeNumericField("price", 5)
+	notIndexed.T = nil
+	termOnly := fakeTermField("price", prefixCodedInt64(5))
+	termOnly.DV = false
+	for name, docs := range map[string][]segment.Document{
+		"not indexed": {&numericDoc{fields: []segment.Field{NewFakeField("_id", "a", true, false, false), notIndexed}}},
+		"term only": {
+			&numericDoc{fields: []segment.Field{NewFakeField("_id", "a", true, false, false), NewFakeNumericField("price", 5)}},
+			&numericDoc{fields: []segment.Field{NewFakeField("_id", "b", true, false, false), termOnly}},
+		},
+	} {
+		s, _, err := newWithChunkMode(docs, encodeNorm, defaultChunkMode, DefaultOptions())
+		if err != nil {
+			t.Fatal(err)
+		}
+		seg := s.(*Segment)
+		for range 2 { // the second answer comes from the cached check
+			if _, ok, err := seg.NumericRange("price", 0, 10); ok || err != nil {
+				t.Fatalf("%s: ok=%v err=%v, want the column declined", name, ok, err)
+			}
+		}
+		if ok, err := seg.VisitNumericColumn("price", func(uint64, int64) error { return nil }); !ok || err != nil {
+			t.Fatalf("%s: column missing: ok=%v err=%v", name, ok, err)
+		}
+	}
+}
