@@ -32,6 +32,7 @@ func prepareIndexingTestInterim(t testing.TB, s *interim, docs []segment.Documen
 	if err := s.prepareDicts(); err != nil {
 		t.Fatal(err)
 	}
+	s.numPostingsLists = s.dictPrep.pidNext
 	for _, keys := range s.DictKeys {
 		sort.Strings(keys)
 	}
@@ -47,6 +48,7 @@ func setupIndexingTestInterim(t testing.TB, s *interim, docs []segment.Document)
 		s.initVisitors()
 	}
 	s.results, s.chunkMode, s.normCalc = docs, defaultChunkMode, encodeNorm
+	s.numDocs = len(docs)
 	s.FieldsMap = map[string]uint16{}
 	s.FieldDocs = map[uint16]uint64{}
 	s.FieldFreqs = map[uint16]uint64{}
@@ -422,5 +424,37 @@ func TestNewReusedCodersEncodeAlike(t *testing.T) {
 		if got := encode(b.ver, b.n); !bytes.Equal(got, want[b]) {
 			t.Fatalf("v%d, %d docs: reused interim wrote %d bytes unlike a fresh one's %d", b.ver, b.n, len(got), len(want[b]))
 		}
+	}
+}
+
+// An interim whose buffers outgrew maxPooledInterimBytes is not pooled, so
+// a big batch does not pin its buffers for later small ones.
+func TestInterimPoolSkipsLargeInterims(t *testing.T) {
+	prev := maxPooledInterimBytes
+	defer func() { maxPooledInterimBytes = prev }()
+	drain := func() {
+		for range 64 {
+			interimPool.Get()
+		}
+	}
+	docs := fstTestDocs(2000)
+
+	maxPooledInterimBytes = 1
+	drain()
+	if _, _, err := New(docs, encodeNorm); err != nil {
+		t.Fatal(err)
+	}
+	if s := interimPool.Get().(*interim); s.lastNumDocs != 0 {
+		t.Fatalf("an interim over the limit was pooled (lastNumDocs %d)", s.lastNumDocs)
+	}
+
+	s := &interim{}
+	if s.retainedBytes() != 0 {
+		t.Fatalf("empty interim retains %d bytes", s.retainedBytes())
+	}
+	s.freqNormsBacking = make([]interimFreqNorm, 0, 1000)
+	s.locsBacking = make([]interimLoc, 0, 1000)
+	if got := s.retainedBytes(); got < 32000 {
+		t.Fatalf("retainedBytes %d, want >= 32000", got)
 	}
 }

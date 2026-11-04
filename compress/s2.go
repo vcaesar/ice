@@ -21,6 +21,9 @@ import (
 
 // S2Decompress decompresses a block using s2 algorithm.
 func S2Decompress(dst, src []byte) ([]byte, error) {
+	if n, err := s2c.DecodedLen(src); err == nil && n >= repeatRatio*len(src) {
+		return decodeRepeats(dst, src)
+	}
 	return s2c.Decode(dst, src)
 }
 

@@ -382,6 +382,10 @@ type PostingsIterator struct {
 	// entry is the last one read when hasLast
 	lastDoc uint32
 	hasLast bool
+	// denseEnd, when denseChecked for the loaded chunk and ActualBM, is
+	// the end of the chunk if ActualBM holds each of its documents, else 0
+	denseEnd     uint64
+	denseChecked bool
 }
 
 var emptyPostingsIterator = &PostingsIterator{}
@@ -430,7 +434,7 @@ func (i *PostingsIterator) loadChunk(chunk int) error {
 	}
 
 	i.currChunk = uint32(chunk)
-	i.locRec = 0
+	i.locRec, i.denseChecked = 0, false
 	if i.postings != nil {
 		i.chunkEnd = (uint64(chunk) + 1) * i.postings.chunkSize
 	}
@@ -1157,18 +1161,36 @@ func (i *PostingsIterator) nextPosRun(n int, docs []uint64, freqs []int, norms [
 	last, chunkEnd := i.lastDoc, i.chunkEnd
 	clean := i.postings.postings == i.ActualBM
 	h := i.recHandle()
+	if m := i.denseRun(it, len(docs)-n); m >= minDenseRun {
+		// docs d0, d0+1, ... d0+m-1 are all postings: read them without
+		// stepping the iterator per document
+		d0, j := it.PeekNext(), uint32(0)
+		for ; j < uint32(m); j++ { // #nosec G115 -- m is at most chunkEnd-d0.
+			nb, f, p, ok := posRecord(fS, lS, fc, lc, len(fieldsInv))
+			if !ok {
+				break
+			}
+			fc, lc = fc+2, lc+3
+			docs[n], freqs[n], norms[n], offs[n] = uint64(d0+j), 1, float64(math.Float32frombits(uint32(nb))), h
+			h++
+			fields = append(fields, fieldsInv[f])
+			locs = append(locs, p, 0, 0)
+			ends[n] = len(fields)
+			n++
+		}
+		if j > 0 {
+			last = d0 + j - 1
+			it.AdvanceIfNeeded(last + 1)
+		}
+	}
 	for n < len(docs) && it.HasNext() {
 		d := it.PeekNext()
-		if uint64(d) >= chunkEnd || (!clean && d != last+1) || fc+2 > len(fS) || lc+3 > len(lS) {
+		if uint64(d) >= chunkEnd || (!clean && d != last+1) {
 			break
 		}
-		fh, nb := fS[fc], fS[fc+1]
-		if fh != 3 || nb >= lastByte || lS[lc] != 2 || (lS[lc+1]|lS[lc+2]) >= lastByte {
+		nb, f, p, ok := posRecord(fS, lS, fc, lc, len(fieldsInv))
+		if !ok {
 			break
-		}
-		f, p := int(lS[lc+1]), int(unzigzag(uint64(lS[lc+2])))
-		if f >= len(fieldsInv) || p < 0 {
-			break // appendSplitLocs reports it
 		}
 		it.Next()
 		last = d
@@ -1183,6 +1205,51 @@ func (i *PostingsIterator) nextPosRun(n int, docs []uint64, freqs []int, norms [
 	fr.C, lr.C, i.lastDoc = fc, lc, last
 	i.locRec = uint32(h) // #nosec G115 -- the record number is the low half of the handle.
 	return n, fields, locs
+}
+
+// posRecord decodes, at fc and lc, the freq/norm entry and version 7+
+// location record of a posting with one location, all one-byte values:
+// freq 1 with locations, norm nb, then record 2, field f, pos p. ok is
+// false for any other posting, which appendSplitLocs reads or reports.
+func posRecord(fS, lS []byte, fc, lc, numFields int) (nb byte, f, p int, ok bool) {
+	if fc+2 > len(fS) || lc+3 > len(lS) || fS[fc] != 3 || fS[fc+1] >= lastByte || lS[lc] != 2 {
+		return 0, 0, 0, false
+	}
+	// a one-byte zigzag pos is not negative when even
+	f, z := int(lS[lc+1]), lS[lc+2]
+	return fS[fc+1], f, int(z >> 1), f < min(numFields, lastByte) && z&(lastByte|1) == 0
+}
+
+// minDenseRun is the shortest run nextPosRun reads without stepping the
+// iterator per document.
+const minDenseRun = 16
+
+// denseRun returns m when the next m (at most limit) documents of it, the
+// iterator over ActualBM, are consecutive and in the loaded chunk, else 0.
+// Whether ActualBM holds every document of the chunk's range is checked
+// once per chunk; then so do the postings, and the next document follows
+// the last one read.
+func (i *PostingsIterator) denseRun(it *roaring.IntIterator, limit int) int {
+	if limit < minDenseRun || !it.HasNext() {
+		return 0
+	}
+	if !i.denseChecked {
+		i.denseChecked, i.denseEnd = true, 0
+		size, bm := i.postings.chunkSize, i.ActualBM
+		start, end := i.chunkEnd-min(size, i.chunkEnd), min(i.chunkEnd, uint64(bm.Maximum())+1)
+		var below uint64 // postings before start
+		if start > 0 {
+			below = bm.Rank(uint32(start - 1)) // #nosec G115 -- start is a document number.
+		}
+		if end > start && bm.Rank(uint32(end-1))-below == end-start { // #nosec G115 -- end-1 is a document number.
+			i.denseEnd = end
+		}
+	}
+	d := uint64(it.PeekNext())
+	if d >= i.denseEnd {
+		return 0
+	}
+	return int(min(uint64(limit), i.denseEnd-d)) // #nosec G115 -- at most limit.
 }
 
 // handleChunkShift places the chunk number in the high half of an offsets
@@ -1476,7 +1543,7 @@ func (i *PostingsIterator) ActualBitmap() *roaring.Bitmap {
 func (i *PostingsIterator) ReplaceActual(abm *roaring.Bitmap) {
 	i.ActualBM = abm
 	i.Actual = abm.Iterator()
-	i.started = true
+	i.started, i.denseChecked = true, false
 	if i.all == nil && i.postings != nil && i.postings.postings != nil {
 		i.all = i.postings.postings.Iterator()
 	}
