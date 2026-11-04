@@ -19,8 +19,8 @@ import (
 	"os"
 	"unicode"
 
-	"github.com/blevesearch/mmap-go"
 	segment "github.com/vcaesar/bluge_segment_api"
+	"github.com/zedsearch/mmap-go"
 
 	"github.com/spf13/cobra"
 

@@ -35,18 +35,22 @@ type chunkedIntDecoder struct {
 	// version 5+ freq/norm stream, empty otherwise
 	maxFreqs []uint64
 	minNorms []uint64
+	// compact chunks (version 6+) start with a chunkRaw/chunkS2 flag
+	compact bool
 }
 
 // newChunkedIntDecoder reads the chunk header at offset; withBounds says the
-// header carries per-chunk freq/norm bounds (version 5+ freq/norm streams).
+// header carries per-chunk freq/norm bounds (version 5+ freq/norm streams)
+// and compact that chunks carry a raw/s2 flag byte (version 6+).
 func newChunkedIntDecoder(data *segment.Data, offset uint64, rv *chunkedIntDecoder,
-	withBounds bool) (*chunkedIntDecoder, error) {
+	withBounds, compact bool) (*chunkedIntDecoder, error) {
 	if rv == nil {
 		rv = &chunkedIntDecoder{startOffset: offset, data: data}
 	} else {
 		rv.startOffset = offset
 		rv.data = data
 	}
+	rv.compact = compact
 	rv.maxFreqs, rv.minNorms = rv.maxFreqs[:0], rv.minNorms[:0]
 	if offset == termNotEncoded {
 		rv.chunkOffsets = rv.chunkOffsets[:0]
@@ -149,13 +153,34 @@ func (d *chunkedIntDecoder) loadChunk(chunk int) error {
 		return err
 	}
 	if len(curChunkBytesData) == 0 {
+		// an empty chunk reads as empty, not as the previous chunk
+		d.curChunkBytes = nil
+		if d.r == nil {
+			d.r = newMemUvarintReader(nil)
+		} else {
+			d.r.Reset(nil)
+		}
 		return nil
 	}
-	d.uncompressed, err = compress.Decompress(d.uncompressed[:cap(d.uncompressed)], curChunkBytesData)
-	if err != nil {
-		return err
+	if d.compact {
+		flag, body := curChunkBytesData[0], curChunkBytesData[1:]
+		switch flag {
+		case chunkRaw:
+			d.curChunkBytes = body
+		case chunkS2:
+			if d.uncompressed, err = compress.Decompress(d.uncompressed[:cap(d.uncompressed)], body); err != nil {
+				return err
+			}
+			d.curChunkBytes = d.uncompressed
+		default:
+			return fmt.Errorf("unknown integer chunk flag %d", flag)
+		}
+	} else {
+		if d.uncompressed, err = compress.Decompress(d.uncompressed[:cap(d.uncompressed)], curChunkBytesData); err != nil {
+			return err
+		}
+		d.curChunkBytes = d.uncompressed
 	}
-	d.curChunkBytes = d.uncompressed
 	if d.r == nil {
 		d.r = newMemUvarintReader(d.curChunkBytes)
 	} else {
@@ -186,7 +211,7 @@ func (d *chunkedIntDecoder) isNil() bool {
 }
 
 func (d *chunkedIntDecoder) readUvarint() (uint64, error) {
-	return d.r.ReadUvarint()
+	return d.r.readUvarintFast()
 }
 
 func (d *chunkedIntDecoder) SkipUvarint() {

@@ -22,8 +22,8 @@ import (
 	"testing"
 
 	"github.com/RoaringBitmap/roaring/v2"
-	"github.com/blevesearch/mmap-go"
 	segment "github.com/vcaesar/bluge_segment_api"
+	"github.com/zedsearch/mmap-go"
 )
 
 // various helpers to test with files, even though

@@ -112,7 +112,7 @@ func TestLocationIntegerBounds(t *testing.T) {
 			postings:  &PostingsList{sb: &Segment{fieldsInv: []string{"field"}}},
 			locReader: &chunkedIntDecoder{r: newMemUvarintReader(data)},
 		}
-		if err := itr.readLocation(&Location{}); err == nil {
+		if err := itr.readLocation(&Location{}, nil); err == nil {
 			t.Fatalf("accepted overflowing location component %d", n)
 		}
 	}

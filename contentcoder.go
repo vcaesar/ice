@@ -110,8 +110,8 @@ func (c *chunkedContentCoder) flushContents() error {
 	diffDocNum := uint64(0)
 	diffDvOffset := uint64(0)
 	for _, meta := range c.chunkMeta {
-		err = writeUvarints(&c.chunkMetaBuf, meta.DocNum-diffDocNum, meta.DocDvOffset-diffDvOffset)
-		if err != nil {
+		b := binary.AppendUvarint(c.chunkMetaBuf.AvailableBuffer(), meta.DocNum-diffDocNum)
+		if _, err = c.chunkMetaBuf.Write(binary.AppendUvarint(b, meta.DocDvOffset-diffDvOffset)); err != nil {
 			return err
 		}
 		diffDocNum = meta.DocNum

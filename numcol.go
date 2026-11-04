@@ -22,6 +22,7 @@ import (
 	"math"
 	"sort"
 
+	"github.com/RoaringBitmap/roaring/v2"
 	segment "github.com/vcaesar/bluge_segment_api"
 )
 
@@ -35,7 +36,7 @@ type NumericField = segment.NumericField
 //	               [docDelta uvarint]*count (omitted when dense)
 //	               [count * width bytes little-endian of uint64(v)-uint64(min)]
 //	block index  – per block: [count uvarint] and, when count > 0,
-//	               [dense byte][min zigzag][max zigzag][width byte][dataOffset uvarint]
+//	               [dataOffset uvarint][dense byte][min zigzag][max zigzag][width byte]
 //	trailer      – [blockIndexOffset u64][numBlocks u64], both big endian
 //
 // Doc numbers repeat for multi-valued fields; "dense" means the block holds
@@ -332,8 +333,14 @@ func newNumericColumnCursor(col *numericColumn) *numericColumnCursor {
 	return &numericColumnCursor{col: col, block: math.MaxUint64}
 }
 
-func (c *numericColumnCursor) loadBlock(s *Segment, block uint64) error {
+func (c *numericColumnCursor) loadBlock(s *Segment, block uint64) (err error) {
 	c.block = block
+	defer func() {
+		if err != nil {
+			// a failed block must not pass, from the cache, as empty
+			c.block = math.MaxUint64
+		}
+	}()
 	c.pos = 0
 	c.docs = c.docs[:0]
 	c.vals = c.vals[:0]
@@ -378,24 +385,44 @@ func (c *numericColumnCursor) loadBlock(s *Segment, block uint64) error {
 		return io.ErrUnexpectedEOF
 	}
 	if cap(c.vals) < count {
-		c.vals = make([]int64, 0, count)
+		c.vals = make([]int64, count)
 	}
-	for i := 0; i < count; i++ {
-		var delta uint64
-		switch m.width {
-		case widthByte:
-			delta = uint64(data[i])
-		case widthWord:
-			delta = uint64(binary.LittleEndian.Uint16(data[i*2:]))
-		case widthDword:
-			delta = uint64(binary.LittleEndian.Uint32(data[i*4:]))
-		case widthQword:
-			delta = binary.LittleEndian.Uint64(data[i*8:])
-		}
-		// #nosec G115 -- inverse of the writer's two's-complement wrap.
-		c.vals = append(c.vals, int64(uint64(m.min)+delta))
-	}
+	c.vals = c.vals[:count]
+	decodeNumericBlock(c.vals, data, m.width, m.min)
 	return nil
+}
+
+// decodeNumericBlock fills vals with min plus the width-byte little-endian
+// deltas in data, one loop per width so the inner loops stay branch free.
+func decodeNumericBlock(vals []int64, data []byte, width uint8, minVal int64) {
+	// #nosec G115 -- inverse of the writer's two's-complement wrap.
+	base := uint64(minVal)
+	switch width {
+	case widthNone:
+		for i := range vals {
+			vals[i] = minVal
+		}
+	case widthByte:
+		data = data[:len(vals)]
+		for i, b := range data {
+			vals[i] = int64(base + uint64(b)) // #nosec G115 -- see base.
+		}
+	case widthWord:
+		data = data[:2*len(vals)]
+		for i := range vals {
+			vals[i] = int64(base + uint64(binary.LittleEndian.Uint16(data[2*i:]))) // #nosec G115 -- see base.
+		}
+	case widthDword:
+		data = data[:4*len(vals)]
+		for i := range vals {
+			vals[i] = int64(base + uint64(binary.LittleEndian.Uint32(data[4*i:]))) // #nosec G115 -- see base.
+		}
+	case widthQword:
+		data = data[:8*len(vals)]
+		for i := range vals {
+			vals[i] = int64(base + binary.LittleEndian.Uint64(data[8*i:])) // #nosec G115 -- see base.
+		}
+	}
 }
 
 // visit calls visitor for every value of docNum.
@@ -429,25 +456,118 @@ func (c *numericColumnCursor) visit(s *Segment, docNum uint64, visitor func(fiel
 	return nil
 }
 
-// iterate visits every (docNum, value) pair in doc order.
-func (c *numericColumnCursor) iterate(s *Segment, visitor func(docNum uint64, value int64) error) error {
+// iterateBlocks calls visitor for every non-empty block in doc order, with
+// docs nil for dense blocks (doc numbers base, base+1, ...).
+func (c *numericColumnCursor) iterateBlocks(s *Segment, visitor func(base uint64, docs []uint64, vals []int64) error) error {
 	for block := range c.col.blocks {
+		if c.col.blocks[block].count == 0 {
+			continue
+		}
 		if err := c.loadBlock(s, uint64(block)); err != nil {
 			return err
 		}
-		blockStart := uint64(block) * numericBlockSize
-		dense := c.col.blocks[block].dense
-		for i, v := range c.vals {
-			docNum := blockStart + uint64(i)
-			if !dense {
-				docNum = c.docs[i]
+		var docs []uint64
+		if !c.col.blocks[block].dense {
+			docs = c.docs
+		}
+		if err := visitor(uint64(block)*numericBlockSize, docs, c.vals); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// iterate visits every (docNum, value) pair in doc order.
+func (c *numericColumnCursor) iterate(s *Segment, visitor func(docNum uint64, value int64) error) error {
+	return c.iterateBlocks(s, func(base uint64, docs []uint64, vals []int64) error {
+		for i, v := range vals {
+			docNum := base + uint64(i)
+			if docs != nil {
+				docNum = docs[i]
 			}
 			if err := visitor(docNum, v); err != nil {
 				return err
 			}
 		}
+		return nil
+	})
+}
+
+// VisitNumericColumn calls visitor for every (docNum, value) of field in doc
+// order, decoding the column block by block. ok is false when field has no
+// numeric column in this segment.
+func (s *Segment) VisitNumericColumn(field string, visitor func(docNum uint64, value int64) error) (ok bool, err error) {
+	fieldIDPlus1, exists := s.fieldsMap[field]
+	if !exists {
+		return false, nil
 	}
-	return nil
+	col, exists := s.fieldNumCols[fieldIDPlus1-1]
+	if !exists {
+		return false, nil
+	}
+	return true, newNumericColumnCursor(col).iterate(s, visitor)
+}
+
+// VisitNumericBlocks is VisitNumericColumn a block at a time: docs and vals
+// are parallel, docs is nil when the block is dense (doc numbers base,
+// base+1, ...), and both are reused between calls. ok is false when field
+// has no numeric column in this segment.
+func (s *Segment) VisitNumericBlocks(field string, visitor func(base uint64, docs []uint64, vals []int64) error) (ok bool, err error) {
+	fieldIDPlus1, exists := s.fieldsMap[field]
+	if !exists {
+		return false, nil
+	}
+	col, exists := s.fieldNumCols[fieldIDPlus1-1]
+	if !exists {
+		return false, nil
+	}
+	return true, newNumericColumnCursor(col).iterateBlocks(s, visitor)
+}
+
+// NumericRange returns the documents of field with a value in [lo, hi].
+// Blocks outside the range are skipped by their bounds and dense blocks
+// fully inside it are added without decoding. ok is false when field has
+// no numeric column in this segment.
+func (s *Segment) NumericRange(field string, lo, hi int64) (bm *roaring.Bitmap, ok bool, err error) {
+	fieldIDPlus1, exists := s.fieldsMap[field]
+	if !exists {
+		return nil, false, nil
+	}
+	col, exists := s.fieldNumCols[fieldIDPlus1-1]
+	if !exists {
+		return nil, false, nil
+	}
+	bm = roaring.New()
+	if lo > hi {
+		return bm, true, nil
+	}
+	cur := newNumericColumnCursor(col)
+	for block := range col.blocks {
+		m := &col.blocks[block]
+		if m.count == 0 || m.max < lo || m.min > hi {
+			continue
+		}
+		start := uint64(block) * numericBlockSize
+		if m.dense && m.min >= lo && m.max <= hi {
+			bm.AddRange(start, start+uint64(m.count))
+			continue
+		}
+		if err := cur.loadBlock(s, uint64(block)); err != nil {
+			return nil, false, err
+		}
+		for i, v := range cur.vals {
+			if v < lo || v > hi {
+				continue
+			}
+			doc := start + uint64(i)
+			if !m.dense {
+				doc = cur.docs[i]
+			}
+			// #nosec G115 -- doc numbers are bounded by the segment's uint32 doc count.
+			bm.Add(uint32(doc))
+		}
+	}
+	return bm, true, nil
 }
 
 // prefixCodedInt64 encodes v like bluge's numeric.NewPrefixCodedInt64 with

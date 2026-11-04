@@ -74,3 +74,31 @@ func BenchmarkDocumentValueStateReuse(b *testing.B) {
 		}
 	}
 }
+
+// Doc values visited through the cached per-segment plan keep request order,
+// skip unknown fields, and survive a field listed twice.
+func TestDocumentValuePlanOrder(t *testing.T) {
+	results := []segment.Document{
+		&FakeDocument{NewFakeField("a", "x", true, false, true), NewFakeField("b", "y z", true, false, true)},
+		&FakeDocument{NewFakeField("a", "w", true, false, true), NewFakeField("b", "v", true, false, true)},
+	}
+	seg, _, err := newWithChunkMode(results, encodeNorm, defaultChunkMode, DefaultOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dvr, err := seg.(*Segment).DocumentValueReader([]string{"b", "missing", "a", "b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for doc, want := range []string{"b:y b:z a:x b:y b:z ", "b:v a:w b:v "} {
+		got := ""
+		if err := dvr.VisitDocumentValues(uint64(doc), func(f string, term []byte) {
+			got += f + ":" + string(term) + " "
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("doc %d: got %q want %q", doc, got, want)
+		}
+	}
+}

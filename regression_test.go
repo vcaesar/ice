@@ -71,16 +71,20 @@ func TestTermFinalizationCompressionError(t *testing.T) {
 		buf := make([]byte, binary.MaxVarintLen64)
 		if merging {
 			var lastDoc, lastFreq, lastNorm uint64
-			err = finishTerm(writer, postings, tf, loc, builder, buf, []byte("term"), &lastDoc, &lastFreq, &lastNorm)
+			err = finishTerm(writer, postings, tf, loc, nil, builder, buf, []byte("term"), &lastDoc, &lastFreq, &lastNorm)
 		} else {
 			s := &interim{
 				results:   []segment.Document{&FakeDocument{}},
-				chunkMode: defaultChunkMode, w: writer, builder: builder,
+				chunkMode: defaultChunkMode, w: writer,
 				Postings:  []*roaring.Bitmap{postings},
 				FreqNorms: [][]interimFreqNorm{{{freq: 1}}},
 				Locs:      [][]interimLoc{nil},
 			}
-			err = s.writeDictsTermField(make([][]byte, 1), map[string]uint64{"term": 1}, "term", tf, loc, buf)
+			var post bytes.Buffer
+			_, err = s.appendTermPostings(&post, make([][]byte, 1), map[string]uint64{"term": 1}, "term", tf, loc, nil)
+			if post.Len() != 0 {
+				t.Error("appended postings after failed compression")
+			}
 		}
 		if err == nil {
 			t.Errorf("merging=%v: expected final compression error", merging)
