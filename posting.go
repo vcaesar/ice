@@ -753,8 +753,9 @@ func (i *PostingsIterator) nextDocNum1Hit(atOrAfter uint64) (docNum uint64, exis
 }
 
 // rankSkipMinGap is the docNum gap past which a clean Advance skips the
-// passed postings by bitmap rank rather than iterating them.
-const rankSkipMinGap = 256
+// passed postings by bitmap rank rather than iterating them. Ranking is
+// cheaper from gaps of about 16 docs (BenchmarkPostingsAdvanceGap).
+const rankSkipMinGap = 16
 
 // optimization when the postings list is "clean" (e.g., no updates &
 // no deletions) where the all bitmap is the same as the actual bitmap

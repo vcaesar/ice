@@ -438,3 +438,61 @@ func TestOrDenseViaReusedScratch(t *testing.T) {
 		}
 	}
 }
+
+// BenchmarkPostingsAdvanceGap advances a scored iterator by fixed gaps,
+// the access pattern of a conjunction driven by a sparser clause.
+func BenchmarkPostingsAdvanceGap(b *testing.B) {
+	seg := buildSkipSegment(&testing.T{}, 100000, chunkModeV1)
+	for _, gap := range []uint64{8, 32, 64, 128, 200, 512} {
+		b.Run("gap"+strconv.FormatUint(gap, 10), func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				it := skipIterator(&testing.T{}, seg)
+				for target := uint64(0); ; target += gap {
+					p, err := it.Advance(target)
+					if err != nil {
+						b.Fatal(err)
+					}
+					if p == nil {
+						break
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestPostingsAdvanceNearRankGap advances by every gap around
+// rankSkipMinGap, where Advance switches between iterating and ranking.
+func TestPostingsAdvanceNearRankGap(t *testing.T) {
+	for _, chunkMode := range []uint32{16, 1024, chunkModeV1} {
+		seg := buildSkipSegment(t, 20000, chunkMode)
+		want := allPostings(t, skipIterator(t, seg))
+		for gap := uint64(rankSkipMinGap - 2); gap <= 3*rankSkipMinGap; gap++ {
+			it := skipIterator(t, seg)
+			j := 0
+			// targets stay past the last hit: iterators only move forward
+			for target := uint64(0); ; target = max(target+gap, want[j].doc+1) {
+				p, err := it.Advance(target)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for j < len(want) && want[j].doc < target {
+					j++
+				}
+				if j == len(want) {
+					if p != nil {
+						t.Fatalf("mode %d gap %d: Advance(%d) = %d, want end", chunkMode, gap, target, p.Number())
+					}
+					break
+				}
+				if p == nil {
+					t.Fatalf("mode %d gap %d: Advance(%d) = end, want %+v", chunkMode, gap, target, want[j])
+				}
+				if got := (plainPosting{p.Number(), p.Frequency(), p.Norm()}); got != want[j] {
+					t.Fatalf("mode %d gap %d: Advance(%d) = %+v, want %+v", chunkMode, gap, target, got, want[j])
+				}
+			}
+		}
+	}
+}

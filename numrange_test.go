@@ -252,3 +252,51 @@ func BenchmarkNumericRange(b *testing.B) {
 		})
 	}
 }
+
+// TestNumericCursorPoolReuse alternates segments whose blocks differ in
+// count and density, so a pooled cursor reused from the other segment
+// must not leak its docs or values into the result.
+func TestNumericCursorPoolReuse(t *testing.T) {
+	segs := make([]*Segment, 2)
+	sizes := []int{3000, 700}
+	for k, n := range sizes {
+		ids := make([]string, n)
+		for i := range ids {
+			ids[i] = strconv.Itoa(i)
+		}
+		seg, err := buildTypedSegment(ids, int64(k*10000), k == 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		segs[k] = seg
+	}
+	for round := range 20 {
+		k := round % 2
+		base := int64(k * 10000)
+		bm, ok, err := segs[k].NumericRange("price", base+100, base+650)
+		if err != nil || !ok {
+			t.Fatalf("round %d: ok=%v err=%v", round, ok, err)
+		}
+		if got := bm.GetCardinality(); got != 551 {
+			t.Fatalf("round %d: %d docs, want 551", round, got)
+		}
+		var count int
+		var sum int64
+		ok, err = segs[k].VisitNumericColumn("price", func(_ uint64, v int64) error {
+			count++
+			sum += v
+			return nil
+		})
+		if err != nil || !ok {
+			t.Fatalf("round %d: visit ok=%v err=%v", round, ok, err)
+		}
+		n := int64(sizes[k])
+		wantCount, wantSum := n, n*base+n*(n-1)/2
+		if k == 1 { // multi: each doc also holds -v
+			wantCount, wantSum = 2*n, 0
+		}
+		if int64(count) != wantCount || sum != wantSum {
+			t.Fatalf("round %d: %d values sum %d, want %d sum %d", round, count, sum, wantCount, wantSum)
+		}
+	}
+}

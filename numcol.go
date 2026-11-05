@@ -21,6 +21,7 @@ import (
 	"io"
 	"math"
 	"sort"
+	"sync"
 	"sync/atomic"
 
 	"github.com/RoaringBitmap/roaring/v2"
@@ -342,6 +343,24 @@ func newNumericColumnCursor(col *numericColumn) *numericColumnCursor {
 	return &numericColumnCursor{col: col, block: math.MaxUint64}
 }
 
+// numericCursorPool keeps the block buffers of cursors used for one call,
+// so a range or scan per segment does not allocate a block each time.
+var numericCursorPool = sync.Pool{New: func() any { return new(numericColumnCursor) }}
+
+// getNumericColumnCursor is newNumericColumnCursor from the pool; the
+// cursor goes back with putNumericColumnCursor.
+func getNumericColumnCursor(col *numericColumn) *numericColumnCursor {
+	c := numericCursorPool.Get().(*numericColumnCursor)
+	c.col, c.block, c.pos = col, math.MaxUint64, 0
+	return c
+}
+
+func putNumericColumnCursor(c *numericColumnCursor) {
+	c.col = nil
+	c.docs, c.vals = c.docs[:0], c.vals[:0]
+	numericCursorPool.Put(c)
+}
+
 func (c *numericColumnCursor) loadBlock(s *Segment, block uint64) (err error) {
 	c.block = block
 	defer func() {
@@ -514,7 +533,9 @@ func (s *Segment) VisitNumericColumn(field string, visitor func(docNum uint64, v
 	if !exists {
 		return false, nil
 	}
-	return true, newNumericColumnCursor(col).iterate(s, visitor)
+	cur := getNumericColumnCursor(col)
+	defer putNumericColumnCursor(cur)
+	return true, cur.iterate(s, visitor)
 }
 
 // VisitNumericBlocks is VisitNumericColumn a block at a time: docs and vals
@@ -530,7 +551,9 @@ func (s *Segment) VisitNumericBlocks(field string, visitor func(base uint64, doc
 	if !exists {
 		return false, nil
 	}
-	return true, newNumericColumnCursor(col).iterateBlocks(s, visitor)
+	cur := getNumericColumnCursor(col)
+	defer putNumericColumnCursor(cur)
+	return true, cur.iterateBlocks(s, visitor)
 }
 
 // NumericRange returns the documents of field with a value in [lo, hi].
@@ -573,7 +596,8 @@ func (s *Segment) NumericRange(field string, lo, hi int64) (bm *roaring.Bitmap, 
 	// adjacent dense blocks fully inside the range join one span, added
 	// as a run
 	var spanStart, spanEnd uint64
-	cur := newNumericColumnCursor(col)
+	cur := getNumericColumnCursor(col)
+	defer putNumericColumnCursor(cur)
 	for block := range col.blocks {
 		m := &col.blocks[block]
 		if !m.overlaps(lo, hi) {
