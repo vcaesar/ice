@@ -19,4 +19,4 @@ require (
 	golang.org/x/sys v0.49.0 // indirect
 )
 
-replace github.com/blevesearch/vellum => github.com/zedsearch/vellum v1.2.2
+replace github.com/blevesearch/vellum => github.com/zedsearch/vellum v1.2.3

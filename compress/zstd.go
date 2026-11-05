@@ -36,7 +36,9 @@ var (
 func ZSTDDecompress(dst, src []byte) ([]byte, error) {
 	decOnce.Do(func() {
 		var err error
-		decoder, err = zstd.NewReader(nil)
+		// one decoder per P: the default of 4 serializes concurrent
+		// searches on DecodeAll
+		decoder, err = zstd.NewReader(nil, zstd.WithDecoderConcurrency(0))
 		if err != nil {
 			log.Panicf("ZSTDDecompress: %+v", err)
 		}

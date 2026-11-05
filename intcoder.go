@@ -62,7 +62,10 @@ type chunkedIntCoder struct {
 // chunk flag bytes of compact (version 6+) int coder chunks
 const (
 	chunkRaw byte = 0
-	chunkS2  byte = 1
+	// chunkS2 chunks (versions 6 and 7) use compress.Algorithm
+	chunkS2 byte = 1
+	// chunkS2Fixed chunks (version 8+) are s2 blocks
+	chunkS2Fixed byte = 2
 )
 
 // newChunkedIntCoder returns a new chunk int coder which packs data into
@@ -220,12 +223,18 @@ func (c *chunkedIntCoder) closeCompact() error {
 	start := len(c.final)
 	if len(raw) > 0 {
 		var err error
-		c.compressed, err = compress.Compress(c.compressed[:cap(c.compressed)], raw)
+		flag := chunkS2
+		if writeVersion >= versionS2Chunks {
+			flag = chunkS2Fixed
+			c.compressed, err = compress.S2Compress(c.compressed[:cap(c.compressed)], raw)
+		} else {
+			c.compressed, err = compress.Compress(c.compressed[:cap(c.compressed)], raw)
+		}
 		if err != nil {
 			return err
 		}
 		if len(c.compressed)*4 <= len(raw)*3 {
-			c.final = append(append(c.final, chunkS2), c.compressed...)
+			c.final = append(append(c.final, flag), c.compressed...)
 		} else {
 			c.final = append(append(c.final, chunkRaw), raw...)
 		}
