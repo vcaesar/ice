@@ -182,6 +182,36 @@ func TestNumericRangeColumnMustMatchIndex(t *testing.T) {
 	}
 }
 
+// NumericRange on a large segment: a narrow range adds its decoded hits
+// directly rather than through a bitset of the whole segment, and a wide
+// one joins whole blocks into runs, not 8KB bitmap containers. Both match
+// a value filter. (TestNumericRange covers the bitset path.)
+func TestNumericRangeNarrowAndWide(t *testing.T) {
+	const n = numericRangeDenseRatio*numericBlockSize + 5000
+	ids := make([]string, n)
+	for i := range ids {
+		ids[i] = strconv.Itoa(i)
+	}
+	seg, err := buildTypedSegment(ids, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range [][2]int64{{5000, 5100}, {0, 0}, {n - 1, n + 5}, {0, n}, {100, n - 100}} {
+		bm, ok, err := seg.NumericRange("price", r[0], r[1])
+		if err != nil || !ok {
+			t.Fatalf("range %v: ok=%v err=%v", r, ok, err)
+		}
+		lo, hi := max(r[0], 0), min(r[1], n-1)
+		// #nosec G115 -- test values are small and nonnegative.
+		if bm.GetCardinality() != uint64(hi-lo+1) || bm.Minimum() != uint32(lo) || bm.Maximum() != uint32(hi) {
+			t.Fatalf("range %v: %d docs in [%d, %d]", r, bm.GetCardinality(), bm.Minimum(), bm.Maximum())
+		}
+		if size := bm.GetSizeInBytes(); size > 1024 {
+			t.Fatalf("range %v: %d bytes for one span, want runs", r, size)
+		}
+	}
+}
+
 // setDenseRange sets exactly the bits of [from, to), across word edges.
 func TestSetDenseRange(t *testing.T) {
 	for _, r := range [][2]uint64{{0, 0}, {0, 1}, {3, 64}, {0, 128}, {63, 65}, {5, 200}, {64, 192}, {130, 131}} {
@@ -193,5 +223,32 @@ func TestSetDenseRange(t *testing.T) {
 				t.Fatalf("range %v: bit %d = %v", r, i, got)
 			}
 		}
+	}
+}
+
+// BenchmarkNumericRange covers a wide range, which takes the dense bitset,
+// and a narrow one, which adds its few documents directly.
+func BenchmarkNumericRange(b *testing.B) {
+	const n = 1 << 20
+	ids := make([]string, n)
+	for i := range ids {
+		ids[i] = strconv.Itoa(i)
+	}
+	seg, err := buildTypedSegment(ids, 0, false)
+	if err != nil {
+		b.Fatal(err)
+	}
+	for _, r := range []struct {
+		name   string
+		lo, hi int64
+	}{{"all", 0, n}, {"half", n / 4, 3 * n / 4}, {"narrow", 5000, 5100}} {
+		b.Run(r.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				if _, _, err := seg.NumericRange("price", r.lo, r.hi); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }

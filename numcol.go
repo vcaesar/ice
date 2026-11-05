@@ -551,39 +551,100 @@ func (s *Segment) NumericRange(field string, lo, hi int64) (bm *roaring.Bitmap, 
 	if indexed, err := s.columnIndexed(col); err != nil || !indexed {
 		return nil, false, err
 	}
+	bm = roaring.New()
 	if lo > hi {
-		return roaring.New(), true, nil
+		return bm, true, nil
 	}
-	// set bits in a dense bitmap and convert once: per-doc roaring Adds
-	// cost more than the scan
-	dense := make([]uint64, (s.footer.numDocs+wordBits-1)/wordBits)
+	numDocs := s.footer.numDocs
+	// hits of decoded blocks go through a dense bitset converted once when
+	// there are many, as per-doc roaring Adds then cost more than its scan;
+	// few go straight into bm, so a narrow range does not pay for a bitset
+	// of the whole segment
+	var decoded uint64
+	for block := range col.blocks {
+		if m := &col.blocks[block]; m.overlaps(lo, hi) && !m.within(lo, hi) {
+			decoded += uint64(m.count)
+		}
+	}
+	var dense []uint64
+	if decoded >= numDocs/numericRangeDenseRatio {
+		dense = make([]uint64, (numDocs+wordBits-1)/wordBits)
+	}
+	// adjacent dense blocks fully inside the range join one span, added
+	// as a run
+	var spanStart, spanEnd uint64
 	cur := newNumericColumnCursor(col)
 	for block := range col.blocks {
 		m := &col.blocks[block]
-		if m.count == 0 || m.max < lo || m.min > hi {
+		if !m.overlaps(lo, hi) {
+			continue
+		}
+		if !m.within(lo, hi) {
+			if err := cur.addHits(s, uint64(block), lo, hi, bm, dense); err != nil {
+				return nil, false, err
+			}
 			continue
 		}
 		start := uint64(block) * numericBlockSize
-		if m.dense && m.min >= lo && m.max <= hi {
-			setDenseRange(dense, start, start+uint64(m.count))
+		end := start + uint64(m.count)
+		if end > numDocs {
+			return nil, false, fmt.Errorf("numeric column block %d past %d documents", block, numDocs)
+		}
+		if start != spanEnd {
+			bm.AddRange(spanStart, spanEnd)
+			spanStart = start
+		}
+		spanEnd = end
+	}
+	bm.AddRange(spanStart, spanEnd)
+	if dense != nil {
+		bm.Or(roaring.FromDense(dense, false))
+	}
+	return bm, true, nil
+}
+
+// numericRangeDenseRatio sets NumericRange's switch to a dense bitset: at
+// least one document to decode per this many in the segment.
+const numericRangeDenseRatio = 128
+
+// overlaps reports whether the block holds values in [lo, hi].
+func (m *numericBlockMeta) overlaps(lo, hi int64) bool {
+	return m.count > 0 && m.max >= lo && m.min <= hi
+}
+
+// within reports whether the block is dense with every value in [lo, hi],
+// so it matches whole without decoding.
+func (m *numericBlockMeta) within(lo, hi int64) bool {
+	return m.dense && m.min >= lo && m.max <= hi
+}
+
+// addHits adds the documents of block with a value in [lo, hi] to dense
+// when it is set, else to bm.
+func (c *numericColumnCursor) addHits(s *Segment, block uint64, lo, hi int64, bm *roaring.Bitmap, dense []uint64) error {
+	if err := c.loadBlock(s, block); err != nil {
+		return err
+	}
+	numDocs := s.footer.numDocs
+	start := block * numericBlockSize
+	for i, v := range c.vals {
+		if v < lo || v > hi {
 			continue
 		}
-		if err := cur.loadBlock(s, uint64(block)); err != nil {
-			return nil, false, err
+		doc := start + uint64(i)
+		if !c.col.blocks[block].dense {
+			doc = c.docs[i]
 		}
-		for i, v := range cur.vals {
-			if v < lo || v > hi {
-				continue
-			}
-			doc := start + uint64(i)
-			if !m.dense {
-				doc = cur.docs[i]
-			}
+		if doc >= numDocs {
+			return fmt.Errorf("numeric column doc %d past %d documents", doc, numDocs)
+		}
+		if dense != nil {
 			dense[doc/wordBits] |= 1 << (doc % wordBits)
+		} else {
+			// #nosec G115 -- doc is below numDocs, a uint32 count.
+			bm.Add(uint32(doc))
 		}
 	}
-	bm = roaring.FromDense(dense, false)
-	return bm, true, nil
+	return nil
 }
 
 // setDenseRange sets bits [from, to) of dense.

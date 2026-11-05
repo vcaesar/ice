@@ -62,13 +62,12 @@ func (d *Dictionary) postingsBytes(offset uint64) ([]byte, error) {
 }
 
 // orRoaringDense ORs the portable-format roaring bitmap buf into dense
-// without decoding it into a roaring.Bitmap, returning its cardinality.
-// It returns false when buf is not a well-formed bitmap or holds a value
+// without decoding it into a roaring.Bitmap. It returns false when buf is not a well-formed bitmap or holds a value
 // past dense, leaving dense partly written; the caller then decodes buf
 // with roaring.
-func orRoaringDense(dense []uint64, buf []byte) (uint64, bool) {
+func orRoaringDense(dense []uint64, buf []byte) bool {
 	if len(buf) < roaringHeaderBytes {
-		return 0, false
+		return false
 	}
 	cookie := binary.LittleEndian.Uint32(buf)
 	var size, pos int
@@ -78,17 +77,19 @@ func orRoaringDense(dense []uint64, buf []byte) (uint64, bool) {
 		size = int(cookie>>roaringCookieShift) + 1
 		pos = 4 + (size+7)/8
 		if pos > len(buf) {
-			return 0, false
+			return false
 		}
 		runs = buf[4:pos]
 	case cookie == roaringCookieNoRuns:
-		size = int(binary.LittleEndian.Uint32(buf[4:]))
+		// bound before int conversion, which wraps negative on 32-bit
+		n := binary.LittleEndian.Uint32(buf[4:])
+		if n > roaringMaxSize {
+			return false
+		}
+		size = int(n)
 		pos = roaringHeaderBytes
 	default:
-		return 0, false
-	}
-	if size > roaringMaxSize {
-		return 0, false
+		return false
 	}
 	hdr := pos
 	pos += 4 * size
@@ -96,13 +97,11 @@ func orRoaringDense(dense []uint64, buf []byte) (uint64, bool) {
 		pos += 4 * size
 	}
 	if pos > len(buf) {
-		return 0, false
+		return false
 	}
-	var n uint64
 	for i := range size {
 		base := uint64(binary.LittleEndian.Uint16(buf[hdr+4*i:])) << roaringKeyShift
 		card := int(binary.LittleEndian.Uint16(buf[hdr+4*i+2:])) + 1
-		n += uint64(card)
 		var ok bool
 		switch {
 		case len(runs) > i/8 && runs[i/8]&(1<<(i%8)) != 0:
@@ -113,10 +112,10 @@ func orRoaringDense(dense []uint64, buf []byte) (uint64, bool) {
 			pos, ok = orArrayDense(dense, buf, pos, base, card)
 		}
 		if !ok {
-			return 0, false
+			return false
 		}
 	}
-	return n, true
+	return true
 }
 
 // orRunsDense ORs the run container at buf[pos:] into dense, returning
