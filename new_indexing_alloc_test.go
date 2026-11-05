@@ -432,20 +432,21 @@ func TestNewReusedCodersEncodeAlike(t *testing.T) {
 func TestInterimPoolSkipsLargeInterims(t *testing.T) {
 	prev := maxPooledInterimBytes
 	defer func() { maxPooledInterimBytes = prev }()
-	drain := func() {
-		for range 64 {
-			interimPool.Get()
-		}
-	}
-	docs := fstTestDocs(2000)
+	// The pool cannot be reliably drained (Get never steals another P's
+	// private slot), so look for this build's interim by its unique doc count
+	// instead of expecting an empty pool.
+	docs := fstTestDocs(2001)
 
 	maxPooledInterimBytes = 1
-	drain()
-	if _, _, err := New(docs, encodeNorm); err != nil {
+	_, _, err := New(docs, encodeNorm)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if s := interimPool.Get().(*interim); s.lastNumDocs != 0 {
-		t.Fatalf("an interim over the limit was pooled (lastNumDocs %d)", s.lastNumDocs)
+	for range 64 {
+		s := interimPool.Get().(*interim)
+		if s.lastNumDocs == len(docs) {
+			t.Fatalf("an interim over the limit was pooled (lastNumDocs %d)", s.lastNumDocs)
+		}
 	}
 
 	s := &interim{}
