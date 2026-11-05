@@ -551,10 +551,12 @@ func (s *Segment) NumericRange(field string, lo, hi int64) (bm *roaring.Bitmap, 
 	if indexed, err := s.columnIndexed(col); err != nil || !indexed {
 		return nil, false, err
 	}
-	bm = roaring.New()
 	if lo > hi {
-		return bm, true, nil
+		return roaring.New(), true, nil
 	}
+	// set bits in a dense bitmap and convert once: per-doc roaring Adds
+	// cost more than the scan
+	dense := make([]uint64, (s.footer.numDocs+wordBits-1)/wordBits)
 	cur := newNumericColumnCursor(col)
 	for block := range col.blocks {
 		m := &col.blocks[block]
@@ -563,7 +565,7 @@ func (s *Segment) NumericRange(field string, lo, hi int64) (bm *roaring.Bitmap, 
 		}
 		start := uint64(block) * numericBlockSize
 		if m.dense && m.min >= lo && m.max <= hi {
-			bm.AddRange(start, start+uint64(m.count))
+			setDenseRange(dense, start, start+uint64(m.count))
 			continue
 		}
 		if err := cur.loadBlock(s, uint64(block)); err != nil {
@@ -577,11 +579,24 @@ func (s *Segment) NumericRange(field string, lo, hi int64) (bm *roaring.Bitmap, 
 			if !m.dense {
 				doc = cur.docs[i]
 			}
-			// #nosec G115 -- doc numbers are bounded by the segment's uint32 doc count.
-			bm.Add(uint32(doc))
+			dense[doc/wordBits] |= 1 << (doc % wordBits)
 		}
 	}
+	bm = roaring.FromDense(dense, false)
 	return bm, true, nil
+}
+
+// setDenseRange sets bits [from, to) of dense.
+func setDenseRange(dense []uint64, from, to uint64) {
+	for ; from < to && from%wordBits != 0; from++ {
+		dense[from/wordBits] |= 1 << (from % wordBits)
+	}
+	for ; from+wordBits <= to; from += wordBits {
+		dense[from/wordBits] = ^uint64(0)
+	}
+	for ; from < to; from++ {
+		dense[from/wordBits] |= 1 << (from % wordBits)
+	}
 }
 
 // columnIndexed reports whether col holds exactly the documents with a

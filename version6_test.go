@@ -9,6 +9,8 @@ import (
 
 	"github.com/RoaringBitmap/roaring/v2"
 	segment "github.com/vcaesar/bluge_segment_api"
+
+	"github.com/vcaesar/ice/compress"
 )
 
 type plainLoc struct {
@@ -147,17 +149,26 @@ func TestVersion6LocationsMatchVersion5(t *testing.T) {
 	}
 }
 
-// TestCompactChunkFlags covers both chunk encodings: incompressible data
-// stays raw, repetitive data is stored s2, and both decode to the input.
+// TestCompactChunkFlags covers the chunk encodings: incompressible data
+// stays raw, repetitive data is compressed (with compress.Algorithm before
+// version 8, s2 from version 8 on), and all decode to the input.
 func TestCompactChunkFlags(t *testing.T) {
+	prevVersion, prevAlgorithm := writeVersion, compress.Algorithm
+	defer func() { writeVersion, compress.Algorithm = prevVersion, prevAlgorithm }()
+	repeat := func(uint64) uint64 { return 7 }
 	for _, tc := range []struct {
-		name string
-		vals func(i uint64) uint64
-		flag byte
+		name      string
+		vals      func(i uint64) uint64
+		flag      byte
+		version   uint32
+		algorithm int
 	}{
-		{"raw", func(i uint64) uint64 { return i * 2654435761 % 1000003 }, chunkRaw},
-		{"s2", func(uint64) uint64 { return 7 }, chunkS2},
+		{"raw", func(i uint64) uint64 { return i * 2654435761 % 1000003 }, chunkRaw, Version, compress.ZSTD},
+		{"s2", repeat, chunkS2Fixed, Version, compress.ZSTD},
+		{"v7 zstd", repeat, chunkS2, versionSplitOffsets, compress.ZSTD},
+		{"v7 s2", repeat, chunkS2, versionSplitOffsets, compress.S2},
 	} {
+		writeVersion, compress.Algorithm = tc.version, tc.algorithm
 		c := newChunkedIntCoder(1024, 1023)
 		c.compact = true
 		for i := range uint64(1000) {

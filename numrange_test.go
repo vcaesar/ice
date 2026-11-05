@@ -181,3 +181,17 @@ func TestNumericRangeColumnMustMatchIndex(t *testing.T) {
 		}
 	}
 }
+
+// setDenseRange sets exactly the bits of [from, to), across word edges.
+func TestSetDenseRange(t *testing.T) {
+	for _, r := range [][2]uint64{{0, 0}, {0, 1}, {3, 64}, {0, 128}, {63, 65}, {5, 200}, {64, 192}, {130, 131}} {
+		dense := make([]uint64, 4)
+		setDenseRange(dense, r[0], r[1])
+		for i := range uint64(256) {
+			got := dense[i/64]&(1<<(i%64)) != 0
+			if want := i >= r[0] && i < r[1]; got != want {
+				t.Fatalf("range %v: bit %d = %v", r, i, got)
+			}
+		}
+	}
+}

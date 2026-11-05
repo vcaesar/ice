@@ -35,7 +35,7 @@ type chunkedIntDecoder struct {
 	// version 5+ freq/norm stream, empty otherwise
 	maxFreqs []uint64
 	minNorms []uint64
-	// compact chunks (version 6+) start with a chunkRaw/chunkS2 flag
+	// compact chunks (version 6+) start with a chunkRaw/chunkS2/chunkS2Fixed flag
 	compact bool
 }
 
@@ -169,6 +169,11 @@ func (d *chunkedIntDecoder) loadChunk(chunk int) error {
 			d.curChunkBytes = body
 		case chunkS2:
 			if d.uncompressed, err = compress.Decompress(d.uncompressed[:cap(d.uncompressed)], body); err != nil {
+				return err
+			}
+			d.curChunkBytes = d.uncompressed
+		case chunkS2Fixed:
+			if d.uncompressed, err = compress.S2Decompress(d.uncompressed[:cap(d.uncompressed)], body); err != nil {
 				return err
 			}
 			d.curChunkBytes = d.uncompressed

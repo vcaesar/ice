@@ -27,12 +27,20 @@ import (
 	segment "github.com/vcaesar/bluge_segment_api"
 )
 
+// Version 8 compresses freq/norm, location and offset chunks with s2
+// whatever compress.Algorithm is (see versionS2Chunks).
 // Version 7 stores location start/end offsets apart from field and pos
 // (see versionSplitOffsets).
 // Version 6 stores freq/norm and location chunks raw unless s2 shrinks
 // them enough, and delta codes locations (see versionCompactPostings).
 // Version 5 added per-chunk freq/norm bounds (block max) to postings.
-const Version uint32 = 7
+const Version uint32 = 8
+
+// versionS2Chunks is the first version whose compact int chunks are s2
+// blocks flagged chunkS2Fixed. Older compact chunks flagged chunkS2 use
+// compress.Algorithm, which the segment does not record. Postings chunks
+// are small and decoded on every query, where zstd costs several times s2.
+const versionS2Chunks uint32 = 8
 
 // versionSplitOffsets is the first version whose location records hold
 // only (field, zigzag pos delta) per location, its (zigzag start delta,
