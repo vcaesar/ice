@@ -11,14 +11,18 @@ import (
 func TestSetAlgorithm(t *testing.T) {
 	previous := Algorithm
 	t.Cleanup(func() { Algorithm = previous })
-	for name, want := range map[string]int{
-		"snappy": SNAPPY, "s2": S2, "zstd": ZSTD, "minlz": MINLZ, "lz4": LZ4, " MinLZ ": MINLZ, "LZ4": LZ4,
+	for _, tc := range []struct {
+		name string
+		want int
+	}{
+		{"snappy", SNAPPY}, {"s2", S2}, {"zstd", ZSTD}, {"minlz", MINLZ}, {"lz4", LZ4},
+		{" MinLZ ", MINLZ}, {"LZ4", LZ4},
 	} {
-		if err := SetAlgorithm(name); err != nil {
-			t.Fatalf("%q: %v", name, err)
+		if err := SetAlgorithm(tc.name); err != nil {
+			t.Fatalf("%q: %v", tc.name, err)
 		}
-		if Algorithm != want {
-			t.Fatalf("%q: Algorithm = %d, want %d", name, Algorithm, want)
+		if Algorithm != tc.want {
+			t.Fatalf("%q: Algorithm = %d, want %d", tc.name, Algorithm, tc.want)
 		}
 	}
 	Algorithm = S2
@@ -68,7 +72,8 @@ func benchInputs() map[string][]byte {
 		"vector", "score", "merge", "shard", "golang", "compress", "token", "analyzer", "bluge"}
 	var docs, text, postings []byte
 	for i := 0; len(docs) < 64<<10; i++ {
-		docs = fmt.Appendf(docs, `{"_id":"doc-%08d","@timestamp":"2026-11-%02dT%02d:%02d:%02dZ","level":"%s","status":%d,"latency_ms":%d,"message":"%s %s %s"}`,
+		docs = fmt.Appendf(docs, `{"_id":"doc-%08d","@timestamp":"2026-11-%02dT%02d:%02d:%02dZ",`+
+			`"level":"%s","status":%d,"latency_ms":%d,"message":"%s %s %s"}`,
 			i, 1+rng.IntN(28), rng.IntN(24), rng.IntN(60), rng.IntN(60),
 			[]string{"info", "warn", "error"}[rng.IntN(3)], []int{200, 201, 404, 500}[rng.IntN(4)], rng.IntN(5000),
 			words[rng.IntN(len(words))], words[rng.IntN(len(words))], words[rng.IntN(len(words))])
@@ -79,7 +84,7 @@ func benchInputs() map[string][]byte {
 	}
 	for range 16 << 10 {
 		postings = binary.AppendUvarint(postings, uint64(1+rng.ExpFloat64()*20)) // doc deltas
-		postings = binary.AppendUvarint(postings, uint64(1+rng.IntN(4)))        // freq
+		postings = binary.AppendUvarint(postings, 1+rng.Uint64N(4))              // freq
 	}
 	inputs := repeatInputs()
 	return map[string][]byte{
