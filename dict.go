@@ -196,8 +196,9 @@ const maxArrayContainer = 4096
 // OrPostingsDense ORs the postings of every term the automaton accepts in
 // [startKeyInclusive, endKeyExclusive) into dense, a bitset of the
 // segment's documents, walking the dictionary once. It stops early once
-// every document is set, as no further term can add one. It returns false,
-// leaving dense partly written, if a posting falls outside dense.
+// every document is set, as no further term can add one, so it reads no
+// posting after that. It returns false, leaving dense partly written, if a
+// posting read falls outside dense.
 func (d *Dictionary) OrPostingsDense(a segment.Automaton, startKeyInclusive, endKeyExclusive []byte,
 	dense []uint64) (bool, error) {
 	if d.fst == nil {
@@ -216,9 +217,8 @@ func (d *Dictionary) OrPostingsDense(a segment.Automaton, startKeyInclusive, end
 			if rerr != nil {
 				return false, rerr
 			}
-			if n, ok := orRoaringDense(dense, buf); ok {
-				// only a term in many documents can complete the set
-				if n >= numDocs/4 && denseFull(dense, numDocs, &full) {
+			if orRoaringDense(dense, buf) {
+				if denseFull(dense, numDocs, &full) {
 					return true, nil
 				}
 				err = itr.Next()
@@ -254,6 +254,9 @@ func (d *Dictionary) OrPostingsDense(a segment.Automaton, startKeyInclusive, end
 			}
 		}
 		pl.normBits1Hit = 0
+		if denseFull(dense, numDocs, &full) {
+			return true, nil
+		}
 		err = itr.Next()
 	}
 	if err != vellum.ErrIteratorDone {

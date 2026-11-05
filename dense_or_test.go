@@ -68,8 +68,8 @@ func TestOrRoaringDense(t *testing.T) {
 			for _, v := range prior {
 				got[v/64] |= 1 << (v % 64)
 			}
-			if n, ok := orRoaringDense(got, buf); !ok || n != bm.GetCardinality() {
-				t.Fatalf("orRoaringDense = %d %v, want %d true", n, ok, bm.GetCardinality())
+			if !orRoaringDense(got, buf) {
+				t.Fatal("orRoaringDense rejected a valid bitmap")
 			}
 			for k := range want {
 				if got[k] != want[k] {
@@ -77,17 +77,21 @@ func TestOrRoaringDense(t *testing.T) {
 				}
 			}
 			if !bm.IsEmpty() {
-				if _, ok := orRoaringDense(make([]uint64, bm.Maximum()/64), buf); ok {
+				if orRoaringDense(make([]uint64, bm.Maximum()/64), buf) {
 					t.Fatal("accepted a bitmap past the bitset")
 				}
 			}
-			if _, ok := orRoaringDense(make([]uint64, len(want)), buf[:len(buf)-1]); len(buf) > 8 && ok {
+			if len(buf) > 8 && orRoaringDense(make([]uint64, len(want)), buf[:len(buf)-1]) {
 				t.Fatal("accepted a truncated bitmap")
 			}
 		})
 	}
-	if _, ok := orRoaringDense(make([]uint64, 4), []byte{1, 2, 3, 4, 0, 0, 0, 0}); ok {
+	if orRoaringDense(make([]uint64, 4), []byte{1, 2, 3, 4, 0, 0, 0, 0}) {
 		t.Fatal("accepted an unknown cookie")
+	}
+	// a container count past int32 must be rejected, not wrap negative
+	if orRoaringDense(make([]uint64, 4), []byte{0x3a, 0x30, 0, 0, 0xff, 0xff, 0xff, 0xff}) {
+		t.Fatal("accepted a huge container count")
 	}
 }
 
@@ -162,5 +166,42 @@ func TestOrPostingsDenseStopsWhenFull(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestOrPostingsDenseSkipsAfterFull proves the early stop: terms a0..a7,
+// each in an eighth of the first 64 documents, fill a one-word bitset, and
+// term b, whose postings lie past it, is never read. Without the stop b
+// makes the call report false.
+func TestOrPostingsDenseSkipsAfterFull(t *testing.T) {
+	docs := make([]segment.Document, 100)
+	for i := range docs {
+		term := "b"
+		if i < 64 {
+			term = "a" + strconv.Itoa(i%8)
+		}
+		docs[i] = &FakeDocument{
+			NewFakeField("_id", strconv.Itoa(i), true, false, false),
+			NewFakeField("body", term, false, true, false),
+		}
+	}
+	seg, _, err := newWithChunkMode(docs, encodeNorm, chunkModeV1, DefaultOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := seg.(*Segment)
+	d, err := s.dictionary("body")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dense := make([]uint64, 1)
+	if ok, err := d.OrPostingsDense(nil, []byte("a"), []byte("c"), dense); err != nil || ok {
+		t.Fatalf("before the stop applies: ok=%v err=%v, want b rejected", ok, err)
+	}
+	// as far as the stop can tell, the segment now holds 64 documents
+	s.footer.numDocs = 64
+	dense[0] = 0
+	if ok, err := d.OrPostingsDense(nil, []byte("a"), []byte("c"), dense); err != nil || !ok || dense[0] != ^uint64(0) {
+		t.Fatalf("ok=%v err=%v dense=%x, want a full word and b skipped", ok, err, dense[0])
 	}
 }
