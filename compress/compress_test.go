@@ -15,10 +15,12 @@ func TestCompressionRoundTrip(t *testing.T) {
 		{"snappy", SNAPPY},
 		{"s2", S2},
 		{"zstd", ZSTD},
+		{"minlz", MINLZ},
+		{"lz4", LZ4},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			Algorithm = tc.algorithm
-			for _, src := range [][]byte{nil, []byte("ice"), bytes.Repeat([]byte("stored field data"), 10000)} {
+			for _, src := range [][]byte{nil, []byte("ice"), bytes.Repeat([]byte("stored field data"), 10000), repeatInputs()["random"]} {
 				for _, reuse := range []bool{false, true} {
 					var encoded, decoded []byte
 					if reuse {

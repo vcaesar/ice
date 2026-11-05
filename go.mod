@@ -6,6 +6,8 @@ require (
 	github.com/RoaringBitmap/roaring/v2 v2.30.0
 	github.com/blevesearch/vellum v1.2.1
 	github.com/klauspost/compress v1.20.3
+	github.com/minio/minlz v1.2.3
+	github.com/pierrec/lz4/v4 v4.1.33
 	github.com/spf13/cobra v1.10.2
 	github.com/vcaesar/bluge_segment_api v1.2.2
 	github.com/zedsearch/mmap-go v1.3.0
