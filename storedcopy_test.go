@@ -60,7 +60,7 @@ func storedCopyFixture(tb testing.TB, count int) *Segment {
 }
 
 func TestStoredCopyMergeEquivalence(t *testing.T) {
-	for _, algorithm := range []int{compress.SNAPPY, compress.S2, compress.ZSTD} {
+	for _, algorithm := range []int{compress.SNAPPY, compress.S2, compress.ZSTD, compress.MINLZ, compress.LZ4} {
 		t.Run(fmt.Sprint(algorithm), func(t *testing.T) {
 			useCompression(t, algorithm)
 			for _, tc := range []struct {
