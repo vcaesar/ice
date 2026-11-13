@@ -234,7 +234,7 @@ func persistMergedRest(segments []*Segment, dropsIn []*roaring.Bitmap,
 	dictLocs = make([]uint64, len(fieldsInv))
 	fieldDvLocsStart := make([]uint64, len(fieldsInv))
 	fieldDvLocsEnd := make([]uint64, len(fieldsInv))
-	fieldDvNumeric := make([]bool, len(fieldsInv))
+	fieldDvKinds := make([]uint64, len(fieldsInv))
 
 	// these int coders are initialized with chunk size 1024
 	// however this will be reset to the correct chunk size
@@ -246,6 +246,7 @@ func persistMergedRest(segments []*Segment, dropsIn []*roaring.Bitmap,
 	locEncoder := newChunkedIntCoder(uint64(legacyChunkMode), newSegDocCount-1)
 	tfEncoder.compact = writeVersion >= versionCompactPostings
 	locEncoder.compact = tfEncoder.compact
+	locEncoder.slim = writeVersion >= versionSlimPostings
 	var offEncoder *chunkedIntCoder // location offsets, version 7+
 	if writeVersion >= versionSplitOffsets {
 		offEncoder = newChunkedIntCoder(uint64(legacyChunkMode), newSegDocCount-1)
@@ -273,7 +274,7 @@ func persistMergedRest(segments []*Segment, dropsIn []*roaring.Bitmap,
 	for fieldID, fieldName := range fieldsInv {
 		err = persistMergedRestField(segments, dropsIn, fieldsMap, newDocNumsIn, newSegDocCount, chunkMode, w,
 			closeCh, fieldName, newRoaring, fieldDocTracking, tfEncoder, locEncoder, offEncoder, newVellum, &vellumBuf,
-			bufMaxVarintLen64, fieldFreqs, fieldID, dictLocs, fieldDvLocsStart, fieldDvLocsEnd, fieldDvNumeric)
+			bufMaxVarintLen64, fieldFreqs, fieldID, dictLocs, fieldDvLocsStart, fieldDvLocsEnd, fieldDvKinds)
 		if err != nil {
 			return nil, nil, nil, 0, err
 		}
@@ -289,7 +290,7 @@ func persistMergedRest(segments []*Segment, dropsIn []*roaring.Bitmap,
 		fieldDocs[uint16(fieldID)] += fieldDocTracking.GetCardinality()
 	}
 
-	docValueOffset, err = writeDvLocs(w, bufMaxVarintLen64, fieldDvLocsStart, fieldDvLocsEnd, fieldDvNumeric)
+	docValueOffset, err = writeDvLocs(w, bufMaxVarintLen64, fieldDvLocsStart, fieldDvLocsEnd, fieldDvKinds)
 	if err != nil {
 		return nil, nil, nil, 0, err
 	}
@@ -301,7 +302,7 @@ func persistMergedRestField(segments []*Segment, dropsIn []*roaring.Bitmap, fiel
 	newDocNumsIn [][]uint64, newSegDocCount uint64, chunkMode uint32, w *countHashWriter, closeCh chan struct{},
 	fieldName string, newRoaring, fieldDocTracking *roaring.Bitmap, tfEncoder, locEncoder, offEncoder *chunkedIntCoder,
 	newVellum *vellum.Builder, vellumBuf *bytes.Buffer, bufMaxVarintLen64 []byte, fieldFreqs map[uint16]uint64,
-	fieldID int, dictLocs, fieldDvLocsStart, fieldDvLocsEnd []uint64, fieldDvNumeric []bool) error {
+	fieldID int, dictLocs, fieldDvLocsStart, fieldDvLocsEnd, fieldDvKinds []uint64) error {
 	var postings *PostingsList
 	var postItr *PostingsIterator
 
@@ -316,6 +317,7 @@ func persistMergedRestField(segments []*Segment, dropsIn []*roaring.Bitmap, fiel
 
 	newRoaring.Clear()
 	fieldDocTracking.Clear()
+	locEncoder.ownField = uint64(fieldID) // #nosec G115 -- an index.
 
 	var lastDocNum uint64
 	var lastFreq, lastNorm uint64
@@ -388,7 +390,7 @@ func persistMergedRestField(segments []*Segment, dropsIn []*roaring.Bitmap, fiel
 	}
 
 	err = buildMergedDocVals(newSegDocCount, w, closeCh, fieldName, fieldID, fieldDvLocsStart, fieldDvLocsEnd,
-		fieldDvNumeric, segmentsInFocus, newDocNums)
+		fieldDvKinds, segments, segmentsInFocus, newDocNums)
 	if err != nil {
 		return err
 	}
@@ -423,81 +425,117 @@ func writeMergedDict(w *countHashWriter, newVellum io.Closer, vellumBuf *bytes.B
 }
 
 func buildMergedDocVals(newSegDocCount uint64, w *countHashWriter, closeCh chan struct{}, fieldName string, fieldID int,
-	fieldDvLocsStart, fieldDvLocsEnd []uint64, fieldDvNumeric []bool, segmentsInFocus []*Segment, newDocNums [][]uint64) error {
+	fieldDvLocsStart, fieldDvLocsEnd, fieldDvKinds []uint64, segments, segmentsInFocus []*Segment,
+	newDocNums [][]uint64) error {
 	if allNumericColumns(segmentsInFocus, fieldName) {
-		fieldDvNumeric[fieldID] = true
+		fieldDvKinds[fieldID] = dvKindNumeric
 		return buildMergedNumericColumn(newSegDocCount, w, closeCh, fieldName, fieldID,
 			fieldDvLocsStart, fieldDvLocsEnd, segmentsInFocus, newDocNums)
 	}
-	// get the field doc value offset (start)
-	fieldDvLocsStart[fieldID] = uint64(w.Count()) // #nosec G115 -- countHashWriter checks overflow and counts nonnegative writes.
-
-	// update the field doc values
-	// NOTE: doc values continue to use legacy chunk mode
-	chunkSize, err := getChunkSize(legacyChunkMode, 0, 0)
-	if err != nil {
-		return err
+	if allStoredDocValues(segments, fieldName) {
+		// the stored values are merged with the documents
+		fieldDvKinds[fieldID], fieldDvLocsStart[fieldID], fieldDvLocsEnd[fieldID] = dvKindStored, 0, 0
+		return nil
 	}
-	fdvEncoder := newChunkedContentCoder(chunkSize, newSegDocCount-1, w, true)
+
+	var add func(docNum uint64, terms []byte) error
+	var finish func() error
+	if writeVersion >= versionNoStoredIndex {
+		tw, err := newTermDvWriter(newSegDocCount)
+		if err != nil {
+			return err
+		}
+		add, finish = tw.Add, func() (err error) {
+			fieldDvKinds[fieldID], fieldDvLocsStart[fieldID], fieldDvLocsEnd[fieldID], err = tw.Write(w)
+			return err
+		}
+	} else {
+		// NOTE: doc values continue to use legacy chunk mode
+		chunkSize, err := getChunkSize(legacyChunkMode, 0, 0)
+		if err != nil {
+			return err
+		}
+		// get the field doc value offset (start)
+		fieldDvLocsStart[fieldID] = uint64(w.Count()) // #nosec G115 -- countHashWriter checks overflow and counts nonnegative writes.
+		fdvEncoder := newChunkedContentCoder(chunkSize, newSegDocCount-1, w, true)
+		add, finish = fdvEncoder.Add, func() error {
+			if err := fdvEncoder.Close(); err != nil {
+				return err
+			}
+			if _, err := fdvEncoder.Write(); err != nil {
+				return err
+			}
+			fieldDvKinds[fieldID], fieldDvLocsEnd[fieldID] = dvKindTerms, uint64(w.Count()) // #nosec G115 -- see above.
+			return nil
+		}
+	}
 
 	fdvReadersAvailable := false
 	var dvIterClone *docValueReader
 	for segmentI, seg := range segmentsInFocus {
-		segmentI := segmentI
 		// check for the closure in meantime
 		if isClosed(closeCh) {
 			return segment.ErrClosed
 		}
+		mapping := newDocNums[segmentI]
+		addMapped := func(docNum uint64, terms []byte) error {
+			if mapping[docNum] == docDropped {
+				return nil
+			}
+			return add(mapping[docNum], terms)
+		}
 
 		fieldIDPlus1 := seg.fieldsMap[fieldName]
+		var err error
 		if col, exists := seg.fieldNumCols[fieldIDPlus1-1]; exists {
 			// mixed with term doc values elsewhere: degrade to terms
 			fdvReadersAvailable = true
-			err = mergeNumericAsTerms(seg, col, newDocNums[segmentI], fdvEncoder)
-			if err != nil {
-				return err
-			}
-			continue
-		}
-		if dvIter, exists := seg.fieldDvReaders[fieldIDPlus1-1]; exists &&
-			dvIter != nil {
+			err = mergeNumericAsTerms(seg, col, mapping, add)
+		} else if col, exists := seg.fieldOrdCols[fieldIDPlus1-1]; exists {
+			fdvReadersAvailable = true
+			err = col.iterate(seg, addMapped)
+		} else if seg.fieldStoredDvs[fieldIDPlus1-1] {
+			fdvReadersAvailable = true
+			err = seg.iterateStoredDocValues(fieldName, mapping, addMapped)
+		} else if dvIter, exists := seg.fieldDvReaders[fieldIDPlus1-1]; exists && dvIter != nil {
 			fdvReadersAvailable = true
 			dvIterClone = dvIter.cloneInto(dvIterClone)
-			err = dvIterClone.iterateAllDocValues(seg, func(docNum uint64, terms []byte) error {
-				if newDocNums[segmentI][docNum] == docDropped {
-					return nil
-				}
-				err2 := fdvEncoder.Add(newDocNums[segmentI][docNum], terms)
-				if err2 != nil {
-					return err2
-				}
-				return nil
-			})
-			if err != nil {
-				return err
-			}
+			err = dvIterClone.iterateAllDocValues(seg, addMapped)
+		}
+		if err != nil {
+			return err
 		}
 	}
 
-	if fdvReadersAvailable {
-		err = fdvEncoder.Close()
-		if err != nil {
-			return err
-		}
-
-		// persist the doc value details for this field
-		_, err = fdvEncoder.Write()
-		if err != nil {
-			return err
-		}
-
-		// get the field doc value offset (end)
-		fieldDvLocsEnd[fieldID] = uint64(w.Count()) // #nosec G115 -- countHashWriter checks overflow and counts nonnegative writes.
-	} else {
+	if !fdvReadersAvailable {
+		fieldDvKinds[fieldID] = dvKindTerms
 		fieldDvLocsStart[fieldID] = fieldNotUninverted
 		fieldDvLocsEnd[fieldID] = fieldNotUninverted
+		return nil
 	}
-	return nil
+	return finish()
+}
+
+// allStoredDocValues reports whether every segment with documents and the
+// field holds its doc values as its stored values, and at least one does.
+// A segment holding none counts against it, with or without terms of the
+// field: its stored values would be read as doc values it never had.
+func allStoredDocValues(segments []*Segment, fieldName string) bool {
+	if writeVersion < versionNoStoredIndex {
+		return false
+	}
+	var stored bool
+	for _, seg := range segments {
+		fieldIDPlus1, ok := seg.fieldsMap[fieldName]
+		if !ok || seg.footer.numDocs == 0 {
+			continue
+		}
+		if !seg.fieldStoredDvs[fieldIDPlus1-1] {
+			return false
+		}
+		stored = true
+	}
+	return stored
 }
 
 // allNumericColumns reports whether every segment holding doc values for
@@ -514,6 +552,9 @@ func allNumericColumns(segments []*Segment, fieldName string) bool {
 			continue
 		}
 		if dv, ok := seg.fieldDvReaders[fieldIDPlus1-1]; ok && dv != nil {
+			return false
+		}
+		if _, ok := seg.fieldOrdCols[fieldIDPlus1-1]; ok || seg.fieldStoredDvs[fieldIDPlus1-1] {
 			return false
 		}
 	}
@@ -552,14 +593,14 @@ func buildMergedNumericColumn(newSegDocCount uint64, w *countHashWriter, closeCh
 
 // mergeNumericAsTerms feeds a numeric column into a term doc value encoder,
 // grouping the values of each doc into one prefix coded term list.
-func mergeNumericAsTerms(seg *Segment, col *numericColumn, mapping []uint64, enc *chunkedContentCoder) error {
+func mergeNumericAsTerms(seg *Segment, col *numericColumn, mapping []uint64, add func(uint64, []byte) error) error {
 	var terms []byte
 	curDoc := uint64(docDropped)
 	flush := func() error {
 		if curDoc == docDropped || len(terms) == 0 {
 			return nil
 		}
-		return enc.Add(curDoc, terms)
+		return add(curDoc, terms)
 	}
 	err := newNumericColumnCursor(col).iterate(seg, func(docNum uint64, v int64) error {
 		newDoc := mapping[docNum]
@@ -671,16 +712,12 @@ func finishTerm(w *countHashWriter, newRoaring *roaring.Bitmap, tfEncoder, locEn
 }
 
 func writeDvLocs(w *countHashWriter, bufMaxVarintLen64 []byte, fieldDvLocsStart, fieldDvLocsEnd []uint64,
-	numeric []bool) (uint64, error) {
+	kinds []uint64) (uint64, error) {
 	fieldDvLocsOffset := uint64(w.Count()) // #nosec G115 -- countHashWriter checks overflow and counts nonnegative writes.
 
 	buf := bufMaxVarintLen64
 	for i := 0; i < len(fieldDvLocsStart); i++ {
-		kind := dvKindTerms
-		if numeric[i] {
-			kind = dvKindNumeric
-		}
-		n := binary.PutUvarint(buf, kind)
+		n := binary.PutUvarint(buf, kinds[i])
 		_, err := w.Write(buf[:n])
 		if err != nil {
 			return 0, err
@@ -777,7 +814,7 @@ func mergeTermFreqNormLocs(fieldsMap map[string]uint16, postItr *PostingsIterato
 					uint64(fieldsMap[loc.Field()]-1), pos, start, end, prevPos, prevStart)
 				prevPos, prevStart = pos, start
 			}
-			err = addLocationRecords(hitNewDocNum, locEncoder, offEncoder)
+			err = addLocationRecords(hitNewDocNum, uint64(nextFreq), locEncoder, offEncoder)
 			if err != nil {
 				return 0, 0, 0, err
 			}
@@ -862,6 +899,9 @@ func mergeStoredAndRemap(segments []*Segment, drops []*roaring.Bitmap,
 
 	// return value is the start of the stored index
 	storedIndexOffset = uint64(w.Count()) // #nosec G115 -- countHashWriter checks overflow and counts nonnegative writes.
+	if writeVersion >= versionNoStoredIndex {
+		return storedIndexOffset, newDocNums, nil
+	}
 
 	// now write out the stored doc index
 	for _, docNumOffset := range docNumOffsets {
@@ -1018,19 +1058,24 @@ func (s *Segment) copyStoredChunk(sourceDoc, newDocNum uint64, offsets []uint64,
 	if newDocNum > uint64(len(offsets)) || chunkSize > uint64(len(offsets))-newDocNum {
 		return false, fmt.Errorf("stored-field document count exceeds output capacity")
 	}
-	if sourceDoc > (math.MaxUint64-s.footer.storedIndexOffset)/fileAddrWidth {
-		return false, fmt.Errorf("stored-field index offset overflow")
-	}
-	index, err := readDataAt(s.data, s.footer.storedIndexOffset+sourceDoc*fileAddrWidth, chunkSize*fileAddrWidth)
-	if err != nil {
-		return false, err
+	var index []byte
+	if s.footer.version < versionNoStoredIndex {
+		if sourceDoc > (math.MaxUint64-s.footer.storedIndexOffset)/fileAddrWidth {
+			return false, fmt.Errorf("stored-field index offset overflow")
+		}
+		var err error
+		index, err = readDataAt(s.data, s.footer.storedIndexOffset+sourceDoc*fileAddrWidth, chunkSize*fileAddrWidth)
+		if err != nil {
+			return false, err
+		}
 	}
 	// Offsets are relative to the uncompressed chunk, so need no rebasing.
 	payload := uncompressed
+	var err error
 	for j := uint64(0); j < chunkSize; j++ {
-		offset := binary.BigEndian.Uint64(index[j*fileAddrWidth:])
 		// #nosec G115 -- payload is a suffix of uncompressed, so the difference is nonnegative.
-		if offset != uint64(len(uncompressed)-len(payload)) {
+		offset := uint64(len(uncompressed) - len(payload))
+		if index != nil && binary.BigEndian.Uint64(index[j*fileAddrWidth:]) != offset {
 			return false, nil
 		}
 		if _, _, payload, err = nextStoredDoc(payload); err != nil {

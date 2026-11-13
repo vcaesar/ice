@@ -34,8 +34,9 @@ const (
 
 // postingsBytes returns the serialized postings bitmap of a non 1-hit
 // postings list at offset, skipping the freq, location and offsets headers
-// in front of it.
-func (d *Dictionary) postingsBytes(offset uint64) ([]byte, error) {
+// in front of it; list says it is a delta list instead (version 10+, see
+// appendDocList).
+func (d *Dictionary) postingsBytes(offset uint64) (buf []byte, list bool, err error) {
 	n := 3
 	if d.sb.footer != nil && d.sb.footer.version >= versionSplitOffsets {
 		n = 4
@@ -43,22 +44,57 @@ func (d *Dictionary) postingsBytes(offset uint64) ([]byte, error) {
 	// #nosec G115 -- a segment's data length is nonnegative.
 	size := uint64(d.sb.data.Len())
 	if offset >= size {
-		return nil, fmt.Errorf("segment varint offset out of bounds: %d", offset)
+		return nil, false, fmt.Errorf("segment varint offset out of bounds: %d", offset)
 	}
 	hdr, err := readDataAt(d.sb.data, offset, min(uint64(n*binary.MaxVarintLen64), size-offset))
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	pos := 0
 	var postingsLen uint64
 	for range n {
 		v, k := binary.Uvarint(hdr[pos:])
 		if k <= 0 {
-			return nil, fmt.Errorf("invalid segment varint")
+			return nil, false, fmt.Errorf("invalid segment varint")
 		}
 		postingsLen, pos = v, pos+k
 	}
-	return readDataAt(d.sb.data, offset+uint64(pos), postingsLen)
+	if d.sb.footer != nil && d.sb.footer.version >= versionSlimPostings {
+		postingsLen, list = postingsLen>>1, postingsLen&1 != 0
+	}
+	buf, err = readDataAt(d.sb.data, offset+uint64(pos), postingsLen)
+	return buf, list, err
+}
+
+// orListDense ORs the documents of a delta list (see appendDocList) into
+// dense. It returns false, leaving dense partly written, when the list is
+// malformed or holds a document past dense.
+func orListDense(dense []uint64, list []byte) bool {
+	limit := uint64(len(dense)) * wordBits
+	next := uint64(0) // the least the next document can be
+	for c := 0; c < len(list); {
+		// gaps of short lists take one or two bytes
+		if b := list[c]; b < lastByte {
+			next += uint64(b)
+			c++
+		} else if c+1 < len(list) && list[c+1] < lastByte {
+			next += uint64(b&significantBits) | uint64(list[c+1])<<7
+			c += 2
+		} else {
+			v, k := binary.Uvarint(list[c:])
+			if k <= 0 || v >= limit {
+				return false
+			}
+			next += v
+			c += k
+		}
+		if next >= limit {
+			return false
+		}
+		dense[next/wordBits] |= 1 << (next % wordBits)
+		next++
+	}
+	return true
 }
 
 // orRoaringDense ORs the portable-format roaring bitmap buf into dense

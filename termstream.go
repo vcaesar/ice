@@ -96,6 +96,7 @@ type termStream struct {
 	head    uint32 // first block
 	tail    uint32 // next byte to write
 	lastDoc uint32 // of the last posting, which the next is a delta to
+	docs    uint32 // postings written, as encode needs before reading them
 	left    uint16 // bytes left in the current block, its link excluded
 	shift   uint8  // log2 of the current block's size
 }
@@ -157,6 +158,17 @@ func (r *termReader) byte() byte {
 }
 
 func (r *termReader) uvarint() uint64 {
+	// fast path: the varint ends before the block's link
+	if end := len(r.blk) - blockLinkLen; r.i < end {
+		if b := r.blk[r.i]; b < lastByte {
+			r.i++
+			return uint64(b)
+		}
+		if v, n := binary.Uvarint(r.blk[r.i:end]); n > 0 {
+			r.i += n
+			return v
+		}
+	}
 	var v uint64
 	for s := uint(0); ; s += 7 {
 		b := r.byte()

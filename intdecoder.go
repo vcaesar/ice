@@ -37,6 +37,8 @@ type chunkedIntDecoder struct {
 	minNorms []uint64
 	// compact chunks (version 6+) start with a chunkRaw/chunkS2/chunkS2Fixed flag
 	compact bool
+	// slim says the loaded chunk is in the slim layout (flagged chunkSlim)
+	slim bool
 }
 
 // newChunkedIntDecoder reads the chunk header at offset; withBounds says the
@@ -129,6 +131,7 @@ func readChunkHeaderUvarint(data *segment.Data, pos *int) (uint64, error) {
 }
 
 func (d *chunkedIntDecoder) loadChunk(chunk int) error {
+	d.slim = false
 	if d.startOffset == termNotEncoded {
 		d.r = newMemUvarintReader([]byte(nil))
 		return nil
@@ -164,7 +167,8 @@ func (d *chunkedIntDecoder) loadChunk(chunk int) error {
 	}
 	if d.compact {
 		flag, body := curChunkBytesData[0], curChunkBytesData[1:]
-		switch flag {
+		d.slim = flag&chunkSlim != 0
+		switch flag &^ chunkSlim {
 		case chunkRaw:
 			d.curChunkBytes = body
 		case chunkS2:
@@ -201,6 +205,7 @@ func (d *chunkedIntDecoder) reset() {
 	d.chunkOffsets = d.chunkOffsets[:0]
 	d.curChunkBytes = d.curChunkBytes[:0]
 	d.uncompressed = d.uncompressed[:0]
+	d.slim = false
 
 	// FIXME what?
 	// d.data = d.data[:0]

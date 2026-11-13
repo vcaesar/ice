@@ -59,6 +59,8 @@ type Builder struct {
 	timeMin, timeMax int64
 	untimed          bool // a document has no timestamp
 
+	idDv storedDocValue // see interim.idDv
+
 	// state of the current document
 	docNum    uint32
 	docMark   int
@@ -249,6 +251,10 @@ func (b *Builder) addField(f segment.Field) {
 	}
 	id := b.fieldIDs[f.Name()]
 	fb := b.fields[id]
+	if id == 0 {
+		b.idDv.check(f)
+		b.idDv.bad = b.idDv.bad || b.count[id] > 1
+	}
 	if f.Store() {
 		v := f.Value()
 		if over32(len(v)) {
@@ -346,6 +352,7 @@ func (b *Builder) addPosting(fb *builderField, tid, freq uint32, length int, loc
 		return
 	}
 	t.lastDoc = b.docNum
+	t.docs++
 }
 
 // cacheNorm computes the norm of fb at length unless known.
@@ -514,9 +521,9 @@ func (b *Builder) Build() (_ segment.Segment, _ uint64, err error) {
 		}
 	}()
 
-	// writeDicts gathers each term's postings from the records as it
-	// encodes it, so the records are never copied in term order
-	s.gather, s.beforePlace = b.gather, waitStored
+	// writeDicts encodes each term's postings straight from the records,
+	// so the records are never copied in term order
+	s.encode, s.beforePlace = b.encode, waitStored
 	b.gid, b.global, b.bases = gid, make([]*builderField, n), make([]uint64, n)
 	for g, l := range order {
 		b.global[g], b.bases[g] = b.fields[l], uint64(s.numPostingsLists) // #nosec G115 -- a count.
@@ -538,7 +545,7 @@ func (b *Builder) Build() (_ segment.Segment, _ uint64, err error) {
 	} else {
 		dictOffsets = make([]uint64, n)
 	}
-	b.arena.release() // gather is done with the postings
+	b.arena.release() // encode is done with the postings
 	err = waitStored()
 	if err != nil {
 		return nil, 0, err
@@ -592,6 +599,7 @@ func (b *Builder) newInterim(order []int, br *bytes.Buffer) *interim {
 	s := &interim{}
 	s.initVisitors()
 	s.chunkMode, s.normCalc, s.numDocs = defaultChunkMode, b.normCalc, b.numDocs
+	s.idDv = b.idDv.result()
 	br.Grow(b.stored.cap + 4*b.numDocs)
 	s.w = newCountHashWriter(br)
 	s.FieldsMap, s.FieldsInv = make(map[string]uint16, n), make([]string, n)
@@ -636,7 +644,10 @@ func (b *Builder) writeStored(s *interim, gid []uint16) (indexOffset uint64, chu
 		return s.metaBuf.Write(varBuf[:binary.PutUvarint(varBuf[:], v)])
 	}
 	vals := make([][][]byte, len(gid))
-	offsets := make([]byte, 0, fileAddrWidth*b.numDocs)
+	var offsets []byte
+	if writeVersion < versionNoStoredIndex {
+		offsets = make([]byte, 0, fileAddrWidth*b.numDocs)
+	}
 	coder := newChunkedDocumentCoder(uint64(defaultDocumentChunkSize), s.w)
 	var data []byte
 	rec, stored := 0, byteReader{l: &b.stored}
@@ -659,7 +670,9 @@ func (b *Builder) writeStored(s *interim, gid []uint16) (indexOffset uint64, chu
 				}
 			}
 		}
-		offsets = binary.BigEndian.AppendUint64(offsets, coder.Size())
+		if writeVersion < versionNoStoredIndex {
+			offsets = binary.BigEndian.AppendUint64(offsets, coder.Size())
+		}
 		if _, err = coder.Add(uint64(d), s.metaBuf.Bytes(), data); err != nil { // #nosec G115 -- a document number.
 			return 0, nil, err
 		}
@@ -670,6 +683,9 @@ func (b *Builder) writeStored(s *interim, gid []uint16) (indexOffset uint64, chu
 		return 0, nil, err
 	}
 	indexOffset = uint64(s.w.Count()) // #nosec G115 -- countHashWriter counts nonnegative writes.
+	if writeVersion >= versionNoStoredIndex {
+		return indexOffset, coder.Offsets(), nil
+	}
 	if _, err = s.w.Write(offsets); err != nil {
 		return 0, nil, err
 	}
@@ -684,7 +700,22 @@ func (b *Builder) invert(s *interim, g int, fb *builderField) {
 	for i := range fb.byRank {
 		fb.byRank[i] = uint32(i) // #nosec G115 -- local term ids.
 	}
-	slices.SortFunc(fb.byRank, func(x, y uint32) int { return strings.Compare(terms[x], terms[y]) })
+	// terms first seen in order, as increasing numeric values are, need no
+	// sort; the others sort with their keys at hand, not behind their ids
+	if !slices.IsSorted(terms) {
+		type ranked struct {
+			key string
+			id  uint32
+		}
+		rs := make([]ranked, len(terms))
+		for i, k := range terms {
+			rs[i] = ranked{k, uint32(i)} // #nosec G115 -- local term ids.
+		}
+		slices.SortFunc(rs, func(x, y ranked) int { return strings.Compare(x.key, y.key) })
+		for o, r := range rs {
+			fb.byRank[o] = r.id
+		}
+	}
 	keys := make([]string, len(terms))
 	for o, id := range fb.byRank {
 		keys[o] = terms[id]
@@ -693,49 +724,74 @@ func (b *Builder) invert(s *interim, g int, fb *builderField) {
 	fb.terms, fb.numeric = termTable{}, nil
 }
 
-// gather is interim.gather: it decodes the postings of pid, as New's
-// postings pass lays them out, into w's buffers.
-func (b *Builder) gather(pid uint64, w *dictWorker) termIn {
+// encode is interim.encode: it encodes the postings of pid as
+// encodeTermPostings does, reading them straight from their records in one
+// pass, so they are never decoded into an intermediate copy.
+func (b *Builder) encode(docTermMap [][]byte, term string, pid uint64, w *dictWorker) (
+	val uint64, oneHit bool, bm *roaring.Bitmap, err error) {
 	g := sort.Search(len(b.bases), func(i int) bool { return b.bases[i] > pid }) - 1
 	fb := b.global[g]
 	t := fb.streams.ptr(int(fb.byRank[pid-b.bases[g]]))
 	gid := uint16(g) // #nosec G115 -- at most MaxUint16 fields.
-	w.fns, w.locs = w.fns[:0], w.locs[:0]
 	r := b.arena.reader(t)
+	if t.docs == 1 {
+		// same "1-hit" encoding as encodeTermPostings; p is a copy, so the
+		// posting is read again below when it is not one
+		p := r
+		// #nosec G115 -- addPosting wrote these from uint32s.
+		doc, freq, norm, nlocs := uint32(p.uvarint()), p.uvarint(), fb.norm(int(p.uvarint())), p.uvarint()
+		normBits := uint64(math.Float32bits(norm))
+		if freq == 1 && nlocs == 0 && under32Bits(uint64(doc)) && normBits != 0 && under32Bits(normBits) {
+			if docTermMap != nil {
+				docTermMap[doc] = append(append(docTermMap[doc], term...), termSeparator)
+			}
+			return fSTValEncode1Hit(uint64(doc), normBits), true, nil, nil
+		}
+	}
+	if err := setChunkSizes(defaultChunkMode, uint64(t.docs), b.numDocs, w.tf, w.loc, w.off); err != nil {
+		return 0, false, nil, err
+	}
+	w.docs = w.docs[:0]
 	var doc uint32
 	for !r.at(t.tail) {
 		// #nosec G115 -- addPosting wrote these from uint32s.
 		doc += uint32(r.uvarint())
-		// #nosec G115 -- see doc.
-		freq, norm, nlocs := uint32(r.uvarint()), fb.norm(int(r.uvarint())), uint32(r.uvarint())
-		w.fns = append(w.fns, interimFreqNorm{freq: freq, norm: norm, docNum: doc, numLocs: nlocs})
-		// doubled, as append grows large slices by only a quarter
-		if n := int(nlocs); cap(w.locs)-len(w.locs) < n {
-			w.locs = slices.Grow(w.locs, max(n, len(w.locs)))
+		freq, norm, nlocs := r.uvarint(), fb.norm(int(r.uvarint())), r.uvarint() // #nosec G115 -- see doc.
+		w.docs = append(w.docs, doc)
+		if err := w.tf.Add(uint64(doc), encodeFreqHasLocs(freq, nlocs > 0), uint64(math.Float32bits(norm))); err != nil {
+			return 0, false, nil, err
 		}
-		var pos, start int64
-		for range nlocs {
-			d, field := r.uvarint(), gid
-			if d&1 != 0 {
-				field = b.gid[r.uvarint()]
+		if nlocs > 0 {
+			var pos, start int64
+			var prevPos, prevStart uint64
+			for range nlocs {
+				d, field := r.uvarint(), gid
+				if d&1 != 0 {
+					field = b.gid[r.uvarint()]
+				}
+				pos += unzigzag(d >> 1)
+				start += r.varint()
+				end := start + r.varint()
+				// #nosec G115 -- locations decoded from checked uint32s.
+				p, st := uint64(pos), uint64(start)
+				recordLocation(w.loc, w.off, uint64(field), p, st, uint64(end), prevPos, prevStart) // #nosec G115 -- see above.
+				prevPos, prevStart = p, st
 			}
-			pos += unzigzag(d >> 1)
-			start += r.varint()
-			end := start + r.varint()
-			// #nosec G115 -- location decoded from checked uint32s.
-			w.locs = append(w.locs, interimLoc{fieldID: field, pos: uint32(pos), start: uint32(start), end: uint32(end)})
+			if err := addLocationRecords(uint64(doc), freq, w.loc, w.off); err != nil {
+				return 0, false, nil, err
+			}
+		}
+		if docTermMap != nil {
+			docTermMap[doc] = append(append(docTermMap[doc], term...), termSeparator)
 		}
 	}
-	// singletons without locations go straight into the FST
-	if len(w.fns) == 1 && len(w.locs) == 0 {
-		return termIn{fns: w.fns}
+	if err := closeEncoders(w.tf, w.loc, w.off); err != nil {
+		return 0, false, nil, err
 	}
 	if w.bm == nil {
 		w.bm = roaring.New()
 	}
 	w.bm.Clear()
-	for _, f := range w.fns {
-		w.bm.Add(f.docNum)
-	}
-	return termIn{w.bm, w.fns, w.locs}
+	w.bm.AddMany(w.docs)
+	return 0, false, w.bm, nil
 }

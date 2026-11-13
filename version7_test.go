@@ -67,7 +67,7 @@ func splitDocs(numDocs int) []segment.Document {
 }
 
 // buildSegment writes docs as version ver and opens the persisted segment.
-func buildSegment(t *testing.T, docs []segment.Document, ver uint32) *Segment {
+func buildSegment(t testing.TB, docs []segment.Document, ver uint32) *Segment {
 	t.Helper()
 	prev := writeVersion
 	writeVersion = ver
@@ -483,7 +483,6 @@ func TestVersion7SplitsLocationBytes(t *testing.T) {
 	}
 }
 
-//nolint:unparam // field names the dictionary; callers happen to share one.
 func postingsList(tb testing.TB, seg *Segment, field, term string) *PostingsList {
 	tb.Helper()
 	dict, err := seg.Dictionary(field)
@@ -520,33 +519,35 @@ func benchPhraseSegment(b *testing.B, n int, ver uint32) *Segment {
 // BenchmarkNextPosBatch reads every posting of a term in every document,
 // with positions only, as a phrase match does, per segment version.
 func BenchmarkNextPosBatch(b *testing.B) {
-	for _, ver := range []uint32{versionCompactPostings, versionSplitOffsets} {
+	for _, ver := range []uint32{versionCompactPostings, versionSplitOffsets, versionBeforeSlim, Version} {
 		seg := benchPhraseSegment(b, 100_000, ver)
-		b.Run("v"+strconv.Itoa(int(ver)), func(b *testing.B) {
-			const size = 128
-			docs, freqs, norms, ends, offs := make([]uint64, size), make([]int, size), make([]float64, size),
-				make([]int, size), make([]uint64, size)
-			var fields []string
-			var locs []int
-			pl := postingsList(b, seg, "body", "search")
-			var it segment.PostingsIterator
-			for b.Loop() {
-				var err error
-				if it, err = pl.Iterator(true, true, true, it); err != nil {
-					b.Fatal(err)
-				}
-				pi := it.(*PostingsIterator)
-				for {
-					var n int
-					n, fields, locs, err = pi.NextPosBatch(docs, freqs, norms, ends, offs, fields[:0], locs[:0])
-					if err != nil {
-						b.Fatal(err)
-					}
-					if n == 0 {
-						break
-					}
-				}
+		b.Run("v"+strconv.Itoa(int(ver)), func(b *testing.B) { benchPosBatch(b, postingsList(b, seg, "body", "search")) })
+	}
+}
+
+// benchPosBatch drains pl with NextPosBatch once per iteration.
+func benchPosBatch(b *testing.B, pl *PostingsList) {
+	const size = 128
+	docs, freqs, norms, ends, offs := make([]uint64, size), make([]int, size), make([]float64, size),
+		make([]int, size), make([]uint64, size)
+	var fields []string
+	var locs []int
+	var it segment.PostingsIterator
+	for b.Loop() {
+		var err error
+		if it, err = pl.Iterator(true, true, true, it); err != nil {
+			b.Fatal(err)
+		}
+		pi := it.(*PostingsIterator)
+		for {
+			var n int
+			n, fields, locs, err = pi.NextPosBatch(docs, freqs, norms, ends, offs, fields[:0], locs[:0])
+			if err != nil {
+				b.Fatal(err)
 			}
-		})
+			if n == 0 {
+				break
+			}
+		}
 	}
 }

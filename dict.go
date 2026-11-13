@@ -213,11 +213,11 @@ func (d *Dictionary) OrPostingsDense(a segment.Automaton, startKeyInclusive, end
 	for err == nil {
 		_, offset := itr.Current()
 		if offset&fSTValEncodingMask != fSTValEncoding1Hit {
-			buf, rerr := d.postingsBytes(offset)
+			buf, list, rerr := d.postingsBytes(offset)
 			if rerr != nil {
 				return false, rerr
 			}
-			if orRoaringDense(dense, buf) {
+			if list && orListDense(dense, buf) || !list && orRoaringDense(dense, buf) {
 				if denseFull(dense, numDocs, &full) {
 					return true, nil
 				}

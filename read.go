@@ -54,10 +54,11 @@ func (s *Segment) initStoredChunkCache(capacity int) {
 	s.storedChunks.init(capacity)
 }
 
-// storedChunk returns decompressed stored-field chunk chunkI, decompressing
-// and caching it on a miss; concurrent misses share one decompression.
-func (s *Segment) storedChunk(chunkI uint64) ([]byte, error) {
-	return s.storedChunks.getOrLoad(chunkI, func() ([]byte, error) {
+// storedChunkEntry returns the cache entry of decompressed stored-field
+// chunk chunkI, decompressing and caching it on a miss; concurrent misses
+// share one decompression.
+func (s *Segment) storedChunkEntry(chunkI uint64) (*storedChunkEntry, error) {
+	return s.storedChunks.getOrLoadEntry(chunkI, func() ([]byte, error) {
 		if chunkI+1 >= uint64(len(s.storedFieldChunkOffsets)) {
 			return nil, fmt.Errorf("stored-field chunk offsets out of bounds")
 		}
@@ -72,14 +73,46 @@ func (s *Segment) storedChunk(chunkI uint64) ([]byte, error) {
 }
 
 func (s *Segment) getDocStoredMetaAndUnCompressed(docNum uint64) (meta, data []byte, err error) {
-	_, storedOffset, err := s.getDocStoredOffsetsOnly(docNum)
-	if err != nil {
-		return nil, nil, err
+	return s.docStored(docNum, nil)
+}
+
+// docStored is getDocStoredMetaAndUnCompressed that, when kept is set, reads
+// docNum's chunk from *kept if that is it and leaves the chunk it read
+// there: documents visited in turn decompress each chunk once, also when
+// the segment caches none.
+func (s *Segment) docStored(docNum uint64, kept **storedChunkEntry) (meta, data []byte, err error) {
+	var storedOffset uint64
+	if s.footer.version < versionNoStoredIndex {
+		if _, storedOffset, err = s.getDocStoredOffsetsOnly(docNum); err != nil {
+			return nil, nil, err
+		}
+	} else if docNum >= s.footer.numDocs {
+		return nil, nil, fmt.Errorf("stored document number out of bounds: %d", docNum)
 	}
 
-	uncompressed, err := s.storedChunk(docNum / uint64(defaultDocumentChunkSize))
-	if err != nil {
-		return nil, nil, err
+	chunk := docNum / uint64(defaultDocumentChunkSize)
+	var entry *storedChunkEntry
+	if kept != nil && *kept != nil && (*kept).chunk == chunk {
+		entry = *kept
+	} else {
+		if entry, err = s.storedChunkEntry(chunk); err != nil {
+			return nil, nil, err
+		}
+		if kept != nil {
+			*kept = entry
+		}
+	}
+	uncompressed := entry.data
+	if s.footer.version >= versionNoStoredIndex {
+		offs, err := entry.recordOffsets()
+		if err != nil {
+			return nil, nil, err
+		}
+		i := docNum % uint64(defaultDocumentChunkSize)
+		if i >= uint64(len(offs)) {
+			return nil, nil, fmt.Errorf("stored document %d missing from its chunk", docNum)
+		}
+		storedOffset = uint64(offs[i]) // #nosec G115 -- a nonnegative offset.
 	}
 
 	if storedOffset > uint64(len(uncompressed)) {
