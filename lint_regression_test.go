@@ -292,15 +292,16 @@ func TestMergeDocumentNumberBounds(t *testing.T) {
 	for _, docNum := range []uint64{math.MaxUint32, math.MaxUint32 + 1} {
 		itr := &PostingsIterator{normBits1Hit: 1, includeFreqNorm: true}
 		bitmap := roaring.New()
+		var fieldFreq uint64
 		lastDoc, freq, norm, err := mergeTermFreqNormLocs(nil, itr, []uint64{docNum}, bitmap,
 			newChunkedIntCoder(uint64(math.MaxUint32), docNum),
-			newChunkedIntCoder(uint64(math.MaxUint32), docNum), nil, roaring.New())
+			newChunkedIntCoder(uint64(math.MaxUint32), docNum), nil, roaring.New(), &fieldFreq)
 		if docNum == math.MaxUint32 {
 			if err != nil || !bitmap.Contains(math.MaxUint32) {
 				t.Fatalf("maximum document number rejected: %v", err)
 			}
-			if lastDoc != docNum || freq != 1 || norm != 1 {
-				t.Fatalf("incorrect merged posting: %d, %d, %d", lastDoc, freq, norm)
+			if lastDoc != docNum || freq != 1 || norm != 1 || fieldFreq != 1 {
+				t.Fatalf("incorrect merged posting: %d, %d, %d, %d", lastDoc, freq, norm, fieldFreq)
 			}
 		} else if err == nil || !bitmap.IsEmpty() {
 			t.Fatalf("overflowing document number accepted: %v", err)
