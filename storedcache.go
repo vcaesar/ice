@@ -16,6 +16,8 @@ package ice
 
 import (
 	"container/list"
+	"fmt"
+	"math"
 	"sync"
 )
 
@@ -55,12 +57,18 @@ type storedChunkCache struct {
 type storedChunkEntry struct {
 	chunk uint64
 	data  []byte
+	// record offsets in data, filled once by walkRecords; kept in the entry
+	// so a cache miss allocates nothing for them
+	offsOnce sync.Once
+	offs     [defaultDocumentChunkSize]uint32
+	offsN    int
+	offsErr  error
 }
 
 type storedChunkLoad struct {
-	done chan struct{}
-	data []byte
-	err  error
+	done  chan struct{}
+	entry *storedChunkEntry
+	err   error
 }
 
 func (c *storedChunkCache) init(capacity int) {
@@ -77,19 +85,29 @@ func (c *storedChunkCache) init(capacity int) {
 // getOrLoad returns the cached chunk or runs load once for all concurrent
 // callers of the same chunk, caching its result.
 func (c *storedChunkCache) getOrLoad(chunk uint64, load func() ([]byte, error)) ([]byte, error) {
+	e, err := c.getOrLoadEntry(chunk, load)
+	if err != nil {
+		return nil, err
+	}
+	return e.data, nil
+}
+
+// getOrLoadEntry is getOrLoad returning the chunk's entry, which is not
+// cached when caching is disabled.
+func (c *storedChunkCache) getOrLoadEntry(chunk uint64, load func() ([]byte, error)) (*storedChunkEntry, error) {
 	c.m.Lock()
 	if el, ok := c.items[chunk]; ok {
 		c.hits++
 		c.order.MoveToFront(el)
-		data := el.Value.(*storedChunkEntry).data
+		e := el.Value.(*storedChunkEntry)
 		c.m.Unlock()
-		return data, nil
+		return e, nil
 	}
 	c.misses++
 	if l, ok := c.inflight[chunk]; ok {
 		c.m.Unlock()
 		<-l.done
-		return l.data, l.err
+		return l.entry, l.err
 	}
 	l := &storedChunkLoad{done: make(chan struct{})}
 	if c.inflight == nil { // zero-value cache: caching disabled, still coalesce
@@ -98,19 +116,23 @@ func (c *storedChunkCache) getOrLoad(chunk uint64, load func() ([]byte, error)) 
 	c.inflight[chunk] = l
 	c.m.Unlock()
 
-	l.data, l.err = load()
+	data, err := load()
+	if err == nil {
+		l.entry = &storedChunkEntry{chunk: chunk, data: data}
+	}
+	l.err = err
 
 	// Publish the result, drop the inflight entry and signal waiters while
 	// holding the lock, so a concurrent caller either joins this load or
 	// observes the cached value instead of starting a duplicate load.
 	c.m.Lock()
 	if l.err == nil {
-		c.putLocked(chunk, l.data)
+		c.putEntryLocked(l.entry)
 	}
 	delete(c.inflight, chunk)
 	close(l.done)
 	c.m.Unlock()
-	return l.data, l.err
+	return l.entry, l.err
 }
 
 func (c *storedChunkCache) get(chunk uint64) ([]byte, bool) {
@@ -134,13 +156,17 @@ func (c *storedChunkCache) put(chunk uint64, data []byte) {
 
 // putLocked inserts data for chunk; the caller must hold c.m.
 func (c *storedChunkCache) putLocked(chunk uint64, data []byte) {
+	c.putEntryLocked(&storedChunkEntry{chunk: chunk, data: data})
+}
+
+// putEntryLocked inserts e; the caller must hold c.m.
+func (c *storedChunkCache) putEntryLocked(e *storedChunkEntry) {
 	if c.capacity <= 0 {
 		return
 	}
-	if el, ok := c.items[chunk]; ok {
-		entry := el.Value.(*storedChunkEntry)
-		c.bytes += cap(data) - cap(entry.data)
-		entry.data = data
+	if el, ok := c.items[e.chunk]; ok {
+		c.bytes += cap(e.data) - cap(el.Value.(*storedChunkEntry).data)
+		el.Value = e
 		c.order.MoveToFront(el)
 		return
 	}
@@ -151,8 +177,32 @@ func (c *storedChunkCache) putLocked(chunk uint64, data []byte) {
 		delete(c.items, evicted.chunk)
 		c.order.Remove(last)
 	}
-	c.bytes += cap(data)
-	c.items[chunk] = c.order.PushFront(&storedChunkEntry{chunk: chunk, data: data})
+	c.bytes += cap(e.data)
+	c.items[e.chunk] = c.order.PushFront(e)
+}
+
+// recordOffsets returns the offset of each document's record in the chunk,
+// which version 9 does not store, walking the records once per entry.
+func (e *storedChunkEntry) recordOffsets() ([]uint32, error) {
+	e.offsOnce.Do(e.walkRecords)
+	return e.offs[:e.offsN], e.offsErr
+}
+
+func (e *storedChunkEntry) walkRecords() {
+	if uint64(len(e.data)) > math.MaxUint32 {
+		e.offsErr = fmt.Errorf("stored-field chunk of %d bytes exceeds 4 GiB", len(e.data))
+		return
+	}
+	n := 0
+	for rest := e.data; len(rest) > 0 && n < len(e.offs); n++ {
+		e.offs[n] = uint32(len(e.data) - len(rest)) // #nosec G115 -- bounded by the check above.
+		var err error
+		if _, _, rest, err = nextStoredDoc(rest); err != nil {
+			e.offsErr = err
+			return
+		}
+	}
+	e.offsN = n
 }
 
 // size returns the total capacity of cached chunk data in bytes.

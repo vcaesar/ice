@@ -95,6 +95,31 @@ func TestTermStreamFullBlock(t *testing.T) {
 	}
 }
 
+// A varint split by a block's link reads back whole, past the fast path.
+func TestTermReaderVarintAcrossLink(t *testing.T) {
+	for pad := range 1<<firstTermBlockShift - blockLinkLen {
+		var a termArena
+		s, _ := a.newTermStream()
+		buf := make([]byte, pad, pad+binary.MaxVarintLen64)
+		buf = binary.AppendUvarint(buf, 1<<62+12345)
+		if !a.write(&s, buf) {
+			t.Fatal("arena full")
+		}
+		r := a.reader(&s)
+		for range pad {
+			if v := r.uvarint(); v != 0 {
+				t.Fatalf("pad %d: padding read %d", pad, v)
+			}
+		}
+		if v := r.uvarint(); v != 1<<62+12345 {
+			t.Fatalf("pad %d: %d", pad, v)
+		}
+		if !r.at(s.tail) {
+			t.Fatalf("pad %d: not at the end", pad)
+		}
+	}
+}
+
 // release gives an arena's full size pages to the next arenas, zeroed, so
 // a stream of flushes does not allocate a fresh arena each time.
 func TestTermArenaReleaseReusesPages(t *testing.T) {

@@ -16,6 +16,7 @@ package ice
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -92,7 +93,7 @@ func writePostings(postings *roaring.Bitmap, tfEncoder, locEncoder, offEncoder *
 	}
 
 	var offOffset uint64
-	if offEncoder != nil {
+	if hasOffsets(offEncoder) {
 		if offOffset, err = offEncoder.writeAt(w); err != nil {
 			return 0, err
 		}
@@ -101,11 +102,15 @@ func writePostings(postings *roaring.Bitmap, tfEncoder, locEncoder, offEncoder *
 	postingsOffset := uint64(w.Count()) // #nosec G115 -- countHashWriter checks overflow and counts nonnegative writes.
 
 	var header [3 * binary.MaxVarintLen64]byte
-	if _, err = w.Write(appendPostingsHeader(header[:0], tfOffset, locOffset, offOffset, offEncoder != nil)); err != nil {
+	if _, err = w.Write(appendPostingsHeader(header[:0], postingsOffset, tfOffset, locOffset, offOffset, offEncoder != nil)); err != nil {
 		return 0, err
 	}
 
-	_, err = writeRoaringWithLen(postings, w, bufMaxVarintLen64)
+	if writeVersion >= versionSlimPostings {
+		err = writeDocs(w, postings, &tfEncoder.list)
+	} else {
+		_, err = writeRoaringWithLen(postings, w, bufMaxVarintLen64)
+	}
 	if err != nil {
 		return 0, err
 	}
@@ -113,11 +118,150 @@ func writePostings(postings *roaring.Bitmap, tfEncoder, locEncoder, offEncoder *
 	return postingsOffset, nil
 }
 
-// appendPostingsHeader appends the chunk offsets of a postings header:
-// tfOffset, then locOffset and, when split (version 7+), offOffset, each
-// relative to the one before when both are set.
-func appendPostingsHeader(h []byte, tfOffset, locOffset, offOffset uint64, split bool) []byte {
-	h = binary.AppendUvarint(h, tfOffset)
+// hasOffsets reports whether offEncoder (nil before version 7) holds an
+// offsets stream to write: from version 10 one of only zeros is left out.
+func hasOffsets(offEncoder *chunkedIntCoder) bool {
+	return offEncoder != nil && len(offEncoder.final) > 0 &&
+		(offEncoder.nonZero || writeVersion < versionSlimPostings)
+}
+
+// maxListDocs is the most documents a version 10+ postings list keeps as a
+// delta list, which every read decodes whole.
+const maxListDocs = 1024
+
+// writeDocs writes the documents that end a version 10+ postings header:
+// their byte count shifted left over a bit, then the roaring bitmap or,
+// with the bit set, the delta list (see appendDocList) that a list of up
+// to maxListDocs documents is written as when smaller. scratch is reused.
+func writeDocs(w io.Writer, bm *roaring.Bitmap, scratch *[]byte) error {
+	bm.RunOptimize()
+	size := bm.GetSerializedSizeInBytes()
+	buf := (*scratch)[:0]
+	if bm.GetCardinality() <= maxListDocs {
+		buf = appendDocList(buf, bm)
+		if n := len(buf); uint64(n) < size {
+			// the head goes after the list in buf and before it in w
+			buf = binary.AppendUvarint(buf, uint64(n)<<1|1)
+			*scratch = buf
+			if _, err := w.Write(buf[n:]); err != nil {
+				return err
+			}
+			_, err := w.Write(buf[:n])
+			return err
+		}
+	}
+	buf = binary.AppendUvarint(buf[:0], size<<1)
+	*scratch = buf
+	if _, err := w.Write(buf); err != nil {
+		return err
+	}
+	_, err := bm.WriteTo(w)
+	return err
+}
+
+// appendDocList appends the documents of bm as uvarints: the first one,
+// then the gap of each to the one before it, less 1.
+func appendDocList(dst []byte, bm *roaring.Bitmap) []byte {
+	var it roaring.IntIterator
+	it.Initialize(bm)
+	next := uint32(0) // the least the next document can be
+	for it.HasNext() {
+		d := it.Next()
+		dst = binary.AppendUvarint(dst, uint64(d-next))
+		next = d + 1
+	}
+	return dst
+}
+
+// docListBitmap returns the documents of a delta list (see appendDocList)
+// as a serialized roaring bitmap of array containers. The buffer is new,
+// as the bitmap read from it, and any bitmap ORed with that one, keep it.
+func docListBitmap(list []byte) ([]byte, error) {
+	var docs [maxListDocs]uint32
+	n, err := decodeDocList(list, &docs)
+	if err != nil {
+		return nil, err
+	}
+	containers := 0
+	key := uint32(math.MaxUint32) // of the last container, none yet
+	for _, d := range docs[:n] {
+		if d>>roaringKeyShift != key {
+			key = d >> roaringKeyShift
+			containers++
+		}
+	}
+	// cookie, container count, then per container its key and size less 1,
+	// then its offset, and last the low halves of its documents
+	data := roaringHeaderBytes + 2*4*containers
+	bm := make([]byte, data+2*n)
+	binary.LittleEndian.PutUint32(bm, roaringCookieNoRuns)
+	binary.LittleEndian.PutUint32(bm[4:], uint32(containers)) // #nosec G115 -- at most maxListDocs.
+	keys, offs, lows := bm[roaringHeaderBytes:data], bm[roaringHeaderBytes+4*containers:data], bm[data:]
+	k, first := -1, 0 // the container written and its first document
+	key = math.MaxUint32
+	for i, d := range docs[:n] {
+		if d>>roaringKeyShift != key {
+			if k >= 0 {
+				binary.LittleEndian.PutUint16(keys[4*k+2:], uint16(i-first-1)) // #nosec G115 -- at most maxListDocs.
+			}
+			key, k, first = d>>roaringKeyShift, k+1, i
+			binary.LittleEndian.PutUint16(keys[4*k:], uint16(key))      // #nosec G115 -- the high half.
+			binary.LittleEndian.PutUint32(offs[4*k:], uint32(data+2*i)) // #nosec G115 -- a small buffer.
+		}
+		binary.LittleEndian.PutUint16(lows[2*i:], uint16(d)) // #nosec G115 -- the low half.
+	}
+	if k >= 0 {
+		binary.LittleEndian.PutUint16(keys[4*k+2:], uint16(n-first-1)) // #nosec G115 -- at most maxListDocs.
+	}
+	return bm, nil
+}
+
+// decodeDocList decodes a delta list (see appendDocList) into docs and
+// returns how many documents it holds.
+func decodeDocList(list []byte, docs *[maxListDocs]uint32) (int, error) {
+	n := 0
+	next := uint64(0) // the least the next document can be
+	for c := 0; c < len(list); n++ {
+		if n == maxListDocs {
+			return 0, errDocList
+		}
+		// gaps of short lists take one or two bytes
+		if b := list[c]; b < lastByte {
+			next += uint64(b)
+			c++
+		} else if c+1 < len(list) && list[c+1] < lastByte {
+			next += uint64(b&significantBits) | uint64(list[c+1])<<7
+			c += 2
+		} else {
+			v, k := binary.Uvarint(list[c:])
+			if k <= 0 || v > math.MaxUint32 {
+				return 0, errDocList
+			}
+			next += v
+			c += k
+		}
+		if next > math.MaxUint32 {
+			return 0, errDocList
+		}
+		docs[n] = uint32(next) // #nosec G115 -- checked above.
+		next++
+	}
+	return n, nil
+}
+
+var errDocList = errors.New("invalid postings document list")
+
+// appendPostingsHeader appends the chunk offsets of the postings header at
+// offset at: tfOffset, then locOffset and, when split (version 7+),
+// offOffset, each relative to the one before when both are set. From
+// version 10 a set tfOffset is stored as its distance back from at, as the
+// chunks are written right before the header.
+func appendPostingsHeader(h []byte, at, tfOffset, locOffset, offOffset uint64, split bool) []byte {
+	if writeVersion >= versionSlimPostings && tfOffset > 0 {
+		h = binary.AppendUvarint(h, at-tfOffset)
+	} else {
+		h = binary.AppendUvarint(h, tfOffset)
+	}
 	h = binary.AppendUvarint(h, relOffset(locOffset, tfOffset))
 	if split {
 		h = binary.AppendUvarint(h, relOffset(offOffset, locOffset))
@@ -143,12 +287,19 @@ func recordLocation(locEncoder, offEncoder *chunkedIntCoder, fieldID, pos, start
 		return
 	}
 	locEncoder.recordVals(a, b)
+	if locEncoder.slim {
+		locEncoder.slimLoc(fieldID == locEncoder.ownField && pos >= prevPos, pos-prevPos)
+	}
 	offEncoder.recordVals(c, d)
+	if c|d != 0 {
+		offEncoder.nonZero = true
+	}
 }
 
-// addLocationRecords adds the records recordLocation built for docNum.
-func addLocationRecords(docNum uint64, locEncoder, offEncoder *chunkedIntCoder) error {
-	if err := locEncoder.addRecord(docNum); err != nil {
+// addLocationRecords adds the records recordLocation built for the posting
+// of docNum, whose frequency is freq.
+func addLocationRecords(docNum, freq uint64, locEncoder, offEncoder *chunkedIntCoder) error {
+	if err := locEncoder.addLocRecord(docNum, freq); err != nil {
 		return err
 	}
 	if offEncoder != nil {

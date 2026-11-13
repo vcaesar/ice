@@ -27,6 +27,11 @@ import (
 	segment "github.com/vcaesar/bluge_segment_api"
 )
 
+// Version 10 stores short postings as delta lists, location records of a
+// field's own positions without field ids, and no offsets stream for
+// locations without offsets (see versionSlimPostings).
+// Version 9 drops the per-document stored-field index (see
+// versionNoStoredIndex) and adds the stored and ordinal doc value kinds.
 // Version 8 compresses freq/norm, location and offset chunks with s2
 // whatever compress.Algorithm is (see versionS2Chunks).
 // Version 7 stores location start/end offsets apart from field and pos
@@ -34,7 +39,18 @@ import (
 // Version 6 stores freq/norm and location chunks raw unless s2 shrinks
 // them enough, and delta codes locations (see versionCompactPostings).
 // Version 5 added per-chunk freq/norm bounds (block max) to postings.
-const Version uint32 = 8
+const Version uint32 = 10
+
+// versionSlimPostings is the first version whose postings header ends with
+// the byte count of the documents shifted left over a bit set for a delta
+// list (see appendDocList), whose location records are slim (see
+// addSlimRecord) and whose lists of locations that all start and end at 0
+// have no offsets stream.
+const versionSlimPostings uint32 = 10
+
+// versionNoStoredIndex is the first version without the 8-byte stored-field
+// offset per document; a document is found by walking its chunk's records.
+const versionNoStoredIndex uint32 = 9
 
 // versionS2Chunks is the first version whose compact int chunks are s2
 // blocks flagged chunkS2Fixed. Older compact chunks flagged chunkS2 use
@@ -91,6 +107,8 @@ type Segment struct {
 	dictLocs       []uint64
 	fieldDvReaders map[uint16]*docValueReader // naive chunk cache per field
 	fieldNumCols   map[uint16]*numericColumn  // typed numeric doc values per field
+	fieldOrdCols   map[uint16]*ordinalColumn  // ordinal term doc values per field
+	fieldStoredDvs map[uint16]bool            // fields whose doc values are their stored values
 	fieldDvNames   []string                   // field names cached in fieldDvReaders
 	size           int
 
@@ -98,6 +116,7 @@ type Segment struct {
 	m            sync.RWMutex
 	fieldFSTs    map[uint16]*vellum.FST
 	storedChunks storedChunkCache
+	docLists     docListCache
 }
 
 func (s *Segment) WriteTo(w io.Writer, _ chan struct{}) (int64, error) {
@@ -174,6 +193,9 @@ func (s *Segment) updateSize() {
 	for _, v := range s.fieldNumCols {
 		sizeInBytes += sizeOfUint16 + sizeOfPtr + v.size()
 	}
+	for _, v := range s.fieldOrdCols {
+		sizeInBytes += sizeOfUint16 + sizeOfPtr + v.size()
+	}
 
 	sizeInBytes += cap(s.storedFieldChunkOffsets) * sizeOfUint64
 
@@ -241,6 +263,10 @@ func (s *Segment) dictionary(field string) (rv *Dictionary, err error) {
 type visitDocumentCtx struct {
 	// buf    []byte
 	reader bytes.Reader
+	// chunk, when keep is set, is the stored chunk last read, see docStored;
+	// the ctx must then stay with one segment
+	keep  bool
+	chunk *storedChunkEntry
 }
 
 var visitDocumentCtxPool = sync.Pool{
@@ -263,7 +289,11 @@ func (s *Segment) visitDocument(vdc *visitDocumentCtx, num uint64,
 	defer vdc.reader.Reset(nil)
 	// first make sure this is a valid number in this segment
 	if num < s.footer.numDocs {
-		meta, uncompressed, err := s.getDocStoredMetaAndUnCompressed(num)
+		var kept **storedChunkEntry
+		if vdc.keep {
+			kept = &vdc.chunk
+		}
+		meta, uncompressed, err := s.docStored(num, kept)
 		if err != nil {
 			return err
 		}
@@ -424,6 +454,22 @@ func (s *Segment) loadDvReaders() error {
 			}
 			// #nosec G115 -- fieldsInv is capped at MaxUint16 entries.
 			s.fieldNumCols[uint16(fieldID)] = col
+			s.fieldDvNames = append(s.fieldDvNames, field)
+		case dvKindOrdinal:
+			col, err := s.loadOrdinalColumn(field, fieldLocStart, fieldLocEnd)
+			if err != nil {
+				return err
+			}
+			if s.fieldOrdCols == nil {
+				s.fieldOrdCols = map[uint16]*ordinalColumn{}
+			}
+			s.fieldOrdCols[uint16(fieldID)] = col // #nosec G115 -- see above.
+			s.fieldDvNames = append(s.fieldDvNames, field)
+		case dvKindStored:
+			if s.fieldStoredDvs == nil {
+				s.fieldStoredDvs = map[uint16]bool{}
+			}
+			s.fieldStoredDvs[uint16(fieldID)] = true // #nosec G115 -- see above.
 			s.fieldDvNames = append(s.fieldDvNames, field)
 		default:
 			return fmt.Errorf("unknown doc value kind %d for field %s", kind, field)

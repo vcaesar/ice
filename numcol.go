@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/bits"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -36,14 +37,18 @@ type NumericField = segment.NumericField
 //
 //	block data   – for every block of numericBlockSize doc numbers:
 //	               [docDelta uvarint]*count (omitted when dense)
-//	               [count * width bytes little-endian of uint64(v)-uint64(min)]
+//	               [count * width bytes little-endian of (uint64(v)-uint64(min)) >> shift]
 //	block index  – per block: [count uvarint] and, when count > 0,
 //	               [dataOffset uvarint][dense byte][min zigzag][max zigzag][width byte]
+//	               and, from version 9, [shift byte]
 //	trailer      – [blockIndexOffset u64][numBlocks u64], both big endian
 //
 // Doc numbers repeat for multi-valued fields; "dense" means the block holds
 // exactly one value for each consecutive doc number starting at the block.
 const numericBlockSize = 1024
+
+// maxNumericBlockValues is the most values a block loads.
+const maxNumericBlockValues = numericBlockSize * numericBlockSize
 
 const numericColumnTrailerLen = 16
 
@@ -67,20 +72,32 @@ const (
 const (
 	dvKindTerms   uint64 = 0
 	dvKindNumeric uint64 = 1
+	dvKindStored  uint64 = 2 // version 9+, see termdv.go
+	dvKindOrdinal uint64 = 3 // version 9+, see termdv.go
 )
 
 type numericBlockMeta struct {
 	count  uint32
 	dense  bool
 	width  uint8
+	shift  uint8 // version 9+: deltas are stored >> shift
 	min    int64
 	max    int64
 	offset uint64
 }
 
+// Version 9 blocks drop the trailing zero bits all their deltas share:
+// float64 bit patterns of integers, as a numeric id, end in dozens of zero
+// bits, so a block of them needs 2 bytes per value instead of 8.
+const versionNumericShift = versionNoStoredIndex
+
 func numericWidth(minVal, maxVal int64) uint8 {
 	// #nosec G115 -- signed order is preserved by the two's-complement wrap.
-	diff := uint64(maxVal) - uint64(minVal)
+	return deltaWidth(uint64(maxVal) - uint64(minVal))
+}
+
+// deltaWidth is the byte width that holds diff.
+func deltaWidth(diff uint64) uint8 {
 	switch {
 	case diff == 0:
 		return widthNone
@@ -104,14 +121,19 @@ type numericColumnWriter struct {
 	data      bytes.Buffer
 	index     bytes.Buffer
 	buf       [binary.MaxVarintLen64]byte
+	shift     bool // write a shift per block, see versionNumericShift
 }
 
 func newNumericColumnWriter(numDocs uint64) *numericColumnWriter {
-	return &numericColumnWriter{numBlocks: (numDocs + numericBlockSize - 1) / numericBlockSize}
+	return &numericColumnWriter{
+		numBlocks: (numDocs + numericBlockSize - 1) / numericBlockSize,
+		shift:     writeVersion >= versionNumericShift,
+	}
 }
 
 func (w *numericColumnWriter) Reset(numDocs uint64) {
 	w.numBlocks = (numDocs + numericBlockSize - 1) / numericBlockSize
+	w.shift = writeVersion >= versionNumericShift
 	w.curBlock = 0
 	w.lastDoc = 0
 	w.docs = w.docs[:0]
@@ -169,7 +191,18 @@ func (w *numericColumnWriter) flushBlock() {
 			maxVal = w.vals[i]
 		}
 	}
-	width := numericWidth(minVal, maxVal)
+	var shift uint8
+	if w.shift {
+		var deltas uint64
+		for _, v := range w.vals {
+			deltas |= uint64(v) - uint64(minVal) // #nosec G115 -- see below.
+		}
+		if deltas != 0 {
+			shift = uint8(bits.TrailingZeros64(deltas)) // #nosec G115 -- at most 63.
+		}
+	}
+	// #nosec G115 -- signed order is preserved by the two's-complement wrap.
+	width := deltaWidth((uint64(maxVal) - uint64(minVal)) >> shift)
 
 	// #nosec G115 -- bytes.Buffer length is nonnegative.
 	w.putUvarint(&w.index, uint64(w.data.Len()))
@@ -181,6 +214,9 @@ func (w *numericColumnWriter) flushBlock() {
 	w.putVarint(&w.index, minVal)
 	w.putVarint(&w.index, maxVal)
 	w.index.WriteByte(width)
+	if w.shift {
+		w.index.WriteByte(shift)
+	}
 
 	if !dense {
 		prev := blockStart
@@ -191,7 +227,7 @@ func (w *numericColumnWriter) flushBlock() {
 	}
 	for _, v := range w.vals {
 		// #nosec G115 -- signed order is preserved by the two's-complement wrap.
-		delta := uint64(v) - uint64(minVal)
+		delta := (uint64(v) - uint64(minVal)) >> shift
 		binary.LittleEndian.PutUint64(w.buf[:8], delta)
 		w.data.Write(w.buf[:width])
 	}
@@ -265,19 +301,19 @@ func (s *Segment) loadNumericColumn(field string, start, end uint64) (*numericCo
 	}
 	col := &numericColumn{field: field, dataLoc: start, dataEnd: indexOffset, blocks: make([]numericBlockMeta, numBlocks)}
 	for i := range col.blocks {
-		if err = col.blocks[i].decode(&index, indexOffset); err != nil {
+		if err = col.blocks[i].decode(&index, indexOffset, s.footer.version >= versionNumericShift); err != nil {
 			return nil, fmt.Errorf("numeric column %s block %d: %w", field, i, err)
 		}
 	}
 	return col, nil
 }
 
-func (m *numericBlockMeta) decode(index *[]byte, dataLen uint64) error {
+func (m *numericBlockMeta) decode(index *[]byte, dataLen uint64, shifted bool) error {
 	count, err := readUvarint(index)
 	if err != nil {
 		return err
 	}
-	if count > numericBlockSize*numericBlockSize {
+	if count > maxNumericBlockValues {
 		return fmt.Errorf("invalid count %d", count)
 	}
 	// #nosec G115 -- bounded above.
@@ -304,7 +340,15 @@ func (m *numericBlockMeta) decode(index *[]byte, dataLen uint64) error {
 	}
 	m.width = (*index)[0]
 	*index = (*index)[1:]
-	if m.min > m.max || m.width != numericWidth(m.min, m.max) || m.offset > dataLen ||
+	if shifted {
+		if len(*index) < 1 {
+			return io.ErrUnexpectedEOF
+		}
+		m.shift = (*index)[0]
+		*index = (*index)[1:]
+	}
+	// #nosec G115 -- signed order is preserved by the two's-complement wrap.
+	if m.min > m.max || m.shift > 63 || m.width != deltaWidth((uint64(m.max)-uint64(m.min))>>m.shift) || m.offset > dataLen ||
 		count*uint64(m.width) > dataLen-m.offset {
 		return fmt.Errorf("corrupt block metadata")
 	}
@@ -416,13 +460,14 @@ func (c *numericColumnCursor) loadBlock(s *Segment, block uint64) (err error) {
 		c.vals = make([]int64, count)
 	}
 	c.vals = c.vals[:count]
-	decodeNumericBlock(c.vals, data, m.width, m.min)
+	decodeNumericBlock(c.vals, data, m.width, m.shift, m.min)
 	return nil
 }
 
 // decodeNumericBlock fills vals with min plus the width-byte little-endian
-// deltas in data, one loop per width so the inner loops stay branch free.
-func decodeNumericBlock(vals []int64, data []byte, width uint8, minVal int64) {
+// deltas in data shifted left by shift, one loop per width so the inner
+// loops stay branch free.
+func decodeNumericBlock(vals []int64, data []byte, width, shift uint8, minVal int64) {
 	// #nosec G115 -- inverse of the writer's two's-complement wrap.
 	base := uint64(minVal)
 	switch width {
@@ -433,22 +478,22 @@ func decodeNumericBlock(vals []int64, data []byte, width uint8, minVal int64) {
 	case widthByte:
 		data = data[:len(vals)]
 		for i, b := range data {
-			vals[i] = int64(base + uint64(b)) // #nosec G115 -- see base.
+			vals[i] = int64(base + uint64(b)<<shift) // #nosec G115 -- see base.
 		}
 	case widthWord:
 		data = data[:2*len(vals)]
 		for i := range vals {
-			vals[i] = int64(base + uint64(binary.LittleEndian.Uint16(data[2*i:]))) // #nosec G115 -- see base.
+			vals[i] = int64(base + uint64(binary.LittleEndian.Uint16(data[2*i:]))<<shift) // #nosec G115 -- see base.
 		}
 	case widthDword:
 		data = data[:4*len(vals)]
 		for i := range vals {
-			vals[i] = int64(base + uint64(binary.LittleEndian.Uint32(data[4*i:]))) // #nosec G115 -- see base.
+			vals[i] = int64(base + uint64(binary.LittleEndian.Uint32(data[4*i:]))<<shift) // #nosec G115 -- see base.
 		}
 	case widthQword:
 		data = data[:8*len(vals)]
 		for i := range vals {
-			vals[i] = int64(base + binary.LittleEndian.Uint64(data[8*i:])) // #nosec G115 -- see base.
+			vals[i] = int64(base + binary.LittleEndian.Uint64(data[8*i:])<<shift) // #nosec G115 -- see base.
 		}
 	}
 }
@@ -744,10 +789,10 @@ func appendPrefixCodedInt64(buf []byte, v int64) []byte {
 	buf = append(buf, make([]byte, prefixCodedChars+1)...)
 	buf[start] = prefixCodedShiftStart
 	// #nosec G115 -- flip the sign bit, keeping the two's-complement pattern.
-	bits := uint64(v) ^ prefixCodedSignBit
+	u := uint64(v) ^ prefixCodedSignBit
 	for i := prefixCodedChars; i > 0; i-- {
-		buf[start+i] = byte(bits & prefixCodedMask)
-		bits >>= 7
+		buf[start+i] = byte(u & prefixCodedMask)
+		u >>= 7
 	}
 	return buf
 }
@@ -758,10 +803,10 @@ func decodePrefixCodedInt64(term []byte) (v int64, ok bool) {
 	if len(term) != prefixCodedChars+1 || term[0] != prefixCodedShiftStart {
 		return 0, false
 	}
-	var bits uint64
+	var u uint64
 	for _, b := range term[1:] {
-		bits = bits<<7 | uint64(b)
+		u = u<<7 | uint64(b)
 	}
 	// #nosec G115 -- restore the sign bit flipped by the encoder.
-	return int64(bits ^ prefixCodedSignBit), true
+	return int64(u ^ prefixCodedSignBit), true
 }

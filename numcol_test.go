@@ -42,7 +42,7 @@ func roundTripColumn(t *testing.T, numDocs uint64, entries []numEntry) (*Segment
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := &Segment{data: segment.NewDataBytes(buf.Bytes())}
+	s := &Segment{data: segment.NewDataBytes(buf.Bytes()), footer: &footer{version: writeVersion}}
 	col, err := s.loadNumericColumn("f", 6, uint64(6+n)) // #nosec G115 -- small test sizes.
 	if err != nil {
 		t.Fatal(err)
@@ -162,14 +162,14 @@ func TestNumericColumnWriterErrors(t *testing.T) {
 }
 
 func TestNumericColumnCorrupt(t *testing.T) {
-	s := &Segment{data: segment.NewDataBytes(make([]byte, 40))}
+	s := &Segment{data: segment.NewDataBytes(make([]byte, 40)), footer: &footer{version: writeVersion}}
 	if _, err := s.loadNumericColumn("f", 0, 8); err == nil {
 		t.Fatal("expected short range error")
 	}
 	// trailer claims 1 block but the index is empty
 	data := make([]byte, 16)
 	data[15] = 1
-	s = &Segment{data: segment.NewDataBytes(data)}
+	s = &Segment{data: segment.NewDataBytes(data), footer: &footer{version: writeVersion}}
 	if _, err := s.loadNumericColumn("f", 0, 16); err == nil {
 		t.Fatal("expected invalid index error")
 	}

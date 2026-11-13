@@ -132,7 +132,7 @@ func TestDecodeNumericBlockWidths(t *testing.T) {
 			data = binary.LittleEndian.AppendUint64(data, uint64(v)-uint64(tc.minVal))[:len(data)+int(tc.width)]
 		}
 		got := make([]int64, len(want))
-		decodeNumericBlock(got, data, tc.width, tc.minVal)
+		decodeNumericBlock(got, data, tc.width, 0, tc.minVal)
 		if !slices.Equal(got, want) {
 			t.Fatalf("width %d: got %v want %v", tc.width, got, want)
 		}
@@ -298,5 +298,50 @@ func TestNumericCursorPoolReuse(t *testing.T) {
 		if int64(count) != wantCount || sum != wantSum {
 			t.Fatalf("round %d: %d values sum %d, want %d sum %d", round, count, sum, wantCount, wantSum)
 		}
+	}
+}
+
+// TestNumericShiftShrinksFloatIDs writes float64-encoded integer ids, whose
+// deltas share many trailing zero bits, and reads them back exactly from a
+// version 9 column (shifted) and a version 8 one (not shifted).
+func TestNumericShiftShrinksFloatIDs(t *testing.T) {
+	const n = 5000
+	vals := make([]int64, n)
+	for i := range vals {
+		vals[i] = int64(math.Float64bits(float64(i))) // #nosec G115 -- nonnegative floats.
+	}
+	vals[17] = -3 // a block mixing a small value, which still decodes
+	sizes := map[uint32]int{}
+	for _, ver := range []uint32{8, Version} {
+		docs := make([]segment.Document, n)
+		for i := range docs {
+			docs[i] = &numericDoc{fields: []segment.Field{
+				NewFakeField("_id", strconv.Itoa(i), true, false, false), NewFakeNumericField("n", vals[i])}}
+		}
+		s := buildSegment(t, docs, ver)
+		col := s.fieldNumCols[s.fieldsMap["n"]-1]
+		if col == nil {
+			t.Fatalf("version %d: no numeric column", ver)
+		}
+		got := make([]int64, n)
+		ok, err := s.VisitNumericColumn("n", func(doc uint64, v int64) error { got[doc] = v; return nil })
+		if err != nil || !ok || !slices.Equal(got, vals) {
+			t.Fatalf("version %d: values differ (ok=%v err=%v)", ver, ok, err)
+		}
+		sizes[ver] = int(col.dataEnd) // #nosec G115 -- a small test column.
+		if ver == Version {
+			// block 0 holds -3, so its deltas are odd: no shift, 8 bytes
+			if b := col.blocks[0]; b.shift != 0 || b.width != widthQword {
+				t.Fatalf("block 0 shift %d width %d, want 0 and 8", b.shift, b.width)
+			}
+			for i, b := range col.blocks[1:] {
+				if b.shift < 40 || b.width != widthWord {
+					t.Fatalf("block %d shift %d width %d, want >= 40 and 2", i+1, b.shift, b.width)
+				}
+			}
+		}
+	}
+	if sizes[Version]*2 > sizes[8] {
+		t.Fatalf("shifted column %d bytes, want < half of %d", sizes[Version], sizes[8])
 	}
 }

@@ -106,6 +106,12 @@ func TestBuilderMatchesNew(t *testing.T) {
 		"ghostLocation": {ghost},
 		"timed":         timed(5, -3, 9),
 		"partlyUntimed": timed(5, 0, 9),
+		// single-posting terms that are not 1-hits are read again after the check
+		"singletons": {
+			&FakeDocument{NewFakeField("_id", "a", true, false, false), NewFakeField("body", "x y y", false, true, false)},
+			&FakeDocument{NewFakeField("_id", "b", true, false, false), NewFakeField("tag", "z z q", false, false, false)},
+		},
+		"unsortedTerms": splitDocs(3000),
 		"empty":         nil,
 		"emptyDocs":     {&FakeDocument{}, &FakeDocument{}},
 	}
@@ -217,15 +223,16 @@ func TestBuilderBuildKeepsOneCopy(t *testing.T) {
 	}
 	alloc := sortAllocs(t) - before
 	sortedCopy := int64(16 * (posts + locs)) // interimFreqNorm and interimLoc
-	t.Logf("%d postings, %d locations: invert and gather allocated %d B, a sorted copy takes %d B",
+	t.Logf("%d postings, %d locations: invert and encode allocated %d B, a sorted copy takes %d B",
 		posts, locs, alloc, sortedCopy)
 	if alloc > sortedCopy/2 {
-		t.Fatalf("invert and gather allocated %d B, a sorted copy takes %d B", alloc, sortedCopy)
+		t.Fatalf("invert and encode allocated %d B, a sorted copy takes %d B", alloc, sortedCopy)
 	}
 }
 
 // sortAllocs returns the bytes allocated so far by Builder.invert and
-// Builder.gather.
+// Builder.encode, not counting the chunk coders encode shares with New
+// (their s2 encoder allocates its tables without assembly, as under -race).
 func sortAllocs(t *testing.T) int64 {
 	t.Helper()
 	runtime.GC()
@@ -242,7 +249,10 @@ func sortAllocs(t *testing.T) int64 {
 		frames := runtime.CallersFrames(r.Stack())
 		for {
 			f, more := frames.Next()
-			if strings.HasSuffix(f.Function, "(*Builder).invert") || strings.HasSuffix(f.Function, "(*Builder).gather") {
+			if strings.Contains(f.Function, "(*chunkedIntCoder).") {
+				break
+			}
+			if strings.HasSuffix(f.Function, "(*Builder).invert") || strings.HasSuffix(f.Function, "(*Builder).encode") {
 				sum += r.AllocBytes
 				break
 			}

@@ -187,6 +187,9 @@ type interim struct {
 	//  field id -> bool
 	NumericOnly []bool
 
+	// idDv tracks whether _id's doc values can be its stored values
+	idDv storedDocValue
+
 	// NumericValues holds (docNum, value) pairs in doc order
 	//  field id -> values
 	NumericValues [][]interimNumeric
@@ -205,10 +208,11 @@ type interim struct {
 	numTermsPerPostingsList []int // key is postings list id
 	numLocsPerPostingsList  []int // key is postings list id
 
-	// gather, when set, returns the postings of a postings list id, using
-	// w's buffers; Postings, FreqNorms and Locs are then unused (Builder),
-	// and Dicts too: field f's lists are its sorted DictKeys from pidBase[f]
-	gather  func(pid uint64, w *dictWorker) termIn
+	// encode, when set, is encodeTermPostings for a postings list id, which
+	// it reads from its own records in one pass; Postings, FreqNorms and
+	// Locs are then unused (Builder), and Dicts too: field f's lists are its
+	// sorted DictKeys from pidBase[f]
+	encode  func(docTermMap [][]byte, term string, pid uint64, w *dictWorker) (val uint64, oneHit bool, bm *roaring.Bitmap, err error)
 	pidBase []uint64
 	// beforePlace, when set, runs before writeDicts first writes to w
 	// (Builder: the stored fields are written meanwhile)
@@ -281,6 +285,7 @@ func (s *interim) reset() {
 	s.dictPrep.dict = nil
 	s.dictPrep.dictKeys = nil
 	s.repeatedFields = false
+	s.idDv = storedDocValue{}
 	for i := range s.Dicts {
 		s.Dicts[i] = nil
 	}
@@ -1224,6 +1229,9 @@ func (s *interim) writeStoredFields() (
 			isf := &docStoredFields[fieldID]
 			isf.vals = append(isf.vals, field.Value())
 		}
+		if fieldID == 0 {
+			s.idDv.check(field)
+		}
 
 		if field.IndexDocValues() {
 			s.IncludeDocValues[fieldID] = true
@@ -1244,6 +1252,9 @@ func (s *interim) writeStoredFields() (
 			docStoredFields[i].vals = docStoredFields[i].vals[:0]
 		}
 		s.results[docNum].EachField(visitField)
+		if len(docStoredFields) > 0 && len(docStoredFields[0].vals) > 1 {
+			s.idDv.bad = true // _id repeats: its doc values hold several terms
+		}
 
 		var curr int
 
@@ -1278,15 +1289,21 @@ func (s *interim) writeStoredFields() (
 	storedFieldChunkOffsets = docChunkCoder.Offsets()
 
 	storedIndexOffset = uint64(s.w.Count()) // #nosec G115 -- countHashWriter checks overflow and counts nonnegative writes.
+	if writeVersion >= versionNoStoredIndex {
+		return storedIndexOffset, storedFieldChunkOffsets, nil
+	}
+	return storedIndexOffset, storedFieldChunkOffsets, writeStoredIndex(s.w, docStoredOffsets)
+}
 
-	for _, docStoredOffset := range docStoredOffsets {
-		err = binary.Write(s.w, binary.BigEndian, docStoredOffset)
-		if err != nil {
-			return 0, nil, err
+// writeStoredIndex writes the stored-field offset of each document, which
+// versions before versionNoStoredIndex keep.
+func writeStoredIndex(w *countHashWriter, offsets []uint64) error {
+	for _, off := range offsets {
+		if err := binary.Write(w, binary.BigEndian, off); err != nil {
+			return err
 		}
 	}
-
-	return storedIndexOffset, storedFieldChunkOffsets, nil
+	return nil
 }
 
 // fieldDicts is one field's share of writeDicts: its postings, encoded
@@ -1297,6 +1314,7 @@ type fieldDicts struct {
 	fst            bytes.Buffer
 	dv             bytes.Buffer
 	dvStart, dvEnd uint64 // relative to dv, or fieldNotUninverted
+	dvKind         uint64
 }
 
 // termPostings is a term's dictionary value (its 1-hit value, or the
@@ -1314,10 +1332,8 @@ type dictWorker struct {
 	docTerms    [][]byte
 	small, bulk *vellum.Builder // reused FST builders, see buildFST
 
-	// one term's postings, see interim.gather
-	fns  []interimFreqNorm
-	locs []interimLoc
-	bm   *roaring.Bitmap
+	bm   *roaring.Bitmap // one term's postings, see interim.encode
+	docs []uint32        // and its documents
 }
 
 // termIn is the postings of one term: its bitmap, nil for a singleton
@@ -1378,6 +1394,7 @@ func (s *interim) writeDicts() (fdvIndexOffset uint64, dictOffsets []uint64, err
 		w.loc = reuseIntCoder(w.loc, maxDocNum)
 		w.tf.compact = writeVersion >= versionCompactPostings
 		w.loc.compact = w.tf.compact
+		w.loc.slim = writeVersion >= versionSlimPostings
 		if writeVersion >= versionSplitOffsets {
 			w.off = reuseIntCoder(w.off, maxDocNum)
 			w.off.compact = true
@@ -1432,11 +1449,7 @@ func (s *interim) writeDicts() (fdvIndexOffset uint64, dictOffsets []uint64, err
 	fdvIndexOffset = uint64(s.w.Count()) // #nosec G115 -- countHashWriter checks overflow and counts nonnegative writes.
 
 	for i := 0; i < len(fdvOffsetsStart); i++ {
-		kind := dvKindTerms
-		if s.IncludeDocValues[i] && s.NumericOnly[i] {
-			kind = dvKindNumeric
-		}
-		n := binary.PutUvarint(buf, kind)
+		n := binary.PutUvarint(buf, s.fieldDicts[i].dvKind)
 		_, err := s.w.Write(buf[:n])
 		if err != nil {
 			return 0, nil, err
@@ -1496,9 +1509,10 @@ func (s *interim) encodeField(w *dictWorker, fieldID int) error {
 	fd.post.Reset()
 	fd.dv.Reset()
 	fd.terms = fd.terms[:0]
+	w.loc.ownField = uint64(fieldID) // #nosec G115 -- an index.
 
 	var docTerms [][]byte
-	if s.IncludeDocValues[fieldID] && !s.NumericOnly[fieldID] {
+	if s.IncludeDocValues[fieldID] && !s.NumericOnly[fieldID] && !s.storedDv(fieldID) {
 		if cap(w.docTerms) < s.numDocs {
 			w.docTerms = make([][]byte, s.numDocs)
 		}
@@ -1512,16 +1526,17 @@ func (s *interim) encodeField(w *dictWorker, fieldID int) error {
 	dict := s.Dicts[fieldID]
 	fd.terms = slices.Grow(fd.terms, len(s.DictKeys[fieldID]))
 	for i, term := range s.DictKeys[fieldID] { // terms are already sorted
-		var pid uint64
-		var in termIn
-		if s.gather != nil {
-			pid = s.pidBase[fieldID] + uint64(i) // #nosec G115 -- a rank.
-			in = s.gather(pid, w)
+		var tp termPostings
+		var err error
+		if s.encode != nil {
+			pid := s.pidBase[fieldID] + uint64(i) // #nosec G115 -- a rank.
+			val, oneHit, bm, eerr := s.encode(docTerms, term, pid, w)
+			tp, err = finishTermPostings(&fd.post, val, oneHit, bm, eerr, w.tf, w.loc, w.off)
 		} else {
-			pid = dict[term] - 1
-			in = termIn{s.Postings[pid], s.FreqNorms[pid], s.Locs[pid]}
+			pid := dict[term] - 1
+			in := termIn{s.Postings[pid], s.FreqNorms[pid], s.Locs[pid]}
+			tp, err = s.appendTermPostings(&fd.post, docTerms, term, pid, in, w.tf, w.loc, w.off)
 		}
-		tp, err := s.appendTermPostings(&fd.post, docTerms, term, pid, in, w.tf, w.loc, w.off)
 		if err != nil {
 			return err
 		}
@@ -1529,7 +1544,7 @@ func (s *interim) encodeField(w *dictWorker, fieldID int) error {
 	}
 
 	var err error
-	fd.dvStart, fd.dvEnd, err = s.writeFieldDocValues(newCountHashWriter(&fd.dv), fieldID, docTerms, &w.numeric)
+	fd.dvKind, fd.dvStart, fd.dvEnd, err = s.writeFieldDocValues(newCountHashWriter(&fd.dv), fieldID, docTerms, &w.numeric)
 	return err
 }
 
@@ -1538,6 +1553,12 @@ func (s *interim) encodeField(w *dictWorker, fieldID int) error {
 func (s *interim) appendTermPostings(post *bytes.Buffer, docTermMap [][]byte, term string, pid uint64, in termIn,
 	tfEncoder, locEncoder, offEncoder *chunkedIntCoder) (tp termPostings, err error) {
 	val, oneHit, postingsBS, err := s.encodeTermPostings(docTermMap, term, pid, in, tfEncoder, locEncoder, offEncoder)
+	return finishTermPostings(post, val, oneHit, postingsBS, err, tfEncoder, locEncoder, offEncoder)
+}
+
+// finishTermPostings appends what encodeTermPostings encoded to post.
+func finishTermPostings(post *bytes.Buffer, val uint64, oneHit bool, postingsBS *roaring.Bitmap, err error,
+	tfEncoder, locEncoder, offEncoder *chunkedIntCoder) (tp termPostings, _ error) {
 	if err != nil || oneHit {
 		return termPostings{val: val}, err
 	}
@@ -1551,15 +1572,20 @@ func (s *interim) appendTermPostings(post *bytes.Buffer, docTermMap [][]byte, te
 			return tp, err
 		}
 	}
-	if offEncoder != nil && len(offEncoder.final) > 0 {
+	if hasOffsets(offEncoder) {
 		if tp.offLen, err = offEncoder.Write(post); err != nil {
 			return tp, err
 		}
 	}
 	start := post.Len()
-	postingsBS.RunOptimize()
-	post.Write(binary.AppendUvarint(post.AvailableBuffer(), postingsBS.GetSerializedSizeInBytes()))
-	if _, err = postingsBS.WriteTo(post); err != nil {
+	if writeVersion >= versionSlimPostings {
+		err = writeDocs(post, postingsBS, &tfEncoder.list)
+	} else {
+		postingsBS.RunOptimize()
+		post.Write(binary.AppendUvarint(post.AvailableBuffer(), postingsBS.GetSerializedSizeInBytes()))
+		_, err = postingsBS.WriteTo(post)
+	}
+	if err != nil {
 		return tp, err
 	}
 	tp.bmLen = post.Len() - start
@@ -1599,7 +1625,7 @@ func (s *interim) placePostings(fd *fieldDicts) error {
 		}
 		p = p[chunks:]
 		tp.val = uint64(s.w.Count()) // #nosec G115 -- see above.
-		h := appendPostingsHeader(header[:0], tfOffset, locOffset, offOffset, split)
+		h := appendPostingsHeader(header[:0], tp.val, tfOffset, locOffset, offOffset, split)
 		if _, err := s.w.Write(h); err != nil {
 			return err
 		}
@@ -1645,12 +1671,18 @@ func (s *interim) buildFST(w *dictWorker, fieldID int) error {
 	return (*b).Close()
 }
 
+// storedDv reports whether fieldID's doc values are written as its stored
+// values (dvKindStored): _id when every document stores its one term.
+func (s *interim) storedDv(fieldID int) bool {
+	return fieldID == 0 && writeVersion >= versionNoStoredIndex && s.idDv.ok()
+}
+
 // writeFieldDocValues writes the doc values of fieldID to w and returns
-// their offsets in w, fieldNotUninverted for both when it has none.
+// their kind and offsets in w, fieldNotUninverted for both when it has none.
 // docTermMap holds each document's terms of the field, numericWriter is
 // reused (and created when nil) for numeric columns.
 func (s *interim) writeFieldDocValues(w *countHashWriter, fieldID int, docTermMap [][]byte,
-	numericWriter **numericColumnWriter) (start, end uint64, err error) {
+	numericWriter **numericColumnWriter) (kind, start, end uint64, err error) {
 	if s.IncludeDocValues[fieldID] && s.NumericOnly[fieldID] {
 		numDocs := uint64(s.numDocs) // #nosec G115 -- a nonnegative count.
 		if *numericWriter == nil {
@@ -1662,22 +1694,47 @@ func (s *interim) writeFieldDocValues(w *countHashWriter, fieldID int, docTermMa
 		for _, nv := range s.NumericValues[fieldID] {
 			err = nw.Add(nv.docNum, nv.val)
 			if err != nil {
-				return 0, 0, err
+				return 0, 0, 0, err
 			}
 		}
 		start = uint64(w.Count()) // #nosec G115 -- countHashWriter checks overflow and counts nonnegative writes.
 		if _, err = nw.Write(w); err != nil {
-			return 0, 0, err
+			return 0, 0, 0, err
 		}
-		return start, uint64(w.Count()), nil // #nosec G115 -- see above.
+		return dvKindNumeric, start, uint64(w.Count()), nil // #nosec G115 -- see above.
 	}
 	if !s.IncludeDocValues[fieldID] {
-		return fieldNotUninverted, fieldNotUninverted, nil
+		return dvKindTerms, fieldNotUninverted, fieldNotUninverted, nil
 	}
+	if s.storedDv(fieldID) {
+		return dvKindStored, 0, 0, nil
+	}
+	if writeVersion < versionNoStoredIndex {
+		return s.writeContentDocValues(w, docTermMap)
+	}
+	tw, err := newTermDvWriter(uint64(s.numDocs)) // #nosec G115 -- a nonnegative count.
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	for docNum, docTerms := range docTermMap {
+		if len(docTerms) == 0 {
+			continue
+		}
+		err = tw.Add(uint64(docNum), docTerms)
+		if err != nil {
+			return 0, 0, 0, err
+		}
+	}
+	return tw.Write(w)
+}
+
+// writeContentDocValues writes term doc values as chunked content, the
+// only term kind before version 9.
+func (s *interim) writeContentDocValues(w *countHashWriter, docTermMap [][]byte) (kind, start, end uint64, err error) {
 	// NOTE: term doc values continue to use legacy chunk mode
 	chunkSize, err := getChunkSize(legacyChunkMode, 0, 0)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 	// #nosec G115 -- called by writeDicts only for nonempty results.
 	fdvEncoder := newChunkedContentCoder(chunkSize, uint64(s.numDocs-1), w, false)
@@ -1685,27 +1742,25 @@ func (s *interim) writeFieldDocValues(w *countHashWriter, fieldID int, docTermMa
 		if len(docTerms) > 0 {
 			err = fdvEncoder.Add(uint64(docNum), docTerms)
 			if err != nil {
-				return 0, 0, err
+				return 0, 0, 0, err
 			}
 		}
 	}
 	err = fdvEncoder.Close()
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 	start = uint64(w.Count()) // #nosec G115 -- countHashWriter checks overflow and counts nonnegative writes.
 	if _, err = fdvEncoder.Write(); err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
-	return start, uint64(w.Count()), nil // #nosec G115 -- see above.
+	return dvKindTerms, start, uint64(w.Count()), nil // #nosec G115 -- see above.
 }
 
 // encodeTermPostings encodes the postings of term into the closed
 // tfEncoder, locEncoder and offEncoder (nil before version 7) and returns
 // its bitmap, or, when oneHit, its "1-hit" dictionary value with the
 // coders untouched.
-//
-//nolint:gocyclo,funlen // hot encode path, kept inline for speed.
 func (s *interim) encodeTermPostings(docTermMap [][]byte, term string, pid uint64, in termIn,
 	tfEncoder, locEncoder, offEncoder *chunkedIntCoder) (val uint64, oneHit bool, postingsBS *roaring.Bitmap, err error) {
 	postingsBS = in.bm
@@ -1737,22 +1792,12 @@ func (s *interim) encodeTermPostings(docTermMap [][]byte, term string, pid uint6
 	if postingsBS == nil {
 		postingsBS = roaring.New()
 		postingsBS.Add(freqNorms[0].docNum)
-		if s.gather == nil {
-			s.Postings[pid] = postingsBS // kept for reuse, see prepareDicts
-		}
+		s.Postings[pid] = postingsBS // kept for reuse, see prepareDicts
 	}
 
-	chunkSize, err := getChunkSize(s.chunkMode, card, uint64(s.numDocs)) // #nosec G115 -- a nonnegative count.
+	err = setChunkSizes(s.chunkMode, card, s.numDocs, tfEncoder, locEncoder, offEncoder)
 	if err != nil {
 		return 0, false, nil, err
-	}
-	// #nosec G115 -- called by writeDicts only for nonempty results.
-	tfEncoder.SetChunkSize(chunkSize, uint64(s.numDocs-1))
-	// #nosec G115 -- called by writeDicts only for nonempty results.
-	locEncoder.SetChunkSize(chunkSize, uint64(s.numDocs-1))
-	if offEncoder != nil {
-		// #nosec G115 -- called by writeDicts only for nonempty results.
-		offEncoder.SetChunkSize(chunkSize, uint64(s.numDocs-1))
 	}
 
 	postingsItr := postingsBS.Iterator()
@@ -1776,7 +1821,7 @@ func (s *interim) encodeTermPostings(docTermMap [][]byte, term string, pid uint6
 					uint64(loc.fieldID), pos, start, uint64(loc.end), prevPos, prevStart)
 				prevPos, prevStart = pos, start
 			}
-			err = addLocationRecords(docNum, locEncoder, offEncoder)
+			err = addLocationRecords(docNum, uint64(freqNorm.freq), locEncoder, offEncoder)
 			if err != nil {
 				return 0, false, nil, err
 			}
@@ -1793,18 +1838,41 @@ func (s *interim) encodeTermPostings(docTermMap [][]byte, term string, pid uint6
 		}
 	}
 
-	if closeErr := tfEncoder.Close(); closeErr != nil {
-		return 0, false, nil, closeErr
-	}
-	if closeErr := locEncoder.Close(); closeErr != nil {
-		return 0, false, nil, closeErr
-	}
-	if offEncoder != nil {
-		if closeErr := offEncoder.Close(); closeErr != nil {
-			return 0, false, nil, closeErr
-		}
+	err = closeEncoders(tfEncoder, locEncoder, offEncoder)
+	if err != nil {
+		return 0, false, nil, err
 	}
 	return 0, false, postingsBS, nil
+}
+
+// setChunkSizes sizes the chunks of the coders of a term with card
+// postings in a segment of numDocs (> 0) documents; offEncoder may be nil.
+func setChunkSizes(chunkMode uint32, card uint64, numDocs int, tfEncoder, locEncoder, offEncoder *chunkedIntCoder) error {
+	chunkSize, err := getChunkSize(chunkMode, card, uint64(numDocs)) // #nosec G115 -- a positive count.
+	if err != nil {
+		return err
+	}
+	maxDocNum := uint64(numDocs - 1) // #nosec G115 -- see above.
+	tfEncoder.SetChunkSize(chunkSize, maxDocNum)
+	locEncoder.SetChunkSize(chunkSize, maxDocNum)
+	if offEncoder != nil {
+		offEncoder.SetChunkSize(chunkSize, maxDocNum)
+	}
+	return nil
+}
+
+// closeEncoders closes a term's coders; offEncoder may be nil.
+func closeEncoders(tfEncoder, locEncoder, offEncoder *chunkedIntCoder) error {
+	if err := tfEncoder.Close(); err != nil {
+		return err
+	}
+	if err := locEncoder.Close(); err != nil {
+		return err
+	}
+	if offEncoder != nil {
+		return offEncoder.Close()
+	}
+	return nil
 }
 
 func (s *interim) calcTimestamp() (minimum, maximum int64) {

@@ -31,6 +31,8 @@ type docNumTermsVisitor func(docNum uint64, terms []byte) error
 type docVisitState struct {
 	dvrs    map[uint16]*docValueReader
 	nums    map[uint16]*numericColumnCursor
+	ords    map[uint16]*ordinalCursor
+	stored  visitDocumentCtx // of dvKindStored fields, keeping their chunk
 	segment *Segment
 	scratch []byte // prefix coded terms handed to the legacy visitor
 	// plan is the per-field reader in request order, resolved once per
@@ -40,8 +42,10 @@ type docVisitState struct {
 }
 
 type dvFieldPlan struct {
-	num *numericColumnCursor
-	dvr *docValueReader
+	num    *numericColumnCursor
+	dvr    *docValueReader
+	ord    *ordinalCursor
+	stored string // a dvKindStored field
 }
 
 type docValueReader struct {
@@ -301,6 +305,8 @@ func (s *Segment) visitDocumentFieldTerms(localDocNum uint64, fields []string,
 		dvs.segment = s
 		dvs.dvrs = nil
 		dvs.nums = nil
+		dvs.ords = nil
+		dvs.stored.chunk = nil
 		dvs.plan = nil
 		dvs.planned = false
 	}
@@ -310,6 +316,7 @@ func (s *Segment) visitDocumentFieldTerms(localDocNum uint64, fields []string,
 	if dvs.dvrs == nil {
 		dvs.dvrs = make(map[uint16]*docValueReader, len(fields))
 		dvs.nums = make(map[uint16]*numericColumnCursor)
+		dvs.ords = make(map[uint16]*ordinalCursor)
 		for _, field := range fields {
 			if fieldIDPlus1, ok = s.fieldsMap[field]; !ok {
 				continue
@@ -322,23 +329,13 @@ func (s *Segment) visitDocumentFieldTerms(localDocNum uint64, fields []string,
 			if col, exists := s.fieldNumCols[fieldID]; exists && dvs.nums[fieldID] == nil {
 				dvs.nums[fieldID] = newNumericColumnCursor(col)
 			}
+			if col, exists := s.fieldOrdCols[fieldID]; exists && dvs.ords[fieldID] == nil {
+				dvs.ords[fieldID] = newOrdinalCursor(col)
+			}
 		}
 	}
 	if !dvs.planned {
-		// resolved once per segment; a field listed twice shares one reader
-		dvs.planned = true
-		dvs.plan = dvs.plan[:0]
-		for _, field := range fields {
-			if fieldIDPlus1, ok = s.fieldsMap[field]; !ok {
-				continue
-			}
-			fieldID := fieldIDPlus1 - 1
-			if cur := dvs.nums[fieldID]; cur != nil {
-				dvs.plan = append(dvs.plan, dvFieldPlan{num: cur})
-			} else if dvr := dvs.dvrs[fieldID]; dvr != nil {
-				dvs.plan = append(dvs.plan, dvFieldPlan{dvr: dvr})
-			}
-		}
+		dvs.makePlan(s, fields)
 	}
 
 	// find the chunkNumber where the docValues are stored
@@ -352,6 +349,18 @@ func (s *Segment) visitDocumentFieldTerms(localDocNum uint64, fields []string,
 	for _, p := range dvs.plan {
 		if p.num != nil {
 			if err := dvs.visitNumeric(p.num, localDocNum, visitor, numVisitor); err != nil {
+				return dvs, err
+			}
+			continue
+		}
+		if p.ord != nil {
+			if err := p.ord.visitDoc(s, localDocNum, visitor); err != nil {
+				return dvs, err
+			}
+			continue
+		}
+		if p.stored != "" {
+			if err := s.visitStoredDocValue(&dvs.stored, localDocNum, p.stored, visitor); err != nil {
 				return dvs, err
 			}
 			continue
@@ -371,6 +380,30 @@ func (s *Segment) visitDocumentFieldTerms(localDocNum uint64, fields []string,
 		}
 	}
 	return dvs, nil
+}
+
+// makePlan resolves the reader of each of fields once per segment; a field
+// listed twice shares one reader.
+func (dvs *docVisitState) makePlan(s *Segment, fields []string) {
+	dvs.planned = true
+	dvs.plan = dvs.plan[:0]
+	for _, field := range fields {
+		fieldIDPlus1, ok := s.fieldsMap[field]
+		if !ok {
+			continue
+		}
+		fieldID := fieldIDPlus1 - 1
+		if cur := dvs.nums[fieldID]; cur != nil {
+			dvs.plan = append(dvs.plan, dvFieldPlan{num: cur})
+		} else if dvr := dvs.dvrs[fieldID]; dvr != nil {
+			dvs.plan = append(dvs.plan, dvFieldPlan{dvr: dvr})
+		} else if ord := dvs.ords[fieldID]; ord != nil {
+			dvs.plan = append(dvs.plan, dvFieldPlan{ord: ord})
+		} else if s.fieldStoredDvs[fieldID] {
+			dvs.stored.keep = true
+			dvs.plan = append(dvs.plan, dvFieldPlan{stored: field})
+		}
+	}
 }
 
 // visitNumeric hands column values to numVisitor when set, otherwise to the

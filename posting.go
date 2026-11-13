@@ -18,6 +18,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"slices"
+	"sync/atomic"
 
 	"github.com/RoaringBitmap/roaring/v2"
 	segment "github.com/vcaesar/bluge_segment_api"
@@ -84,6 +86,7 @@ type PostingsList struct {
 	offOffset      uint64 // location offsets stream, version 7+
 	postings       *roaring.Bitmap
 	except         *roaring.Bitmap
+	field          string // of the dictionary, the one slim location chunks leave out
 
 	// when normBits1Hit != 0, then this postings list came from a
 	// 1-hit encoding, and only the docNum1Hit & normBits1Hit apply
@@ -265,6 +268,7 @@ func (p *PostingsList) split() bool {
 
 func (p *PostingsList) read(postingsOffset uint64, d *Dictionary) error {
 	p.postingsOffset = postingsOffset
+	p.field = d.field
 
 	// handle "1-hit" encoding special case
 	if p.postingsOffset&fSTValEncodingMask == fSTValEncoding1Hit {
@@ -276,6 +280,9 @@ func (p *PostingsList) read(postingsOffset uint64, d *Dictionary) error {
 	var err error
 	p.freqOffset, err = readDataUvarint(d.sb.data, &pos)
 	if err != nil {
+		return err
+	}
+	if p.freqOffset, err = headerFreqOffset(d.sb, postingsOffset, p.freqOffset); err != nil {
 		return err
 	}
 	p.locOffset, err = readDataUvarint(d.sb.data, &pos)
@@ -300,15 +307,10 @@ func (p *PostingsList) read(postingsOffset uint64, d *Dictionary) error {
 			p.offOffset += p.locOffset
 		}
 	}
-	postingsLen, err := readDataUvarint(d.sb.data, &pos)
+	roaringBytes, err := readDocs(d.sb, pos)
 	if err != nil {
 		return err
 	}
-	roaringData, err := readDataAt(d.sb.data, pos, postingsLen)
-	if err != nil {
-		return err
-	}
-	roaringBytes := roaringData
 
 	if p.postings == nil {
 		p.postings = roaring.NewBitmap()
@@ -325,6 +327,75 @@ func (p *PostingsList) read(postingsOffset uint64, d *Dictionary) error {
 	}
 
 	return nil
+}
+
+// headerFreqOffset returns the freq/norm offset stored in the postings
+// header at at: from version 10 a set one is the distance back from the
+// header (see appendPostingsHeader).
+func headerFreqOffset(sb *Segment, at, stored uint64) (uint64, error) {
+	if stored == 0 || sb.footer == nil || sb.footer.version < versionSlimPostings {
+		return stored, nil
+	}
+	if stored > at {
+		return 0, fmt.Errorf("postings freq offset out of range")
+	}
+	return at - stored, nil
+}
+
+// readDocs returns the serialized roaring bitmap of the documents that end
+// the postings header at pos, converting a version 10+ delta list.
+func readDocs(sb *Segment, pos uint64) ([]byte, error) {
+	n, err := readDataUvarint(sb.data, &pos)
+	if err != nil {
+		return nil, err
+	}
+	list := false
+	if sb.footer != nil && sb.footer.version >= versionSlimPostings {
+		n, list = n>>1, n&1 != 0
+	}
+	docs, err := readDataAt(sb.data, pos, n)
+	if err != nil || !list {
+		return docs, err
+	}
+	return sb.docLists.bitmap(pos, docs)
+}
+
+// docListSlots bounds docListCache: a slot holds at most the bitmap of
+// maxListDocs documents, about 2 KiB.
+const (
+	docListSlotBits = 6
+	docListSlots    = 1 << docListSlotBits
+)
+
+// docListCache keeps the roaring buffers delta lists were converted to, so
+// a term read again skips docListBitmap. It is direct mapped by the list's
+// offset; a bitmap read from a cached buffer copies a container before
+// changing it (see readDocs), so the buffers are shared read only.
+type docListCache struct {
+	slots [docListSlots]atomic.Pointer[docListEntry]
+}
+
+type docListEntry struct {
+	pos uint64
+	bm  []byte
+}
+
+// docListSlot hashes a list's offset to its docListCache slot (Fibonacci
+// hashing to the top docListSlotBits bits).
+func docListSlot(pos uint64) uint64 { return (pos * 0x9E3779B97F4A7C15) >> (64 - docListSlotBits) }
+
+// bitmap returns the roaring buffer of the delta list at pos.
+func (c *docListCache) bitmap(pos uint64, list []byte) ([]byte, error) {
+	s := &c.slots[docListSlot(pos)]
+	if e := s.Load(); e != nil && e.pos == pos {
+		return e.bm, nil
+	}
+	bm, err := docListBitmap(list)
+	if err != nil {
+		return nil, err
+	}
+	s.Store(&docListEntry{pos: pos, bm: bm})
+	return bm, nil
 }
 
 func (p *PostingsList) init1Hit(fstVal uint64) error {
@@ -461,19 +532,19 @@ func (i *PostingsIterator) readFreqNormHasLocs() (freq int, norm uint64, hasLocs
 	return freq, norm, hasLocs, nil
 }
 
-func (i *PostingsIterator) skipFreqNormReadHasLocs() (bool, error) {
+func (i *PostingsIterator) skipFreqNormReadHasLocs() (freq uint64, hasLocs bool, err error) {
 	if i.normBits1Hit != 0 {
-		return false, nil
+		return 1, false, nil
 	}
 
 	freqHasLocs, err := i.freqNormReader.readUvarint()
 	if err != nil {
-		return false, fmt.Errorf("error reading freqHasLocs: %v", err)
+		return 0, false, fmt.Errorf("error reading freqHasLocs: %v", err)
 	}
 
 	i.freqNormReader.SkipUvarint() // Skip normBits.
 
-	return freqHasLocs&0x01 != 0, nil // See decodeFreqHasLocs() / hasLocs.
+	return freqHasLocs >> 1, freqHasLocs&0x01 != 0, nil // See decodeFreqHasLocs().
 }
 
 func encodeFreqHasLocs(freq uint64, hasLocs bool) uint64 {
@@ -1162,16 +1233,21 @@ func (i *PostingsIterator) nextPosRun(n int, docs []uint64, freqs []int, norms [
 	last, chunkEnd := i.lastDoc, i.chunkEnd
 	clean := i.postings.postings == i.ActualBM
 	h := i.recHandle()
+	// a slim chunk's record is the pos alone, of the list's own field
+	slim, recLen := i.locReader.slim, splitRecLen
+	if slim {
+		fieldsInv, recLen = []string{i.postings.field}, 1
+	}
 	if m := i.denseRun(it, len(docs)-n); m >= minDenseRun {
 		// docs d0, d0+1, ... d0+m-1 are all postings: read them without
 		// stepping the iterator per document
 		d0, j := it.PeekNext(), uint32(0)
 		for ; j < uint32(m); j++ { // #nosec G115 -- m is at most chunkEnd-d0.
-			nb, f, p, ok := posRecord(fS, lS, fc, lc, len(fieldsInv))
+			nb, f, p, ok := posRecord(fS, lS, fc, lc, len(fieldsInv), slim)
 			if !ok {
 				break
 			}
-			fc, lc = fc+2, lc+3
+			fc, lc = fc+2, lc+recLen
 			docs[n], freqs[n], norms[n], offs[n] = uint64(d0+j), 1, float64(math.Float32frombits(uint32(nb))), h
 			h++
 			fields = append(fields, fieldsInv[f])
@@ -1189,13 +1265,13 @@ func (i *PostingsIterator) nextPosRun(n int, docs []uint64, freqs []int, norms [
 		if uint64(d) >= chunkEnd || (!clean && d != last+1) {
 			break
 		}
-		nb, f, p, ok := posRecord(fS, lS, fc, lc, len(fieldsInv))
+		nb, f, p, ok := posRecord(fS, lS, fc, lc, len(fieldsInv), slim)
 		if !ok {
 			break
 		}
 		it.Next()
 		last = d
-		fc, lc = fc+2, lc+3
+		fc, lc = fc+2, lc+recLen
 		docs[n], freqs[n], norms[n], offs[n] = uint64(d), 1, float64(math.Float32frombits(uint32(nb))), h
 		h++
 		fields = append(fields, fieldsInv[f])
@@ -1208,12 +1284,179 @@ func (i *PostingsIterator) nextPosRun(n int, docs []uint64, freqs []int, norms [
 	return n, fields, locs
 }
 
+// NextOwnPosBatch is NextPosBatch for postings in a slim chunk, whose
+// locations are all of the list's own field at positions that do not
+// decrease. It does not decode them: recs[starts[k]:ends[k]] is the record
+// of posting k, the uvarint deltas of its positions, each complete and at
+// most maxDeltaLen bytes. recs is the chunk, so a batch ends with it, and
+// is valid until the iterator is read again. starts and ends must be as
+// long as docs. own false, with n 0, says the next posting is in a chunk
+// of another layout, which NextPosBatch reads; n 0 with own true is the end.
+//
+//nolint:gocyclo // hot decode path, kept inline for speed.
+func (i *PostingsIterator) NextOwnPosBatch(docs []uint64, freqs []int, norms []float64, starts, ends []int,
+	offs []uint64) (n int, recs []byte, own bool, err error) {
+	if i.normBits1Hit == 0 && i.ActualBM == nil {
+		return 0, nil, true, nil // an empty list
+	}
+	if !i.includeFreqNorm || !i.includeLocs || i.normBits1Hit != 0 || !i.postings.split() || i.postings.chunkSize == 0 {
+		return 0, nil, false, nil
+	}
+	if !i.started {
+		i.startIterators()
+	}
+	it, ok := i.Actual.(*roaring.IntIterator) // concrete calls in nextOwnRun
+	if !ok {
+		return 0, nil, false, nil
+	}
+	clean := i.postings.postings == i.ActualBM
+	for n < len(docs) && it.HasNext() {
+		d := it.PeekNext()
+		// same sequential-read test as Next
+		if !i.hasLast || d <= i.lastDoc || uint64(d) >= i.chunkEnd || (!clean && d != i.lastDoc+1) {
+			if n > 0 && uint64(d) >= i.chunkEnd {
+				break // the next chunk replaces recs
+			}
+			if seekErr := i.seekFreqNorm(d, i.chunkOf(d)); seekErr != nil {
+				return n, nil, true, seekErr
+			}
+			// the readers are on d's entry, as before the first read
+			i.hasLast = false
+		}
+		if !i.locReader.slim {
+			return 0, nil, false, nil
+		}
+		if n, err = i.nextOwnRun(n, docs, freqs, norms, starts, ends, offs, it, clean); err != nil {
+			return n, nil, true, err
+		}
+	}
+	return n, i.locReader.r.S, true, nil
+}
+
+// maxDeltaLen is the longest position delta of a slim record, in bytes:
+// one more would not fit an int.
+const maxDeltaLen = 9
+
+// highBits has the continuation bit of each of the wordBytes uvarint bytes
+// nextOwnRun tests at once.
+const (
+	highBits  = 0x8080808080808080
+	wordBytes = 8
+)
+
+// nextOwnRun continues NextOwnPosBatch through the postings of the loaded
+// slim chunk from the next document of it, whose entry the readers are on,
+// while they follow in sequence. It reads at least that document.
+//
+//nolint:gocyclo // hot decode path, kept inline for speed.
+func (i *PostingsIterator) nextOwnRun(n int, docs []uint64, freqs []int, norms []float64, starts, ends []int,
+	offs []uint64, it *roaring.IntIterator, clean bool) (nOut int, err error) {
+	fr, lr := i.freqNormReader.r, i.locReader.r
+	fS, fc, lS, lc := fr.S, fr.C, lr.S, lr.C
+	last, hasLast, chunkEnd := i.lastDoc, i.hasLast, i.chunkEnd
+	h := i.recHandle()
+	// documents d0, d0+1, ... d0+dense-1 are all postings: read them
+	// without stepping the iterator per document
+	var d0, j uint32
+	dense := uint32(i.denseRun(it, len(docs)-n)) // #nosec G115 -- at most len(docs).
+	if dense > 0 {
+		d0 = it.PeekNext()
+	}
+run:
+	for n < len(docs) {
+		d := d0 + j
+		if j >= dense {
+			if !it.HasNext() {
+				break
+			}
+			d = it.PeekNext()
+			if uint64(d) >= chunkEnd || (!clean && hasLast && d != last+1) {
+				break
+			}
+		}
+		var fh, nb uint64
+		if fc+2 <= len(fS) && (fS[fc]|fS[fc+1]) < lastByte {
+			fh, nb, fc = uint64(fS[fc]), uint64(fS[fc+1]), fc+2
+		} else {
+			var ok bool
+			if fh, fc, ok = uvarintAt(fS, fc); ok {
+				nb, fc, ok = uvarintAt(fS, fc)
+			}
+			if !ok || nb > math.MaxUint32 {
+				err = fmt.Errorf("error reading frequency or norm")
+				break
+			}
+		}
+		freq, hasLocs := decodeFreqHasLocs(fh)
+		starts[n], offs[n] = lc, NoOffsets
+		if hasLocs {
+			// pass over freq deltas, eight one-byte ones at a time
+			for left := freq; left > 0; {
+				if lc+wordBytes <= len(lS) {
+					k := min(left, wordBytes)
+					if binary.LittleEndian.Uint64(lS[lc:])&(highBits>>(wordBytes*(wordBytes-k))) == 0 {
+						lc, left = lc+k, left-k
+						continue
+					}
+				}
+				// a delta of several bytes, or the last ones of the chunk
+				for from := lc; ; {
+					if lc >= len(lS) || lc-from >= maxDeltaLen {
+						err = fmt.Errorf("location record truncated")
+						break run
+					}
+					lc++
+					if lS[lc-1] < lastByte {
+						break
+					}
+				}
+				left--
+			}
+			offs[n] = h
+			h++
+		}
+		if j >= dense {
+			it.Next()
+		} else {
+			j++
+			if j == dense {
+				it.AdvanceIfNeeded(d0 + dense)
+			}
+		}
+		last, hasLast = d, true
+		docs[n], freqs[n], norms[n], ends[n] = uint64(d), freq, float64(math.Float32frombits(uint32(nb))), lc
+		n++
+	}
+	if j < dense {
+		it.AdvanceIfNeeded(d0 + j)
+	}
+	fr.C, lr.C, i.lastDoc, i.hasLast = fc, lc, last, hasLast
+	i.locRec = uint32(h) // #nosec G115 -- the record number is the low half of the handle.
+	return n, err
+}
+
+// splitRecLen is the byte length of the location record posRecord decodes.
+const splitRecLen = 3
+
+// locInts is the number of ints a location takes in locs: pos, start, end.
+const locInts = 3
+
 // posRecord decodes, at fc and lc, the freq/norm entry and version 7+
 // location record of a posting with one location, all one-byte values:
-// freq 1 with locations, norm nb, then record 2, field f, pos p. ok is
-// false for any other posting, which appendSplitLocs reads or reports.
-func posRecord(fS, lS []byte, fc, lc, numFields int) (nb byte, f, p int, ok bool) {
-	if fc+2 > len(fS) || lc+3 > len(lS) || fS[fc] != 3 || fS[fc+1] >= lastByte || lS[lc] != 2 {
+// freq 1 with locations, norm nb, then record 2, field f, pos p, or, in a
+// slim chunk, pos p alone (f is 0). ok is false for any other posting,
+// which appendSplitLocs reads or reports.
+func posRecord(fS, lS []byte, fc, lc, numFields int, slim bool) (nb byte, f, p int, ok bool) {
+	if fc+2 > len(fS) || fS[fc] != 3 || fS[fc+1] >= lastByte {
+		return 0, 0, 0, false
+	}
+	if slim {
+		if lc >= len(lS) || lS[lc] >= lastByte {
+			return 0, 0, 0, false
+		}
+		return fS[fc+1], 0, int(lS[lc]), true
+	}
+	if lc+splitRecLen > len(lS) || lS[lc] != 2 {
 		return 0, 0, 0, false
 	}
 	// a one-byte zigzag pos is not negative when even
@@ -1267,6 +1510,43 @@ func (i *PostingsIterator) recHandle() uint64 {
 func (i *PostingsIterator) appendSplitLocs(freq int, fields []string, locs []int) (
 	fieldsOut []string, locsOut []int, err error) {
 	r := i.locReader.r
+	if i.locReader.slim {
+		// freq positions of the list's own field, each a delta
+		S, c, field := r.S, r.C, i.postings.field
+		if freq < 0 || freq > len(S)-c {
+			return fields, locs, fmt.Errorf("location record truncated")
+		}
+		// each position takes at least a byte: grow once, then fill in place
+		nf, nl := len(fields), len(locs)
+		fields, locs = slices.Grow(fields, freq)[:nf+freq], slices.Grow(locs, locInts*freq)[:nl+locInts*freq]
+		fs, ls := fields[nf:], locs[nl:]
+		var pos uint64
+		for k := range fs {
+			var p uint64
+			if b := S[c]; b < lastByte {
+				p, c = uint64(b), c+1
+			} else {
+				var next int
+				var ok bool
+				if p, next, ok = uvarintAt(S, c); !ok {
+					return fields[:nf], locs[:nl], fmt.Errorf("location record truncated")
+				}
+				c = next
+			}
+			if p > math.MaxInt-pos {
+				return fields[:nf], locs[:nl], fmt.Errorf("location record truncated")
+			}
+			pos += p
+			fs[k] = field
+			ls[3*k], ls[3*k+1], ls[3*k+2] = int(pos), 0, 0 // #nosec G115 -- checked above.
+			if k+1 < len(fs) && c >= len(S) {
+				return fields[:nf], locs[:nl], fmt.Errorf("location record truncated")
+			}
+		}
+		r.C = c
+		i.locRec++
+		return fields, locs, nil
+	}
 	numLocsBytes, c, ok := uvarintAt(r.S, r.C)
 	if !ok {
 		return fields, locs, fmt.Errorf("error reading location numLocsBytes")
@@ -1349,6 +1629,13 @@ func (i *PostingsIterator) LoadOffsets(h uint64, locs []int) error {
 	}
 	if len(locs)%3 != 0 {
 		return fmt.Errorf("locations are not (pos, start, end) triples")
+	}
+	if p := i.postings; p != nil && p.offOffset == 0 && p.sb.footer != nil && p.sb.footer.version >= versionSlimPostings {
+		// no offsets stream: every location starts and ends at 0
+		for j := 0; j < len(locs); j += 3 {
+			locs[j+1], locs[j+2] = 0, 0
+		}
+		return nil
 	}
 	end, err := i.seekOffsets(h)
 	if err != nil {
@@ -1500,11 +1787,16 @@ func (i *PostingsIterator) currChunkNext(nChunk uint32) error {
 	}
 
 	// read off freq/offsets even though we don't care about them
-	hasLocs, err := i.skipFreqNormReadHasLocs()
+	freq, hasLocs, err := i.skipFreqNormReadHasLocs()
 	if err != nil {
 		return err
 	}
 
+	if i.includeLocs && hasLocs && i.locReader.slim {
+		// a slim record is freq positions
+		i.locRec++
+		return i.locReader.r.skipUvarints(freq)
+	}
 	if i.includeLocs && hasLocs {
 		numLocsBytes, err := i.locReader.readUvarint()
 		if err != nil {

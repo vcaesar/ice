@@ -99,7 +99,8 @@ func TestStoredCopyMergeEquivalence(t *testing.T) {
 					if index != wantIndex || !reflect.DeepEqual(mapping, wantMapping) || !bytes.Equal(fast.Bytes(), fallback.Bytes()) {
 						t.Fatal("raw copy differs from document-by-document merge")
 					}
-					merged := &Segment{data: segment.NewDataBytes(fast.Bytes()), footer: &footer{numDocs: n, storedIndexOffset: index}}
+					merged := &Segment{data: segment.NewDataBytes(fast.Bytes()),
+						footer: &footer{numDocs: n, storedIndexOffset: index, version: writeVersion}}
 					if err := merged.loadStoredFieldChunk(); err != nil {
 						t.Fatal(err)
 					}

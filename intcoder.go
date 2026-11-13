@@ -57,6 +57,23 @@ type chunkedIntCoder struct {
 	// and keeps it raw unless s2 saves at least a quarter; empty chunks
 	// take no bytes
 	compact bool
+
+	// slim (version 10+ location coders) also keeps each chunk's records
+	// as the position deltas alone while every record holds only locations
+	// of ownField, as many as its posting's frequency, at positions that do
+	// not decrease; Close then writes that layout, flagged chunkSlim
+	slim     bool
+	ownField uint64
+	slimBuf  []byte // the current chunk in the slim layout
+	slimRec  []byte // the pending record in it
+	slimBad  bool   // the current chunk has a record the layout cannot hold
+	recBad   bool   // the pending record has a location it cannot hold
+	recLocs  uint64 // locations of the pending record
+
+	// nonZero says an offsets coder recorded a start or end since Reset
+	nonZero bool
+
+	list []byte // scratch of writeDocs, which follows this coder's Write
 }
 
 // chunk flag bytes of compact (version 6+) int coder chunks
@@ -66,6 +83,9 @@ const (
 	chunkS2 byte = 1
 	// chunkS2Fixed chunks (version 8+) are s2 blocks
 	chunkS2Fixed byte = 2
+	// chunkSlim, set with chunkRaw or chunkS2Fixed, flags a version 10+
+	// location chunk in the slim layout
+	chunkSlim byte = 4
 )
 
 // newChunkedIntCoder returns a new chunk int coder which packs data into
@@ -88,6 +108,8 @@ func (c *chunkedIntCoder) Reset() {
 	c.final = c.final[:0]
 	c.chunkBuf.Reset()
 	c.rec = c.rec[:0]
+	c.slimBuf, c.slimRec = c.slimBuf[:0], c.slimRec[:0]
+	c.slimBad, c.recBad, c.recLocs, c.nonZero = false, false, 0, false
 	c.currChunk = 0
 	for i := range c.chunkLens {
 		c.chunkLens[i] = 0
@@ -172,6 +194,7 @@ func (c *chunkedIntCoder) enterChunk(docNum uint64) (uint64, error) {
 			return 0, err
 		}
 		c.chunkBuf.Reset()
+		c.slimBuf, c.slimBad = c.slimBuf[:0], false
 		c.currChunk = chunk
 	}
 	return chunk, nil
@@ -199,6 +222,34 @@ func (c *chunkedIntCoder) addRecord(docNum uint64) error {
 	return err
 }
 
+// slimLoc adds a location to the pending record of the slim layout: delta
+// is its position past the previous one's, own whether the layout holds it.
+func (c *chunkedIntCoder) slimLoc(own bool, delta uint64) {
+	c.recLocs++
+	if !own {
+		c.recBad = true
+		return
+	}
+	c.slimRec = binary.AppendUvarint(c.slimRec, delta)
+}
+
+// addLocRecord is addRecord for the location record of a posting with
+// frequency freq, which a slim coder also adds in the slim layout.
+func (c *chunkedIntCoder) addLocRecord(docNum, freq uint64) error {
+	if err := c.addRecord(docNum); err != nil {
+		return err
+	}
+	if c.slim {
+		if c.recBad || c.recLocs != freq {
+			c.slimBad = true
+		} else if !c.slimBad {
+			c.slimBuf = append(c.slimBuf, c.slimRec...)
+		}
+		c.slimRec, c.recBad, c.recLocs = c.slimRec[:0], false, 0
+	}
+	return nil
+}
+
 // Close indicates you are done calling Add() this allows the final chunk
 // to be encoded.
 func (c *chunkedIntCoder) Close() error {
@@ -219,7 +270,10 @@ func (c *chunkedIntCoder) Close() error {
 // closeCompact is Close for compact (version 6+) chunks: a flag byte, then
 // the s2 block when it saves at least a quarter, else the raw varints.
 func (c *chunkedIntCoder) closeCompact() error {
-	raw := c.chunkBuf.Bytes()
+	raw, layout := c.chunkBuf.Bytes(), chunkRaw
+	if c.slim && !c.slimBad && len(c.slimBuf) > 0 {
+		raw, layout = c.slimBuf, chunkSlim
+	}
 	start := len(c.final)
 	if len(raw) > 0 {
 		var err error
@@ -234,9 +288,9 @@ func (c *chunkedIntCoder) closeCompact() error {
 			return err
 		}
 		if len(c.compressed)*4 <= len(raw)*3 {
-			c.final = append(append(c.final, flag), c.compressed...)
+			c.final = append(append(c.final, flag|layout), c.compressed...)
 		} else {
-			c.final = append(append(c.final, chunkRaw), raw...)
+			c.final = append(append(c.final, chunkRaw|layout), raw...)
 		}
 	}
 	c.chunkLens[c.currChunk] = uint64(len(c.final) - start) // #nosec G115 -- final only grows past start.
