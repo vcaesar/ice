@@ -321,6 +321,7 @@ func persistMergedRestField(segments []*Segment, dropsIn []*roaring.Bitmap, fiel
 
 	var lastDocNum uint64
 	var lastFreq, lastNorm uint64
+	var fieldFreq uint64 // total term frequency of the surviving postings
 
 	enumerator, err := newEnumerator(itrs)
 
@@ -342,7 +343,7 @@ func persistMergedRestField(segments []*Segment, dropsIn []*roaring.Bitmap, fiel
 		}
 
 		if !bytes.Equal(prevTerm, term) || prevTerm == nil {
-			err = prepareNewTerm(newSegDocCount, chunkMode, tfEncoder, locEncoder, offEncoder, fieldFreqs, fieldID,
+			err = prepareNewTerm(newSegDocCount, chunkMode, tfEncoder, locEncoder, offEncoder,
 				enumerator, dicts, drops)
 			if err != nil {
 				return err
@@ -363,7 +364,7 @@ func persistMergedRestField(segments []*Segment, dropsIn []*roaring.Bitmap, fiel
 		// can no longer optimize by copying, since chunk factor could have changed
 		lastDocNum, lastFreq, lastNorm, err = mergeTermFreqNormLocs(
 			fieldsMap, postItr, newDocNums[itrI], newRoaring,
-			tfEncoder, locEncoder, offEncoder, fieldDocTracking)
+			tfEncoder, locEncoder, offEncoder, fieldDocTracking, &fieldFreq)
 
 		if err != nil {
 			return err
@@ -377,6 +378,8 @@ func persistMergedRestField(segments []*Segment, dropsIn []*roaring.Bitmap, fiel
 	if err != vellum.ErrIteratorDone {
 		return err
 	}
+	// #nosec G115 -- fieldID indexes fieldsInv, bounded to MaxUint16 by mapFields.
+	fieldFreqs[uint16(fieldID)] = fieldFreq
 
 	err = finishTerm(w, newRoaring, tfEncoder, locEncoder, offEncoder, newVellum, bufMaxVarintLen64, prevTerm,
 		&lastDocNum, &lastFreq, &lastNorm)
@@ -624,8 +627,7 @@ func mergeNumericAsTerms(seg *Segment, col *numericColumn, mapping []uint64, add
 }
 
 func prepareNewTerm(newSegDocCount uint64, chunkMode uint32, tfEncoder, locEncoder, offEncoder *chunkedIntCoder,
-	fieldFreqs map[uint16]uint64, fieldID int, enumerator *enumerator, dicts []*Dictionary,
-	drops []*roaring.Bitmap) error {
+	enumerator *enumerator, dicts []*Dictionary, drops []*roaring.Bitmap) error {
 	var err error
 
 	// compute cardinality of field-term in new seg
@@ -638,8 +640,6 @@ func prepareNewTerm(newSegDocCount uint64, chunkMode uint32, tfEncoder, locEncod
 			return err
 		}
 		newCard += pl.Count()
-		// #nosec G115 -- fieldID indexes fieldsInv, bounded to MaxUint16 by mapFields.
-		fieldFreqs[uint16(fieldID)] += newCard
 	}
 	// compute correct chunk size with this
 	var chunkSize uint64
@@ -775,7 +775,7 @@ func setupActiveForField(segments []*Segment, dropsIn []*roaring.Bitmap, newDocN
 
 func mergeTermFreqNormLocs(fieldsMap map[string]uint16, postItr *PostingsIterator,
 	newDocNums []uint64, newRoaring *roaring.Bitmap,
-	tfEncoder, locEncoder, offEncoder *chunkedIntCoder, docTracking *roaring.Bitmap) (
+	tfEncoder, locEncoder, offEncoder *chunkedIntCoder, docTracking *roaring.Bitmap, fieldFreq *uint64) (
 	lastDocNum, lastFreq, lastNorm uint64, err error) {
 	next, err := postItr.Next()
 	for next != nil && err == nil {
@@ -794,6 +794,7 @@ func mergeTermFreqNormLocs(fieldsMap map[string]uint16, postItr *PostingsIterato
 		if nextFreq < 0 {
 			return 0, 0, 0, fmt.Errorf("negative posting frequency")
 		}
+		*fieldFreq += uint64(nextFreq)
 		nextNorm := uint64(math.Float32bits(float32(next.Norm())))
 
 		locs := next.Locations()

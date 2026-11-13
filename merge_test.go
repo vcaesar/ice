@@ -15,6 +15,7 @@
 package ice
 
 import (
+	"bytes"
 	"fmt"
 	"path/filepath"
 	"reflect"
@@ -772,5 +773,97 @@ func TestUnder32Bits(t *testing.T) {
 	}
 	if under32Bits(uint64(0x80000000)) || under32Bits(uint64(0x80000001)) {
 		t.Errorf("under32Bits wrong")
+	}
+}
+
+// tokenField reports its token count as its length, as an analyzer does.
+type tokenField struct{ *FakeField }
+
+func (f tokenField) Length() int {
+	var n int
+	for _, t := range f.T {
+		n += t.F
+	}
+	return n
+}
+
+type tokenDocument []tokenField
+
+func (d tokenDocument) Analyze() {}
+
+func (d tokenDocument) Timestamp() int64 { return 0 }
+
+func (d tokenDocument) EachField(vf segment.VisitField) {
+	for _, f := range d {
+		vf(f)
+	}
+}
+
+// TestMergeCollectionStats checks that a merge leaves a field with the stats
+// of a segment built from the surviving documents (issue #19).
+func TestMergeCollectionStats(t *testing.T) {
+	contents := []string{"needle", "needle needle other words", "needle"}
+	build := func(docs ...int) *Segment {
+		t.Helper()
+		results := make([]segment.Document, len(docs))
+		for i, doc := range docs {
+			results[i] = tokenDocument{
+				{NewFakeField("_id", fmt.Sprint(doc), true, false, false)},
+				{NewFakeField("content", contents[doc], false, true, false)},
+			}
+		}
+		seg, _, err := newWithChunkMode(results, encodeNorm, defaultChunkMode, DefaultOptions())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return seg.(*Segment)
+	}
+
+	for _, tc := range []struct {
+		name      string
+		segments  [][]int
+		drops     []*roaring.Bitmap
+		survivors []int
+		tokens    uint64
+	}{
+		{"once per document", [][]int{{0}, {2}}, []*roaring.Bitmap{nil, nil}, []int{0, 2}, 2},
+		{"repeated in a document", [][]int{{0}, {1}, {2}}, []*roaring.Bitmap{nil, nil, nil}, []int{0, 1, 2}, 6},
+		{"same segment", [][]int{{0, 1}, {2}}, []*roaring.Bitmap{nil, nil}, []int{0, 1, 2}, 6},
+		{"dropped repeat", [][]int{{0, 1}, {2}}, []*roaring.Bitmap{roaring.BitmapOf(1), nil}, []int{0, 2}, 2},
+		{"dropped single", [][]int{{0, 1}, {2}}, []*roaring.Bitmap{roaring.BitmapOf(0), nil}, []int{1, 2}, 5},
+		{"dropped segment", [][]int{{0}, {1}, {2}}, []*roaring.Bitmap{nil, roaring.BitmapOf(0), nil}, []int{0, 2}, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			segments := make([]segment.Segment, len(tc.segments))
+			for i, docs := range tc.segments {
+				segments[i] = build(docs...)
+			}
+			var buf bytes.Buffer
+			if _, _, err := merge(segments, tc.drops, &buf, nil); err != nil {
+				t.Fatal(err)
+			}
+			merged, err := load(segment.NewDataBytes(buf.Bytes()), DefaultOptions())
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			rebuilt := build(tc.survivors...)
+			for _, field := range []string{"_id", "content"} {
+				got, serr := merged.CollectionStats(field)
+				if serr != nil {
+					t.Fatal(serr)
+				}
+				want, serr := rebuilt.CollectionStats(field)
+				if serr != nil {
+					t.Fatal(serr)
+				}
+				if !reflect.DeepEqual(got, want) {
+					t.Errorf("%s stats = %+v, rebuilt %+v", field, got, want)
+				}
+				if field == "content" && got.SumTotalTermFrequency() != tc.tokens {
+					t.Errorf("content tokens = %d, want %d", got.SumTotalTermFrequency(), tc.tokens)
+				}
+			}
+		})
 	}
 }
