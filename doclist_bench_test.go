@@ -15,6 +15,7 @@
 package ice
 
 import (
+	"math"
 	"testing"
 
 	"github.com/RoaringBitmap/roaring/v2"
@@ -33,8 +34,8 @@ var docListCases = []struct {
 	{"tiny", 15, 667, 1},
 }
 
-func docListOf(n, step, o int) (*roaring.Bitmap, []byte) {
-	bm := roaring.New()
+func docListOf(n, step, o int) (bm *roaring.Bitmap, list []byte) {
+	bm = roaring.New()
 	for i := range n {
 		bm.Add(uint32(o + i*step)) // #nosec G115 -- small test values.
 	}
@@ -114,6 +115,16 @@ func TestDocListCacheShared(t *testing.T) {
 	}
 	if _, err := c.bitmap(9, []byte{5, 0x80}); err == nil {
 		t.Fatal("cached a bad list")
+	}
+}
+
+// docListSlot keeps the top docListSlotBits bits of the hash, so every offset
+// maps inside the cache.
+func TestDocListSlotRange(t *testing.T) {
+	for _, pos := range []uint64{0, 1, 7, 1 << 32, math.MaxUint64} {
+		if got, want := docListSlot(pos), (pos*0x9E3779B97F4A7C15)>>58; got != want || got >= docListSlots {
+			t.Fatalf("docListSlot(%d) = %d, want %d below %d", pos, got, want, docListSlots)
+		}
 	}
 }
 

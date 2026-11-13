@@ -362,7 +362,10 @@ func readDocs(sb *Segment, pos uint64) ([]byte, error) {
 
 // docListSlots bounds docListCache: a slot holds at most the bitmap of
 // maxListDocs documents, about 2 KiB.
-const docListSlots = 64
+const (
+	docListSlotBits = 6
+	docListSlots    = 1 << docListSlotBits
+)
 
 // docListCache keeps the roaring buffers delta lists were converted to, so
 // a term read again skips docListBitmap. It is direct mapped by the list's
@@ -378,8 +381,8 @@ type docListEntry struct {
 }
 
 // docListSlot hashes a list's offset to its docListCache slot (Fibonacci
-// hashing to the top 6 bits).
-func docListSlot(pos uint64) uint64 { return (pos * 0x9E3779B97F4A7C15) >> 58 }
+// hashing to the top docListSlotBits bits).
+func docListSlot(pos uint64) uint64 { return (pos * 0x9E3779B97F4A7C15) >> (64 - docListSlotBits) }
 
 // bitmap returns the roaring buffer of the delta list at pos.
 func (c *docListCache) bitmap(pos uint64, list []byte) ([]byte, error) {
