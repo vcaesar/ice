@@ -18,6 +18,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"math/bits"
 	"slices"
 	"sync/atomic"
 
@@ -169,7 +170,7 @@ func (p *PostingsList) iterator(includeFreq, includeNorm, includeLocs bool,
 		nextLocs := rv.nextLocs[:0]
 		nextSegmentLocs := rv.nextSegmentLocs[:0]
 
-		buf := rv.buf
+		buf, rankDense, actualDense := rv.buf, rv.rankDense[:0], rv.actualDense[:0]
 		offs, splitFields, splitLocs := rv.offs, rv.splitFields[:0], rv.splitLocs[:0]
 
 		*rv = PostingsIterator{} // clear the struct
@@ -181,7 +182,7 @@ func (p *PostingsList) iterator(includeFreq, includeNorm, includeLocs bool,
 		rv.nextLocs = nextLocs
 		rv.nextSegmentLocs = nextSegmentLocs
 
-		rv.buf = buf
+		rv.buf, rv.rankDense, rv.actualDense = buf, rankDense, actualDense
 		rv.offs, rv.splitFields, rv.splitLocs = offs, splitFields, splitLocs
 	}
 
@@ -457,6 +458,19 @@ type PostingsIterator struct {
 	// the end of the chunk if ActualBM holds each of its documents, else 0
 	denseEnd     uint64
 	denseChecked bool
+
+	// rankDense, once rankBuilt, holds the postings bitmap as words, so a
+	// subset seek counts the entries it passes with a popcount instead of
+	// a roaring range cardinality; rankSeeks counts the seeks before then
+	rankDense []uint64
+	rankSeeks uint64
+	rankBuilt bool
+	// batchRead counts the postings NextBatch read before rankDense
+	batchRead uint64
+	// actualDense, once actualBuilt, holds ActualBM as words when it is a
+	// subset of the postings, for nextBatchSubset
+	actualDense []uint64
+	actualBuilt bool
 }
 
 var emptyPostingsIterator = &PostingsIterator{}
@@ -916,6 +930,92 @@ func (i *PostingsIterator) advanceByRank(atOrAfter uint32) (docNum uint64, exist
 	return uint64(n), true, nil
 }
 
+// A subset seek costs about as much as writing rankWordsPerSeek words of
+// rankDense, a posting read by NextBatch as batchWordsPerRead words: the
+// words are built once the work done so far has paid for them. Segments
+// of more than maxRankWords words, and gaps of more than maxRankGapWords,
+// keep using the bitmaps.
+const (
+	rankWordsPerSeek  = 64
+	batchWordsPerRead = 8
+	maxRankWords      = 1 << 16
+	maxRankGapWords   = 64
+)
+
+// segmentWords returns the number of words that hold a bitmap of the
+// segment's documents; 0 when it is over maxRankWords.
+func (i *PostingsIterator) segmentWords() uint64 {
+	if i.postings.sb == nil || i.postings.sb.footer == nil {
+		return 0
+	}
+	if words := (i.postings.sb.footer.numDocs + 63) / 64; words <= maxRankWords {
+		return words
+	}
+	return 0
+}
+
+// writeWords sets *dst to bm as words words, reusing its array; false,
+// leaving *dst empty, when bm has a document past them.
+func writeWords(dst *[]uint64, bm *roaring.Bitmap, words uint64) bool {
+	if !bm.IsEmpty() && uint64(bm.Maximum())>>6 >= words {
+		*dst = (*dst)[:0]
+		return false
+	}
+	*dst = slices.Grow((*dst)[:0], int(words))[:words] // #nosec G115 -- at most maxRankWords.
+	clear(*dst)
+	bm.WriteDenseTo(*dst)
+	return true
+}
+
+// rankWords builds rankDense, the full postings as words, once cost words
+// of work were done without them; nil until then.
+func (i *PostingsIterator) rankWords(cost uint64) []uint64 {
+	if !i.rankBuilt {
+		words := i.segmentWords()
+		if words == 0 || cost < words {
+			return nil
+		}
+		i.rankBuilt = writeWords(&i.rankDense, i.postings.postings, words)
+		if !i.rankBuilt {
+			return nil
+		}
+	}
+	return i.rankDense
+}
+
+// batchWords returns rankDense for NextBatch's clean reads, or nil.
+func (i *PostingsIterator) batchWords() []uint64 {
+	return i.rankWords(i.batchRead * batchWordsPerRead)
+}
+
+// countPostings returns how many documents of bm, the full postings, are
+// in [lo, hi).
+func (i *PostingsIterator) countPostings(bm *roaring.Bitmap, lo, hi uint64) uint64 {
+	if !i.rankBuilt {
+		i.rankSeeks++
+		if i.rankWords(i.rankSeeks*rankWordsPerSeek) == nil {
+			return bm.CardinalityInRange(lo, hi)
+		}
+	}
+	hi = min(hi, uint64(len(i.rankDense))*wordBits)
+	if lo >= hi {
+		return 0
+	}
+	lw, hw := lo>>6, (hi-1)>>6
+	if hw-lw > maxRankGapWords {
+		return bm.CardinalityInRange(lo, hi)
+	}
+	d := i.rankDense
+	if lw == hw {
+		return uint64(bits.OnesCount64(d[lw] >> (lo & 63) << (lo&63 + 63 - (hi-1)&63))) // #nosec G115 -- a popcount.
+	}
+	n := bits.OnesCount64(d[lw]>>(lo&63)) + bits.OnesCount64(d[hw]<<(63-(hi-1)&63))
+	for _, w := range d[lw+1 : hw] {
+		n += bits.OnesCount64(w)
+	}
+	return uint64(n) // #nosec G115 -- a popcount is not negative.
+}
+
 // freqNormVarints is the number of varints in a freq/norm entry.
 const freqNormVarints = 2
 
@@ -928,13 +1028,13 @@ func (i *PostingsIterator) seekFreqNorm(n, nChunk uint32) error {
 	if i.hasLast && i.currChunk == nChunk && !i.freqNormReader.isNil() && i.lastDoc < n {
 		// the reader sits just past lastDoc's entry in this chunk
 		if n-i.lastDoc > 1 {
-			skip = bm.CardinalityInRange(uint64(i.lastDoc)+1, uint64(n))
+			skip = i.countPostings(bm, uint64(i.lastDoc)+1, uint64(n))
 		}
 	} else {
 		if err := i.loadChunk(int(nChunk)); err != nil {
 			return fmt.Errorf("error loading chunk: %v", err)
 		}
-		skip = bm.CardinalityInRange(uint64(nChunk)*i.postings.chunkSize, uint64(n))
+		skip = i.countPostings(bm, uint64(nChunk)*i.postings.chunkSize, uint64(n))
 	}
 	if !i.includeLocs {
 		// without locations an entry is just two varints, freq and norm
@@ -956,9 +1056,13 @@ func (i *PostingsIterator) seekFreqNorm(n, nChunk uint32) error {
 // the postings (deletions, or a conjunction's ReplaceActual): the freq/norm
 // entries of the postings left out are skipped by range cardinality.
 func (i *PostingsIterator) nextBatchSubset(docs []uint64, freqs []int, norms []float64) (int, error) {
+	if words := i.subsetWords(); words != nil {
+		return i.nextBatchWords(words, true, docs, freqs, norms)
+	}
 	it := i.Actual
 	r := i.freqNormReader
 	n := 0
+	defer func() { i.batchRead += uint64(n) }() // #nosec G115 -- n is not negative.
 	for n < len(docs) && it.HasNext() {
 		d := it.Next()
 		if err := i.seekFreqNorm(d, i.chunkOf(d)); err != nil {
@@ -1016,9 +1120,13 @@ func (i *PostingsIterator) NextBatch(docs []uint64, freqs []int, norms []float64
 	if i.postings.postings != i.ActualBM {
 		return i.nextBatchSubset(docs, freqs, norms)
 	}
+	if words := i.batchWords(); words != nil {
+		return i.nextBatchWords(words, false, docs, freqs, norms)
+	}
 	it := i.Actual
 	r := i.freqNormReader
 	n := 0
+	defer func() { i.batchRead += uint64(n) }() // #nosec G115 -- n is not negative.
 	for n < len(docs) && it.HasNext() {
 		d := it.Next()
 		if uint64(d) >= i.chunkEnd || r.isNil() {
@@ -1044,6 +1152,78 @@ func (i *PostingsIterator) NextBatch(docs []uint64, freqs []int, norms []float64
 		norms[n] = float64(math.Float32frombits(uint32(normBits)))
 		n++
 		i.lastDoc, i.hasLast = d, true
+	}
+	return n, nil
+}
+
+// subsetWords is batchWords for nextBatchSubset: it returns ActualBM, a
+// subset of the postings, as words, or nil.
+func (i *PostingsIterator) subsetWords() []uint64 {
+	if !i.actualBuilt {
+		words := i.segmentWords()
+		if words == 0 || i.batchRead*batchWordsPerRead < words {
+			return nil
+		}
+		if i.actualBuilt = writeWords(&i.actualDense, i.ActualBM, words); !i.actualBuilt {
+			return nil
+		}
+	}
+	return i.actualDense
+}
+
+// nextBatchWords is NextBatch's loop, clean or, with subset, that of
+// nextBatchSubset, with the documents read from words, ActualBM as words,
+// instead of stepping the roaring iterator per posting; the iterator is
+// moved past the batch at the end.
+func (i *PostingsIterator) nextBatchWords(words []uint64, subset bool, docs []uint64, freqs []int,
+	norms []float64) (n int, err error) {
+	it := i.Actual
+	if len(docs) == 0 || !it.HasNext() {
+		return 0, nil
+	}
+	r := i.freqNormReader
+	d := uint64(it.PeekNext())
+	w := d >> 6
+	cur := words[w] &^ (1<<(d&63) - 1)
+	defer func() { it.AdvanceIfNeeded(uint32(d) + 1) }() // #nosec G115 -- d is below maxRankWords*64.
+	for n < len(docs) {
+		for cur == 0 {
+			w++
+			if w >= uint64(len(words)) {
+				return n, nil
+			}
+			cur = words[w]
+		}
+		d = w<<6 | uint64(bits.TrailingZeros64(cur)) // #nosec G115 -- a bit index.
+		cur &= cur - 1
+		if subset {
+			// #nosec G115 -- d is below maxRankWords*64.
+			if err := i.seekFreqNorm(uint32(d), i.chunkOf(uint32(d))); err != nil {
+				return n, err
+			}
+		} else if d >= i.chunkEnd || r.isNil() {
+			// sequential reads enter a new chunk at its first entry
+			// #nosec G115 -- a document number divided by a positive size fits int.
+			if err := i.loadChunk(int(d / i.postings.chunkSize)); err != nil {
+				return n, fmt.Errorf("error loading chunk: %v", err)
+			}
+		}
+		freqHasLocs, err := r.r.readUvarintFast()
+		if err != nil {
+			return n, fmt.Errorf("error reading frequency: %v", err)
+		}
+		normBits, err := r.r.ReadUvarint()
+		if err != nil {
+			return n, fmt.Errorf("error reading norm: %v", err)
+		}
+		if normBits > math.MaxUint32 {
+			return n, fmt.Errorf("norm bits exceed uint32")
+		}
+		docs[n] = d
+		freqs[n] = int(freqHasLocs >> 1)
+		norms[n] = float64(math.Float32frombits(uint32(normBits)))
+		n++
+		i.lastDoc, i.hasLast = uint32(d), true // #nosec G115 -- d is below maxRankWords*64.
 	}
 	return n, nil
 }
@@ -1836,7 +2016,7 @@ func (i *PostingsIterator) ActualBitmap() *roaring.Bitmap {
 func (i *PostingsIterator) ReplaceActual(abm *roaring.Bitmap) {
 	i.ActualBM = abm
 	i.Actual = abm.Iterator()
-	i.started, i.denseChecked = true, false
+	i.started, i.denseChecked, i.actualBuilt = true, false, false
 	if i.all == nil && i.postings != nil && i.postings.postings != nil {
 		i.all = i.postings.postings.Iterator()
 	}
